@@ -1,6 +1,8 @@
 .env
 data/
 node_modules/
+desktop/target/
+desktop/dist/
 *.log
 __pycache__/
 *.pyc
