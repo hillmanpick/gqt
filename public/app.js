@@ -31,9 +31,10 @@ const state = {
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
+const APP_BASE = new URL(".", window.location.href).pathname.replace(/\/$/, "");
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
+  const response = await fetch(`${APP_BASE}${path}`, {
     headers: { "Content-Type": "application/json", ...(options.headers ?? {}) },
     credentials: "same-origin",
     ...options,

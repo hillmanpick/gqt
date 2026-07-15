@@ -93,6 +93,8 @@ WantedBy=multi-user.target
 
 Nginx 只代理到 `127.0.0.1:4173`，并传递 `Host`、`X-Forwarded-For` 和 `X-Forwarded-Proto`。使用 Certbot 或云负载均衡配置有效证书后，再访问首次设置页。防火墙只开放 `22`、`80`、`443`，不要公开 `4173` 或 Freqtrade 容器端口。
 
+前端会根据入口 URL 自动识别部署前缀，因此也可以将 Nginx 的 `/gqt/` 代理到 GQT 根路径，同时保留域名下已有的其他服务。
+
 ## 启用实盘
 
 先完成数据下载、分段回测和至少数周 Dry-run。确认策略、手续费、滑点、最小下单量和极端行情保护后：
