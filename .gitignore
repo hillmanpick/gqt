@@ -12,6 +12,7 @@ trading/user_data/logs/
 trading/user_data/backtest_results/
 trading/user_data/hyperopt_results/
 trading/user_data/*.sqlite*
+trading/user_data/ai_signals.json
 trading/user_data/freqaimodels/
 trading/user_data/notebooks/
 trading/user_data/plot/
