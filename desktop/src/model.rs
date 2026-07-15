@@ -106,7 +106,7 @@ pub struct Candle {
     pub volume: f64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Sentiment {
     pub score: i32,
     pub label: String,
@@ -115,7 +115,7 @@ pub struct Sentiment {
     pub funding: f64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MarketSnapshot {
     pub symbol: String,
     pub price: f64,
@@ -128,9 +128,10 @@ pub struct MarketSnapshot {
     pub long_short_ratio: f64,
     pub open_interest: f64,
     pub sentiment: Sentiment,
+    pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FuturesAccount {
     pub wallet_balance: f64,
     pub available_balance: f64,
@@ -142,7 +143,7 @@ pub struct FuturesAccount {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FuturesPosition {
     pub symbol: String,
     pub side: String,
@@ -184,6 +185,82 @@ pub enum AiProvider {
     Claude,
     DeepSeek,
     Relay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MarginMode {
+    Cross,
+    Isolated,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiTradingConfig {
+    pub enabled: bool,
+    pub dry_run_only: bool,
+    pub symbol_whitelist: Vec<String>,
+    pub timeframe: String,
+    pub margin_mode: MarginMode,
+    pub leverage: u8,
+    pub capital_usage_percent: f64,
+    pub minimum_confidence: f64,
+    pub model_timeout_seconds: u64,
+    pub market_max_age_seconds: i64,
+    pub one_signal_per_candle: bool,
+}
+
+impl Default for AiTradingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dry_run_only: true,
+            symbol_whitelist: vec!["BTCUSDT".into(), "ETHUSDT".into()],
+            timeframe: "1h".into(),
+            margin_mode: MarginMode::Cross,
+            leverage: 2,
+            capital_usage_percent: 10.0,
+            minimum_confidence: 0.75,
+            model_timeout_seconds: 30,
+            market_max_age_seconds: 90,
+            one_signal_per_candle: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiAction {
+    Long,
+    Short,
+    Close,
+    Hold,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiTradeSignal {
+    pub decision_id: String,
+    pub symbol: String,
+    pub timeframe: String,
+    pub candle_open_time: i64,
+    pub valid_until: i64,
+    pub action: AiAction,
+    pub confidence: f64,
+    pub stop_loss_percent: f64,
+    pub take_profit_percent: f64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiTradingInput {
+    pub symbol: String,
+    pub timeframe: String,
+    pub candle_open_time: i64,
+    pub candles: Vec<Candle>,
+    pub snapshot: MarketSnapshot,
+    pub account: FuturesAccount,
+    pub current_position: Option<FuturesPosition>,
+    pub configured_leverage: u8,
+    pub configured_capital_usage_percent: f64,
 }
 
 impl AiProvider {

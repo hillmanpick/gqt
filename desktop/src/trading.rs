@@ -10,11 +10,14 @@ use rand::{RngCore, rngs::OsRng};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 
-use crate::model::{SimulationAccount, SimulationTrade};
+use crate::model::{AiTradingConfig, SimulationAccount, SimulationTrade};
 
 const DEFAULT_CONFIG: &str = include_str!("../../trading/user_data/config.json");
 const DEFAULT_STRATEGY: &str =
     include_str!("../../trading/user_data/strategies/FuturesFactorStrategy.py");
+const DEFAULT_AI_STRATEGY: &str =
+    include_str!("../../trading/user_data/strategies/AiSignalStrategy.py");
+const DEFAULT_AI_CONFIG: &str = include_str!("../../trading/user_data/ai_config.json");
 const DEFAULT_COMPOSE: &str = include_str!("../../trading/docker-compose.yml");
 
 #[derive(Debug, Clone)]
@@ -22,6 +25,10 @@ pub struct TradingWorkspace {
     pub root: PathBuf,
     pub config: PathBuf,
     pub strategy: PathBuf,
+    pub ai_strategy: PathBuf,
+    pub ai_config: PathBuf,
+    pub ai_signals: PathBuf,
+    pub ai_audit: PathBuf,
 }
 
 impl TradingWorkspace {
@@ -30,17 +37,42 @@ impl TradingWorkspace {
         fs::create_dir_all(&strategy_dir).context("无法创建策略目录")?;
         let config = root.join("user_data").join("config.json");
         let strategy = strategy_dir.join("FuturesFactorStrategy.py");
+        let ai_strategy = strategy_dir.join("AiSignalStrategy.py");
+        let ai_config = root.join("user_data").join("ai_config.json");
         let compose = root.join("docker-compose.yml");
         write_if_missing(&config, DEFAULT_CONFIG)?;
         migrate_config(&config)?;
         write_if_missing(&strategy, DEFAULT_STRATEGY)?;
+        write_if_missing(&ai_strategy, DEFAULT_AI_STRATEGY)?;
+        write_if_missing(&ai_config, DEFAULT_AI_CONFIG)?;
         write_if_missing(&compose, DEFAULT_COMPOSE)?;
         migrate_compose(&compose)?;
         Ok(Self {
             root: root.to_path_buf(),
             config,
             strategy,
+            ai_strategy,
+            ai_config,
+            ai_signals: root.join("user_data").join("ai_signals.json"),
+            ai_audit: root.join("user_data").join("ai_audit.sqlite"),
         })
+    }
+
+    pub fn ai_trading_config(&self) -> Result<AiTradingConfig> {
+        let config = serde_json::from_str(&fs::read_to_string(&self.ai_config)?)?;
+        crate::ai_trader::validate_config(&config)?;
+        Ok(config)
+    }
+
+    pub fn save_ai_trading_config(&self, config: &AiTradingConfig) -> Result<()> {
+        crate::ai_trader::validate_config(config)?;
+        let temporary = self.ai_config.with_extension("json.tmp");
+        fs::write(
+            &temporary,
+            format!("{}\n", serde_json::to_string_pretty(config)?),
+        )?;
+        fs::rename(temporary, &self.ai_config).context("无法保存 AI 自动交易配置")?;
+        Ok(())
     }
 
     pub fn strategy_source(&self) -> Result<String> {

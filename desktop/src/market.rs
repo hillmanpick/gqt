@@ -155,6 +155,7 @@ fn fetch_snapshot(client: &Client, symbol: &str) -> Result<MarketSnapshot> {
         long_short_ratio,
         open_interest: field_number(&open_interest, "openInterest")?,
         sentiment: calculate_sentiment(change_percent, funding_rate, long_short_ratio),
+        updated_at: chrono::Utc::now().timestamp(),
     })
 }
 

@@ -1,0 +1,16 @@
+{
+  "enabled": false,
+  "dry_run_only": true,
+  "symbol_whitelist": [
+    "BTCUSDT",
+    "ETHUSDT"
+  ],
+  "timeframe": "1h",
+  "margin_mode": "cross",
+  "leverage": 2,
+  "capital_usage_percent": 10.0,
+  "minimum_confidence": 0.75,
+  "model_timeout_seconds": 30,
+  "market_max_age_seconds": 90,
+  "one_signal_per_candle": true
+}

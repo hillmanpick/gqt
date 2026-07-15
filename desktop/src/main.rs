@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod ai;
+mod ai_trader;
 mod app;
+mod audit;
 mod exchange;
 mod market;
 mod model;
