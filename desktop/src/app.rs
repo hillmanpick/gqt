@@ -1235,7 +1235,7 @@ impl GqtApp {
                             ui.add(theme::primary_button(if self.job_running {
                                 "任务运行中..."
                             } else if backtest {
-                                "开始回测"
+                                "同步数据并回测"
                             } else {
                                 "同步数据"
                             }))
@@ -1272,7 +1272,7 @@ impl GqtApp {
         }
         self.job_running = true;
         self.bot_log = if backtest {
-            "正在启动回测容器...".into()
+            "正在同步所选范围的 4h 历史数据，完成后将自动运行回测...".into()
         } else {
             "正在同步 Binance Futures 历史数据...".into()
         };

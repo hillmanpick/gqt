@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::NaiveDate;
+use chrono::{Duration as ChronoDuration, NaiveDate};
 use rand::{RngCore, rngs::OsRng};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
@@ -247,6 +247,27 @@ impl TradingWorkspace {
             bail!("回测费率超出允许范围");
         }
         let pairs = normalized_pairs(symbols)?;
+        let data_start = start - ChronoDuration::days(90);
+        let mut download_command = vec![
+            "download-data".into(),
+            "--config".into(),
+            "/freqtrade/user_data/config.json".into(),
+            "--exchange".into(),
+            "binance".into(),
+            "--trading-mode".into(),
+            "futures".into(),
+            "--timeframes".into(),
+            "4h".into(),
+            "--prepend".into(),
+            "--timerange".into(),
+            format!("{}-{}", data_start.format("%Y%m%d"), end.format("%Y%m%d")),
+            "--pairs".into(),
+        ];
+        download_command.extend(pairs.clone());
+        let download_log = self
+            .run_compose(&download_command)
+            .context("回测前同步历史数据失败")?;
+
         let mut command = vec![
             "backtesting".into(),
             "--config".into(),
@@ -260,7 +281,11 @@ impl TradingWorkspace {
             "--pairs".into(),
         ];
         command.extend(pairs);
-        self.run_compose(&command)
+        let backtest_log = self.run_compose(&command)?;
+        Ok(format!(
+            "===== 历史数据同步 =====\n{}\n\n===== 回测结果 =====\n{}",
+            download_log, backtest_log
+        ))
     }
 
     pub fn download_data(&self, days: i64, symbols: &[String]) -> Result<String> {
@@ -278,6 +303,7 @@ impl TradingWorkspace {
             "futures".into(),
             "--timeframes".into(),
             "4h".into(),
+            "--prepend".into(),
             "--days".into(),
             days.to_string(),
             "--pairs".into(),
