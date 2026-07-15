@@ -1,0 +1,16 @@
+services:
+  freqtrade:
+    image: freqtradeorg/freqtrade:2026.6
+    container_name: binance-futures-factor
+    restart: unless-stopped
+    volumes:
+      - ./user_data:/freqtrade/user_data
+    environment:
+      FREQTRADE__EXCHANGE__KEY: "${BINANCE_API_KEY:-}"
+      FREQTRADE__EXCHANGE__SECRET: "${BINANCE_API_SECRET:-}"
+    command: >
+      trade
+      --logfile /freqtrade/user_data/logs/freqtrade.log
+      --db-url sqlite:////freqtrade/user_data/tradesv3.sqlite
+      --config /freqtrade/user_data/config.json
+      --strategy FuturesFactorStrategy

@@ -1,0 +1,15 @@
+.env
+data/
+node_modules/
+*.log
+__pycache__/
+*.pyc
+trading/.env
+trading/user_data/data/
+trading/user_data/logs/
+trading/user_data/backtest_results/
+trading/user_data/hyperopt_results/
+trading/user_data/*.sqlite*
+trading/user_data/freqaimodels/
+trading/user_data/notebooks/
+trading/user_data/plot/

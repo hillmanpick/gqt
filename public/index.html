@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
+    <title>GQT Quant Console</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <section class="auth-gate" id="auth-gate" aria-labelledby="auth-title">
+      <div class="auth-panel">
+        <div class="auth-brand">
+          <span class="brand-mark"><i data-lucide="candlestick-chart" aria-hidden="true"></i></span>
+          <strong>GQT</strong>
+        </div>
+        <form id="setup-form" class="auth-form is-hidden">
+          <div><h1 id="auth-title">安全接入</h1><p>首次设置</p></div>
+          <label class="field"><span>管理员密码</span><input id="setup-password" type="password" minlength="12" maxlength="256" autocomplete="new-password" required /></label>
+          <div class="auth-divider"><span>Binance Futures</span></div>
+          <label class="field"><span>API Key</span><input id="setup-binance-key" type="password" autocomplete="off" required /></label>
+          <label class="field"><span>API Secret</span><input id="setup-binance-secret" type="password" autocomplete="off" required /></label>
+          <details class="provider-details">
+            <summary>AI 提供商</summary>
+            <div class="provider-fields">
+              <label class="field"><span>OpenAI API Key</span><input id="setup-openai-key" type="password" autocomplete="off" /></label>
+              <label class="field"><span>Claude API Key</span><input id="setup-anthropic-key" type="password" autocomplete="off" /></label>
+              <label class="field"><span>DeepSeek API Key</span><input id="setup-deepseek-key" type="password" autocomplete="off" /></label>
+            </div>
+          </details>
+          <button class="button primary auth-submit" type="submit"><i data-lucide="shield-check" aria-hidden="true"></i>加密保存并进入</button>
+        </form>
+        <form id="login-form" class="auth-form is-hidden">
+          <div><h1>管理员登录</h1><p>GQT Quant Console</p></div>
+          <label class="field"><span>管理员密码</span><input id="login-password" type="password" maxlength="256" autocomplete="current-password" required /></label>
+          <button class="button primary auth-submit" type="submit"><i data-lucide="log-in" aria-hidden="true"></i>进入平台</button>
+        </form>
+      </div>
+    </section>
+
+    <div class="app-shell is-hidden" id="app-shell">
+      <aside class="sidebar">
+        <div class="brand"><span class="brand-mark"><i data-lucide="candlestick-chart" aria-hidden="true"></i></span><span>GQT</span></div>
+        <nav class="nav-list" aria-label="主导航">
+          <button class="nav-item is-active" data-page="overview"><i data-lucide="layout-dashboard" aria-hidden="true"></i><span>总览</span></button>
+          <button class="nav-item" data-page="market"><i data-lucide="candlestick-chart" aria-hidden="true"></i><span>行情</span></button>
+          <button class="nav-item" data-page="strategies"><i data-lucide="braces" aria-hidden="true"></i><span>策略</span></button>
+          <button class="nav-item" data-page="backtests"><i data-lucide="chart-no-axes-combined" aria-hidden="true"></i><span>回测</span></button>
+          <button class="nav-item" data-page="data"><i data-lucide="database" aria-hidden="true"></i><span>数据</span></button>
+          <button class="nav-item" data-page="execution"><i data-lucide="activity" aria-hidden="true"></i><span>执行</span></button>
+          <button class="nav-item" data-page="settings"><i data-lucide="sliders-horizontal" aria-hidden="true"></i><span>设置</span></button>
+        </nav>
+        <div class="sidebar-status"><span class="status-dot" id="sidebar-dot"></span><div><strong id="sidebar-engine">检测中</strong><small id="sidebar-mode">DRY-RUN</small></div></div>
+      </aside>
+
+      <div class="workspace">
+        <header class="topbar">
+          <div><h1 id="page-title">总览</h1><p id="page-context">Binance U 本位永续</p></div>
+          <div class="top-actions">
+            <span class="mode-badge" id="mode-badge">DRY-RUN</span>
+            <button class="icon-button" id="refresh-all" aria-label="刷新"><i data-lucide="refresh-cw" aria-hidden="true"></i></button>
+            <button class="icon-button" id="logout" aria-label="退出登录"><i data-lucide="log-out" aria-hidden="true"></i></button>
+          </div>
+        </header>
+
+        <main>
+          <section class="page is-active" data-page-panel="overview">
+            <div class="metric-grid">
+              <article class="metric-card"><div class="metric-label"><i data-lucide="server" aria-hidden="true"></i>交易内核</div><strong id="metric-engine">--</strong><small id="metric-docker">Docker --</small></article>
+              <article class="metric-card"><div class="metric-label"><i data-lucide="shield-check" aria-hidden="true"></i>运行模式</div><strong id="metric-mode">--</strong><small id="metric-margin">--</small></article>
+              <article class="metric-card"><div class="metric-label"><i data-lucide="wallet-cards" aria-hidden="true"></i>风险敞口</div><strong id="metric-exposure">--</strong><small id="metric-positions">--</small></article>
+              <article class="metric-card"><div class="metric-label"><i data-lucide="workflow" aria-hidden="true"></i>当前策略</div><strong id="metric-strategy">--</strong><small id="metric-pairs">--</small></article>
+            </div>
+            <div class="overview-grid">
+              <section class="section-block performance-block">
+                <div class="section-heading"><div><h2>最近回测</h2><p id="backtest-range">暂无完成记录</p></div><button class="text-button" data-go="backtests">运行回测<i data-lucide="arrow-right" aria-hidden="true"></i></button></div>
+                <div class="performance-summary"><div><small>净收益</small><strong id="latest-profit">--</strong></div><div><small>交易数</small><strong id="latest-trades">--</strong></div><div><small>最大回撤</small><strong id="latest-drawdown">--</strong></div><div><small>Profit Factor</small><strong id="latest-pf">--</strong></div></div>
+                <svg id="result-chart" class="result-chart" viewBox="0 0 720 190" role="img" aria-label="最近回测结果趋势"><line x1="24" y1="150" x2="696" y2="150" class="chart-axis"></line><path id="result-path" class="chart-line" d="M24 150 L696 150"></path><circle id="result-point" class="chart-point" cx="696" cy="150" r="5"></circle></svg>
+              </section>
+              <section class="section-block">
+                <div class="section-heading"><h2>系统状态</h2><span class="quiet-status" id="system-state">--</span></div>
+                <dl class="status-list"><div><dt>合约模式</dt><dd id="status-contract">--</dd></div><div><dt>保证金</dt><dd id="status-margin">--</dd></div><div><dt>API 凭证</dt><dd id="status-api">--</dd></div><div><dt>爆仓缓冲</dt><dd id="status-buffer">--</dd></div></dl>
+                <div class="exposure-meter"><div class="meter-row"><span id="meter-label">保证金占用上限</span><strong id="meter-value">--</strong></div><div class="meter-track"><span id="meter-fill"></span></div></div>
+              </section>
+            </div>
+            <section class="section-block jobs-block"><div class="section-heading"><h2>最近任务</h2><span id="job-count" class="quiet-status">0</span></div><div class="table-wrap"><table><thead><tr><th>任务</th><th>类型</th><th>状态</th><th>更新时间</th><th>结果</th></tr></thead><tbody id="overview-jobs"></tbody></table></div></section>
+          </section>
+
+          <section class="page" data-page-panel="market">
+            <div class="market-toolbar">
+              <label class="field"><span>永续合约</span><select id="market-symbol"><option>BTCUSDT</option><option>ETHUSDT</option><option>BNBUSDT</option><option>SOLUSDT</option><option>XRPUSDT</option><option>DOGEUSDT</option><option>ADAUSDT</option><option>LINKUSDT</option><option>AVAXUSDT</option><option>LTCUSDT</option></select></label>
+              <div class="interval-control" role="group" aria-label="K线周期"><button class="interval-button" data-interval="1m">1m</button><button class="interval-button" data-interval="5m">5m</button><button class="interval-button" data-interval="15m">15m</button><button class="interval-button" data-interval="1h">1h</button><button class="interval-button is-active" data-interval="4h">4h</button><button class="interval-button" data-interval="1d">1d</button></div>
+              <span class="live-indicator" id="market-live"><span></span><span id="market-live-text">连接中</span></span>
+            </div>
+            <div class="market-layout">
+              <section class="chart-workspace"><div class="chart-heading"><div><h2 id="market-heading">BTCUSDT</h2><p id="market-price">--</p></div><div id="market-change" class="market-change">--</div></div><div id="candlestick-chart" class="candlestick-chart" role="img" aria-label="实时合约K线图"></div></section>
+              <aside class="market-sidebar">
+                <section class="sentiment-panel"><div class="section-heading"><h2>市场情绪</h2><strong id="sentiment-score">--</strong></div><div class="sentiment-track"><span id="sentiment-fill"></span></div><div class="sentiment-labels"><span>恐慌</span><strong id="sentiment-label">--</strong><span>贪婪</span></div></section>
+                <dl class="status-list market-stats"><div><dt>标记价格</dt><dd id="mark-price">--</dd></div><div><dt>资金费率</dt><dd id="funding-rate">--</dd></div><div><dt>多空比</dt><dd id="long-short-ratio">--</dd></div><div><dt>持仓量</dt><dd id="open-interest">--</dd></div><div><dt>24h 成交额</dt><dd id="quote-volume">--</dd></div></dl>
+              </aside>
+            </div>
+            <section class="ai-workbench">
+              <div class="section-heading"><div><h2>AI 研判</h2><p id="ai-provider-state">选择已配置的提供商</p></div><div class="ai-controls"><select id="ai-provider" aria-label="AI 提供商"><option value="openai">OpenAI</option><option value="anthropic">Claude</option><option value="deepseek">DeepSeek</option></select><input id="ai-model" type="text" placeholder="模型（可选）" aria-label="模型" /><button class="button primary" id="run-ai"><i data-lucide="sparkles" aria-hidden="true"></i>分析</button></div></div>
+              <textarea id="ai-prompt" class="ai-prompt" aria-label="AI 分析问题">判断当前市场状态、主要风险与需要等待的确认信号。</textarea>
+              <div class="ai-output" id="ai-output">暂无分析</div>
+            </section>
+          </section>
+
+          <section class="page" data-page-panel="strategies">
+            <div class="toolbar-row"><label class="field compact-field"><span>策略</span><select id="strategy-select"></select></label><div class="toolbar-actions"><button class="button secondary" id="new-strategy"><i data-lucide="file-plus-2" aria-hidden="true"></i>新建</button><button class="button primary" id="save-strategy"><i data-lucide="check-check" aria-hidden="true"></i>保存并校验</button></div></div>
+            <div class="editor-shell"><div class="editor-topline"><span id="strategy-file">--</span><span id="strategy-state" class="validation-state">未修改</span></div><textarea id="strategy-editor" spellcheck="false" aria-label="策略源码"></textarea></div>
+          </section>
+
+          <section class="page" data-page-panel="backtests">
+            <form id="backtest-form" class="control-band"><label class="field"><span>策略</span><select id="backtest-strategy"></select></label><label class="field"><span>开始日期</span><input id="backtest-start" type="date" value="2023-01-01" required /></label><label class="field"><span>结束日期</span><input id="backtest-end" type="date" value="2026-01-01" required /></label><label class="field"><span>周期</span><select id="backtest-timeframe"><option>1h</option><option selected>4h</option><option>8h</option><option>1d</option></select></label><label class="field"><span>单边费率</span><input id="backtest-fee" type="number" min="0" max="0.01" step="0.0001" value="0.0005" /></label><button class="button primary submit-button" type="submit"><i data-lucide="play" aria-hidden="true"></i>开始回测</button></form>
+            <fieldset class="pair-fieldset"><legend>合约范围</legend><div class="pair-grid" id="backtest-pairs"></div></fieldset>
+            <section class="section-block"><div class="section-heading"><h2>回测任务</h2><button class="icon-button" id="refresh-jobs" aria-label="刷新任务"><i data-lucide="refresh-cw" aria-hidden="true"></i></button></div><div class="table-wrap"><table><thead><tr><th>策略 / 范围</th><th>状态</th><th>交易数</th><th>净收益</th><th>最大回撤</th><th>更新时间</th></tr></thead><tbody id="backtest-jobs"></tbody></table></div></section>
+          </section>
+
+          <section class="page" data-page-panel="data">
+            <form id="download-form" class="control-band data-controls"><label class="field"><span>历史天数</span><input id="download-days" type="number" min="30" max="3650" value="1095" /></label><label class="field"><span>周期</span><select id="download-timeframe"><option>1h</option><option selected>4h</option><option>8h</option><option>1d</option></select></label><button class="button primary submit-button" type="submit"><i data-lucide="database-backup" aria-hidden="true"></i>同步数据</button></form>
+            <fieldset class="pair-fieldset"><legend>数据范围</legend><div class="pair-grid" id="download-pairs"></div></fieldset>
+            <section class="section-block"><div class="section-heading"><h2>同步任务</h2><span class="quiet-status" id="download-status">--</span></div><pre class="log-view compact-log" id="download-log">暂无任务</pre></section>
+          </section>
+
+          <section class="page" data-page-panel="execution">
+            <div class="execution-bar"><div class="engine-identity"><span class="engine-icon"><i data-lucide="radio-tower" aria-hidden="true"></i></span><div><h2>Freqtrade</h2><p id="execution-detail">状态检测中</p></div></div><div class="toolbar-actions"><button class="button secondary" id="stop-bot"><i data-lucide="square" aria-hidden="true"></i>停止</button><button class="button primary" id="start-bot"><i data-lucide="play" aria-hidden="true"></i>启动策略</button></div></div>
+            <section class="automation-row"><div><h2>自动恢复</h2><p>Dry-run 交易进程监控</p></div><label class="switch-control"><input id="automation-enabled" type="checkbox" /><span>启用监控</span></label><label class="switch-control"><input id="automation-restart" type="checkbox" /><span>异常后重启</span></label><button class="button secondary" id="save-automation"><i data-lucide="save" aria-hidden="true"></i>保存</button></section>
+            <section class="section-block"><div class="section-heading"><h2>运行日志</h2><button class="icon-button" id="refresh-logs" aria-label="刷新日志"><i data-lucide="refresh-cw" aria-hidden="true"></i></button></div><pre class="log-view" id="bot-log">暂无日志</pre></section>
+          </section>
+
+          <section class="page" data-page-panel="settings">
+            <form id="risk-form" class="settings-layout">
+              <section class="settings-section"><div class="settings-heading"><h2>仓位限制</h2><span>USDT-M · Isolated</span></div><div class="settings-fields"><label class="field"><span>单仓保证金（USDT）</span><input id="risk-stake" type="number" min="5" step="5" /></label><label class="field"><span>最大同时持仓</span><input id="risk-max-trades" type="number" min="1" max="20" step="1" /></label><label class="field"><span>爆仓缓冲</span><input id="risk-buffer" type="number" min="0.05" max="0.5" step="0.01" /></label></div></section>
+              <section class="settings-section"><div class="settings-heading"><h2>安全状态</h2><span id="settings-mode">DRY-RUN</span></div><dl class="status-list"><div><dt>提现权限</dt><dd>平台不管理</dd></div><div><dt>实盘启动</dt><dd>服务器环境控制</dd></div><div><dt>Binance API</dt><dd id="settings-api">--</dd></div></dl></section>
+              <section class="settings-section credentials-section"><div class="settings-heading"><h2>密钥管理</h2><span>加密数据库 key.db</span></div><div><div class="credential-status-grid"><span>Binance <strong id="cred-binance">--</strong></span><span>OpenAI <strong id="cred-openai">--</strong></span><span>Claude <strong id="cred-anthropic">--</strong></span><span>DeepSeek <strong id="cred-deepseek">--</strong></span></div><div class="settings-fields credential-fields"><label class="field"><span>Binance API Key</span><input id="cred-binance-key" type="password" autocomplete="off" /></label><label class="field"><span>Binance API Secret</span><input id="cred-binance-secret" type="password" autocomplete="off" /></label><label class="field"><span>OpenAI API Key</span><input id="cred-openai-key" type="password" autocomplete="off" /></label><label class="field"><span>Claude API Key</span><input id="cred-anthropic-key" type="password" autocomplete="off" /></label><label class="field"><span>DeepSeek API Key</span><input id="cred-deepseek-key" type="password" autocomplete="off" /></label></div><button class="button secondary credential-save" id="save-credentials" type="button"><i data-lucide="key-round" aria-hidden="true"></i>更新密钥</button></div></section>
+              <div class="settings-actions"><button class="button primary" type="submit"><i data-lucide="save" aria-hidden="true"></i>保存风控</button></div>
+            </form>
+          </section>
+        </main>
+      </div>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="/vendor/lucide.min.js"></script>
+    <script src="/vendor/lightweight-charts.js"></script>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.freqtrade.io/schema.json",
+  "entry_pricing": {
+    "price_side": "other"
+  },
+  "exit_pricing": {
+    "price_side": "other"
+  }
+}
