@@ -130,16 +130,23 @@ pub enum AiProvider {
     OpenAi,
     Claude,
     DeepSeek,
+    Relay,
 }
 
 impl AiProvider {
-    pub const ALL: [AiProvider; 3] = [AiProvider::OpenAi, AiProvider::Claude, AiProvider::DeepSeek];
+    pub const ALL: [AiProvider; 4] = [
+        AiProvider::OpenAi,
+        AiProvider::Claude,
+        AiProvider::DeepSeek,
+        AiProvider::Relay,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             AiProvider::OpenAi => "OpenAI",
             AiProvider::Claude => "Claude",
             AiProvider::DeepSeek => "DeepSeek",
+            AiProvider::Relay => "中转站",
         }
     }
 }
@@ -150,6 +157,7 @@ pub struct SecretStatus {
     pub openai: bool,
     pub claude: bool,
     pub deepseek: bool,
+    pub relay: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -159,6 +167,7 @@ pub struct CredentialDraft {
     pub openai_key: String,
     pub claude_key: String,
     pub deepseek_key: String,
+    pub relay_key: String,
 }
 
 #[derive(Debug)]

@@ -56,6 +56,7 @@ pub struct GqtApp {
     last_health_check: Instant,
     ai_provider: AiProvider,
     ai_model: String,
+    relay_base_url: String,
     ai_prompt: String,
     ai_output: String,
     ai_running: bool,
@@ -111,6 +112,11 @@ impl GqtApp {
             .ok()
             .flatten()
             .is_some_and(|value| value == "true");
+        let relay_base_url = store
+            .setting("relay_base_url")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         Self {
             store,
             workspace,
@@ -139,6 +145,7 @@ impl GqtApp {
             last_health_check: Instant::now(),
             ai_provider: AiProvider::DeepSeek,
             ai_model: String::new(),
+            relay_base_url,
             ai_prompt: "判断当前市场状态、主要风险与需要等待的确认信号。".into(),
             ai_output: "暂无分析".into(),
             ai_running: false,
@@ -294,6 +301,16 @@ impl GqtApp {
                                         )
                                         .password(true),
                                     );
+                                    field_label(ui, "中转站 API Key");
+                                    ui.add(
+                                        TextEdit::singleline(&mut self.credential_draft.relay_key)
+                                            .password(true),
+                                    );
+                                    field_label(ui, "中转站 Base URL");
+                                    ui.add(
+                                        TextEdit::singleline(&mut self.relay_base_url)
+                                            .hint_text("https://example.com/v1"),
+                                    );
                                 });
                             ui.add_space(14.0);
                             if ui
@@ -311,6 +328,10 @@ impl GqtApp {
     }
 
     fn connect_binance(&mut self) {
+        if let Err(error) = self.save_relay_endpoint() {
+            self.toast(error, true);
+            return;
+        }
         match self.store.setup(&self.credential_draft) {
             Ok(key) => {
                 self.unlocked_key = Some(key);
@@ -850,8 +871,9 @@ impl GqtApp {
         };
         let secret_name = match self.ai_provider {
             AiProvider::OpenAi => "openai_api_key",
-            AiProvider::Claude => "claude_api_key",
+            AiProvider::Claude => "anthropic_api_key",
             AiProvider::DeepSeek => "deepseek_api_key",
+            AiProvider::Relay => "relay_api_key",
         };
         let api_key = self
             .store
@@ -865,11 +887,19 @@ impl GqtApp {
         let sender = self.task_sender.clone();
         let provider = self.ai_provider;
         let model = self.ai_model.clone();
+        let relay_base_url = self.relay_base_url.clone();
         let snapshot = self.snapshot.clone();
         let prompt = self.ai_prompt.clone();
         thread::spawn(move || {
-            let result = ai::analyze(provider, &model, &api_key, &snapshot, &prompt)
-                .map_err(|error| error.to_string());
+            let result = ai::analyze(
+                provider,
+                &model,
+                &api_key,
+                &relay_base_url,
+                &snapshot,
+                &prompt,
+            )
+            .map_err(|error| error.to_string());
             let _ = sender.send(TaskEvent::Ai(result));
         });
     }
@@ -1029,6 +1059,7 @@ impl GqtApp {
                     status_chip(ui, "OpenAI", self.secret_status.openai);
                     status_chip(ui, "Claude", self.secret_status.claude);
                     status_chip(ui, "DeepSeek", self.secret_status.deepseek);
+                    status_chip(ui, "中转站", self.secret_status.relay);
                 });
                 ui.add_space(10.0);
                 ui.columns(2, |cols| {
@@ -1057,10 +1088,23 @@ impl GqtApp {
                         "DeepSeek API Key",
                         &mut self.credential_draft.deepseek_key,
                     );
+                    credential_field(
+                        &mut cols[1],
+                        "中转站 API Key",
+                        &mut self.credential_draft.relay_key,
+                    );
                 });
+                field_label(ui, "中转站 Base URL（OpenAI 兼容）");
+                ui.add_sized(
+                    [ui.available_width(), 38.0],
+                    TextEdit::singleline(&mut self.relay_base_url)
+                        .hint_text("https://example.com/v1"),
+                );
                 ui.add_space(10.0);
                 if ui.add(theme::primary_button("更新密钥")).clicked() {
-                    if let Some(key) = self.unlocked_key.as_ref() {
+                    if let Err(error) = self.save_relay_endpoint() {
+                        self.toast(error, true);
+                    } else if let Some(key) = self.unlocked_key.as_ref() {
                         match self.store.update_credentials(key, &self.credential_draft) {
                             Ok(()) => {
                                 self.credential_draft = CredentialDraft::default();
@@ -1073,6 +1117,25 @@ impl GqtApp {
                 }
             });
         });
+    }
+
+    fn save_relay_endpoint(&mut self) -> Result<(), String> {
+        let key_available =
+            self.secret_status.relay || !self.credential_draft.relay_key.trim().is_empty();
+        let url_supplied = !self.relay_base_url.trim().is_empty();
+        if !key_available && !url_supplied {
+            return Ok(());
+        }
+        if !key_available {
+            return Err("填写中转站 Base URL 时也需要填写 API Key".into());
+        }
+        let normalized = ai::normalize_relay_base_url(&self.relay_base_url)
+            .map_err(|error| error.to_string())?;
+        self.store
+            .set_setting("relay_base_url", &normalized)
+            .map_err(|error| error.to_string())?;
+        self.relay_base_url = normalized;
+        Ok(())
     }
 
     fn select_market(&self) {

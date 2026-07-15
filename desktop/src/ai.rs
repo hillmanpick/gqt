@@ -10,6 +10,7 @@ pub fn analyze(
     provider: AiProvider,
     requested_model: &str,
     api_key: &str,
+    relay_base_url: &str,
     snapshot: &MarketSnapshot,
     prompt: &str,
 ) -> Result<String> {
@@ -50,6 +51,7 @@ pub fn analyze(
         AiProvider::OpenAi => openai(&client, model, api_key, &market_context),
         AiProvider::Claude => claude(&client, model, api_key, &market_context),
         AiProvider::DeepSeek => deepseek(&client, model, api_key, &market_context),
+        AiProvider::Relay => relay(&client, model, api_key, relay_base_url, &market_context),
     }
 }
 
@@ -58,6 +60,7 @@ fn default_model(provider: AiProvider) -> &'static str {
         AiProvider::OpenAi => "gpt-4.1-mini",
         AiProvider::Claude => "claude-sonnet-4-20250514",
         AiProvider::DeepSeek => "deepseek-chat",
+        AiProvider::Relay => "gpt-4o-mini",
     }
 }
 
@@ -118,8 +121,42 @@ fn claude(client: &Client, model: &str, api_key: &str, input: &str) -> Result<St
 }
 
 fn deepseek(client: &Client, model: &str, api_key: &str, input: &str) -> Result<String> {
+    chat_completions(
+        client,
+        "https://api.deepseek.com/chat/completions",
+        "DeepSeek",
+        model,
+        api_key,
+        input,
+    )
+}
+
+fn relay(
+    client: &Client,
+    model: &str,
+    api_key: &str,
+    base_url: &str,
+    input: &str,
+) -> Result<String> {
+    let base_url = normalize_relay_base_url(base_url)?;
+    let endpoint = if base_url.ends_with("/chat/completions") {
+        base_url
+    } else {
+        format!("{base_url}/chat/completions")
+    };
+    chat_completions(client, &endpoint, "中转站", model, api_key, input)
+}
+
+fn chat_completions(
+    client: &Client,
+    endpoint: &str,
+    provider: &str,
+    model: &str,
+    api_key: &str,
+    input: &str,
+) -> Result<String> {
     let response = client
-        .post("https://api.deepseek.com/chat/completions")
+        .post(endpoint)
         .bearer_auth(api_key.trim())
         .json(&json!({
             "model": model,
@@ -131,12 +168,35 @@ fn deepseek(client: &Client, model: &str, api_key: &str, input: &str) -> Result<
             "max_tokens": 1200
         }))
         .send()
-        .context("DeepSeek 请求失败")?;
-    let body = read_json(response, "DeepSeek")?;
+        .with_context(|| format!("{provider} 请求失败"))?;
+    let body = read_json(response, provider)?;
     body["choices"][0]["message"]["content"]
         .as_str()
         .map(str::to_owned)
-        .context("DeepSeek 返回中没有文本")
+        .with_context(|| format!("{provider} 返回中没有文本"))
+}
+
+pub fn normalize_relay_base_url(value: &str) -> Result<String> {
+    let value = value.trim().trim_end_matches('/');
+    if value.is_empty() {
+        bail!("请填写中转站 Base URL");
+    }
+    let url = reqwest::Url::parse(value).context("中转站 Base URL 格式无效")?;
+    let host = url.host_str().context("中转站 Base URL 缺少主机名")?;
+    let localhost = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if url.scheme() != "https" && !(url.scheme() == "http" && localhost) {
+        bail!("中转站必须使用 HTTPS，本机调试地址除外");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("中转站 Base URL 不能包含用户名或密码");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        bail!("中转站 Base URL 不能包含查询参数或片段");
+    }
+    Ok(value.to_string())
 }
 
 fn read_json(response: reqwest::blocking::Response, provider: &str) -> Result<Value> {
@@ -155,4 +215,20 @@ fn read_json(response: reqwest::blocking::Response, provider: &str) -> Result<Va
         bail!("{} 接口返回 {}: {}", provider, status, detail);
     }
     serde_json::from_str(&body).context("AI 返回不是有效 JSON")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_relay_base_urls() {
+        assert_eq!(
+            normalize_relay_base_url("https://relay.example.com/v1/").unwrap(),
+            "https://relay.example.com/v1"
+        );
+        assert!(normalize_relay_base_url("http://relay.example.com/v1").is_err());
+        assert!(normalize_relay_base_url("http://127.0.0.1:8080/v1").is_ok());
+        assert!(normalize_relay_base_url("https://user:pass@example.com/v1").is_err());
+    }
 }

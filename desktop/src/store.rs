@@ -22,12 +22,13 @@ use zeroize::Zeroizing;
 
 use crate::model::{CredentialDraft, SecretStatus};
 
-const SECRET_NAMES: [&str; 5] = [
+const SECRET_NAMES: [&str; 6] = [
     "binance_api_key",
     "binance_api_secret",
     "openai_api_key",
     "anthropic_api_key",
     "deepseek_api_key",
+    "relay_api_key",
 ];
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -111,6 +112,7 @@ impl SecretStore {
             openai: configured("openai_api_key")?,
             claude: configured("anthropic_api_key")?,
             deepseek: configured("deepseek_api_key")?,
+            relay: configured("relay_api_key")?,
         })
     }
 
@@ -168,6 +170,7 @@ fn validate_credentials(draft: &CredentialDraft, setup: bool) -> Result<()> {
         &draft.openai_key,
         &draft.claude_key,
         &draft.deepseek_key,
+        &draft.relay_key,
     ] {
         let length = value.trim().len();
         if length != 0 && !(10..=512).contains(&length) {
@@ -184,6 +187,7 @@ fn store_draft(connection: &Connection, key: &[u8; 32], draft: &CredentialDraft)
         ("openai_api_key", draft.openai_key.trim()),
         ("anthropic_api_key", draft.claude_key.trim()),
         ("deepseek_api_key", draft.deepseek_key.trim()),
+        ("relay_api_key", draft.relay_key.trim()),
     ];
     for (name, value) in values {
         if value.is_empty() {
@@ -312,10 +316,12 @@ mod tests {
         let draft = CredentialDraft {
             binance_key: "fake-binance-key-for-tests".into(),
             binance_secret: "fake-binance-secret-for-tests".into(),
+            relay_key: "fake-relay-key-for-tests".into(),
             ..Default::default()
         };
         let key = store.setup(&draft).unwrap();
         assert!(store.secret_status().unwrap().binance);
+        assert!(store.secret_status().unwrap().relay);
         assert_eq!(
             store
                 .get_secret(&key, "binance_api_key")
@@ -331,6 +337,11 @@ mod tests {
             !bytes
                 .windows(draft.binance_key.len())
                 .any(|part| part == draft.binance_key.as_bytes())
+        );
+        assert!(
+            !bytes
+                .windows(draft.relay_key.len())
+                .any(|part| part == draft.relay_key.as_bytes())
         );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));

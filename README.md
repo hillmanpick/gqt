@@ -7,7 +7,7 @@ GQT Trader 是面向 Binance USDT-M 永续合约的 Windows 原生量化客户�
 - Binance Futures 实时 K 线、交易对和周期切换
 - 标记价格、资金费率、多空比、持仓量和 24 小时成交额
 - 趋势、仓位、资金费率组成的 0-100 市场情绪分值
-- OpenAI、Claude、DeepSeek 风险研判，AI 不具备下单能力
+- OpenAI、Claude、DeepSeek 和 OpenAI 兼容中转站风险研判，AI 不具备下单能力
 - 本地策略编辑、Python 语法校验、历史数据下载和回测
 - Freqtrade 合约策略启动、停止、日志与 Dry-run 异常恢复
 - 仓位、最大持仓数和爆仓缓冲风控
@@ -48,6 +48,7 @@ cargo build --release --manifest-path desktop\Cargo.toml
 
 - 不使用 `/root/key.txt`，没有隐藏接口或凭据回传逻辑。
 - AI 接口只接收当前公开市场数据和用户分析问题，不能触发交易。
+- 中转站支持自定义 HTTPS Base URL 和模型名，API Key 仍使用本地加密密钥库保存。
 - Binance Key 应关闭提现权限，并只授予合约交易所需权限。
 - `desktop/target/`、`desktop/dist/`、交易数据库、日志和回测结果不会提交到 Git。
 - 自动恢复只作用于 Dry-run Freqtrade 容器，不会切换为实盘。
