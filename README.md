@@ -12,6 +12,7 @@ GQT Trader 是面向 Binance USDT-M 永续合约的 Windows 原生量化客户�
 - OpenAI、Claude、DeepSeek 和 OpenAI 兼容中转站风险研判，AI 不具备下单能力
 - 本地策略编辑、Python 语法校验、历史数据下载和回测
 - 回测会自动补齐所选日期范围及策略启动窗口所需的历史数据
+- Docker、Python、回测和日志任务均以 Windows 隐藏后台进程运行
 - Freqtrade 数据同步、回测、策略启动、停止、日志与 Dry-run 异常恢复
 - 模拟盘与实盘模式切换；启用和启动实盘均需在客户端二次确认
 - 模拟与实盘分别使用独立 SQLite 交易数据库，成交记录不会混合

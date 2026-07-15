@@ -51,7 +51,7 @@ impl TradingWorkspace {
         if source.len() < 80 || source.len() > 500_000 {
             bail!("策略源码长度无效");
         }
-        let mut child = Command::new(python_command())
+        let mut child = background_command(python_command())
             .args([
                 "-c",
                 "import ast,sys; ast.parse(sys.stdin.read()); print('ok')",
@@ -118,7 +118,7 @@ impl TradingWorkspace {
     }
 
     pub fn docker_state(&self) -> (bool, String) {
-        let available = Command::new("docker")
+        let available = background_command("docker")
             .args(["info", "--format", "{{.ServerVersion}}"])
             .output()
             .map(|output| output.status.success())
@@ -126,7 +126,7 @@ impl TradingWorkspace {
         if !available {
             return (false, "Docker 不可用".into());
         }
-        let status = Command::new("docker")
+        let status = background_command("docker")
             .args([
                 "inspect",
                 "--format",
@@ -152,7 +152,7 @@ impl TradingWorkspace {
         } else {
             "sqlite:////freqtrade/user_data/tradesv3.live.sqlite"
         };
-        let output = Command::new("docker")
+        let output = background_command("docker")
             .args(args)
             .current_dir(&self.root)
             .env("BINANCE_API_KEY", api_key)
@@ -313,7 +313,7 @@ impl TradingWorkspace {
     }
 
     pub fn logs(&self) -> String {
-        Command::new("docker")
+        background_command("docker")
             .args([
                 "compose",
                 "logs",
@@ -342,7 +342,7 @@ impl TradingWorkspace {
             "freqtrade".into(),
         ];
         args.extend_from_slice(command);
-        let output = Command::new("docker")
+        let output = background_command("docker")
             .args(&args)
             .current_dir(&self.root)
             .output()
@@ -434,6 +434,17 @@ fn random_config_secret() -> String {
     let mut value = [0_u8; 32];
     OsRng.fill_bytes(&mut value);
     hex::encode(value)
+}
+
+fn background_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
 }
 
 fn python_command() -> &'static str {
