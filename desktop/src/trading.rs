@@ -7,7 +7,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
 use rand::{RngCore, rngs::OsRng};
+use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
+
+use crate::model::{SimulationAccount, SimulationTrade};
 
 const DEFAULT_CONFIG: &str = include_str!("../../trading/user_data/config.json");
 const DEFAULT_STRATEGY: &str =
@@ -32,6 +35,7 @@ impl TradingWorkspace {
         migrate_config(&config)?;
         write_if_missing(&strategy, DEFAULT_STRATEGY)?;
         write_if_missing(&compose, DEFAULT_COMPOSE)?;
+        migrate_compose(&compose)?;
         Ok(Self {
             root: root.to_path_buf(),
             config,
@@ -143,17 +147,86 @@ impl TradingWorkspace {
         } else {
             &["compose", "stop", "freqtrade"]
         };
+        let database_url = if self.dry_run()? {
+            "sqlite:////freqtrade/user_data/tradesv3.dryrun.sqlite"
+        } else {
+            "sqlite:////freqtrade/user_data/tradesv3.live.sqlite"
+        };
         let output = Command::new("docker")
             .args(args)
             .current_dir(&self.root)
             .env("BINANCE_API_KEY", api_key)
             .env("BINANCE_API_SECRET", api_secret)
+            .env("FREQTRADE_DB_URL", database_url)
             .output()
             .context("无法启动 Docker")?;
         if !output.status.success() {
             bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    pub fn simulation_account(&self) -> Result<SimulationAccount> {
+        let config: Value = serde_json::from_str(&fs::read_to_string(&self.config)?)?;
+        let initial_wallet = config["dry_run_wallet"].as_f64().unwrap_or(1000.0);
+        let database = self.root.join("user_data").join("tradesv3.dryrun.sqlite");
+        if !database.exists() {
+            return Ok(SimulationAccount {
+                wallet_balance: initial_wallet,
+                available_balance: initial_wallet,
+                ..Default::default()
+            });
+        }
+
+        let connection = Connection::open_with_flags(
+            database,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .context("无法读取模拟交易数据库")?;
+        let (realized_profit, closed_trades, winning_trades): (f64, i64, i64) = connection
+            .query_row(
+                "SELECT
+                    COALESCE(SUM(COALESCE(close_profit_abs, realized_profit, 0)), 0),
+                    COUNT(*),
+                    COALESCE(SUM(CASE WHEN COALESCE(close_profit_abs, realized_profit, 0) > 0 THEN 1 ELSE 0 END), 0)
+                 FROM trades WHERE is_open = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .context("无法统计模拟交易盈亏")?;
+        let mut statement = connection.prepare(
+            "SELECT pair, is_short, amount, stake_amount, open_rate, leverage,
+                    open_date, COALESCE(enter_tag, '')
+             FROM trades WHERE is_open = 1 ORDER BY open_date DESC",
+        )?;
+        let open_trades = statement
+            .query_map([], |row| {
+                Ok(SimulationTrade {
+                    pair: row.get(0)?,
+                    side: if row.get::<_, bool>(1)? { "空" } else { "多" }.into(),
+                    amount: row.get::<_, Option<f64>>(2)?.unwrap_or_default(),
+                    stake_amount: row.get::<_, Option<f64>>(3)?.unwrap_or_default(),
+                    open_rate: row.get::<_, Option<f64>>(4)?.unwrap_or_default(),
+                    leverage: row.get::<_, Option<f64>>(5)?.unwrap_or(1.0),
+                    open_date: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                    tag: row.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let open_stake = open_trades
+            .iter()
+            .map(|trade| trade.stake_amount)
+            .sum::<f64>();
+        let wallet_balance = initial_wallet + realized_profit;
+        Ok(SimulationAccount {
+            wallet_balance,
+            available_balance: (wallet_balance - open_stake).max(0.0),
+            realized_profit,
+            open_stake,
+            closed_trades,
+            winning_trades,
+            open_trades,
+        })
     }
 
     pub fn run_backtest(
@@ -319,6 +392,18 @@ fn migrate_config(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn migrate_compose(path: &Path) -> Result<()> {
+    let source = fs::read_to_string(path).context("无法读取 Docker Compose 配置")?;
+    let updated = source.replace(
+        "sqlite:////freqtrade/user_data/tradesv3.sqlite",
+        "${FREQTRADE_DB_URL:-sqlite:////freqtrade/user_data/tradesv3.dryrun.sqlite}",
+    );
+    if updated != source {
+        fs::write(path, updated).context("无法迁移 Docker Compose 配置")?;
+    }
+    Ok(())
+}
+
 fn random_config_secret() -> String {
     let mut value = [0_u8; 32];
     OsRng.fill_bytes(&mut value);
@@ -377,6 +462,33 @@ mod tests {
         assert!(workspace.dry_run().unwrap());
         workspace.update_mode(false).unwrap();
         assert!(!workspace.dry_run().unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reads_simulation_wallet_and_trades() {
+        let root = std::env::temp_dir().join(format!("gqt-sim-{}", rand::random::<u64>()));
+        let workspace = TradingWorkspace::ensure(&root).unwrap();
+        let database = root.join("user_data").join("tradesv3.dryrun.sqlite");
+        let connection = Connection::open(database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE trades (
+                    pair TEXT, is_open INTEGER, is_short INTEGER, amount REAL,
+                    stake_amount REAL, open_rate REAL, leverage REAL, open_date TEXT,
+                    enter_tag TEXT, close_profit_abs REAL, realized_profit REAL
+                 );
+                 INSERT INTO trades VALUES
+                    ('BTC/USDT:USDT', 0, 0, 0.01, 100, 60000, 2, '2026-01-01', 'factor_long', 25, 25),
+                    ('ETH/USDT:USDT', 1, 1, 0.1, 50, 3000, 2, '2026-02-01', 'factor_short', NULL, 0);",
+            )
+            .unwrap();
+        drop(connection);
+        let account = workspace.simulation_account().unwrap();
+        assert_eq!(account.wallet_balance, 1025.0);
+        assert_eq!(account.available_balance, 975.0);
+        assert_eq!(account.closed_trades, 1);
+        assert_eq!(account.open_trades[0].side, "空");
         let _ = fs::remove_dir_all(root);
     }
 }

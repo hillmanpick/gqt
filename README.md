@@ -7,11 +7,13 @@ GQT Trader 是面向 Binance USDT-M 永续合约的 Windows 原生量化客户�
 - Binance Futures 实时 K 线、交易对和周期切换
 - 标记价格、资金费率、多空比、持仓量和 24 小时成交额
 - Binance U 本位真实钱包余额、可用余额、保证金、未实现盈亏和当前持仓
+- 独立模拟账户权益、可用虚拟资金、累计盈亏、胜率和模拟持仓
 - 趋势、仓位、资金费率组成的 0-100 市场情绪分值
 - OpenAI、Claude、DeepSeek 和 OpenAI 兼容中转站风险研判，AI 不具备下单能力
 - 本地策略编辑、Python 语法校验、历史数据下载和回测
 - Freqtrade 数据同步、回测、策略启动、停止、日志与 Dry-run 异常恢复
 - 模拟盘与实盘模式切换；启用和启动实盘均需在客户端二次确认
+- 模拟与实盘分别使用独立 SQLite 交易数据库，成交记录不会混合
 - 仓位、最大持仓数和爆仓缓冲风控
 - Windows DPAPI + AES-256-GCM 本地加密密钥库
 - 保存前使用 Binance Futures 签名账户接口验证 Key、Secret 和合约交易权限

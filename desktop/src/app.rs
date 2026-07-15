@@ -16,7 +16,7 @@ use crate::{
     ai, exchange, market,
     model::{
         AiProvider, Candle, CredentialDraft, FuturesAccount, Interval, MarketCommand, MarketEvent,
-        MarketSnapshot, Page, SecretStatus,
+        MarketSnapshot, Page, SecretStatus, SimulationAccount,
     },
     store::SecretStore,
     theme,
@@ -39,6 +39,11 @@ pub struct GqtApp {
     account_error: String,
     account_check_running: bool,
     last_account_check: Instant,
+    simulation_account: SimulationAccount,
+    simulation_error: String,
+    simulation_check_running: bool,
+    last_simulation_check: Instant,
+    show_simulation_account: bool,
     page: Page,
     symbol: String,
     interval: Interval,
@@ -92,6 +97,7 @@ enum TaskEvent {
         result: Result<String, String>,
     },
     Account(Result<FuturesAccount, String>),
+    Simulation(Result<SimulationAccount, String>),
 }
 
 #[derive(Clone, Copy)]
@@ -157,6 +163,11 @@ impl GqtApp {
             account_error: String::new(),
             account_check_running: false,
             last_account_check: Instant::now() - Duration::from_secs(30),
+            simulation_account: SimulationAccount::default(),
+            simulation_error: String::new(),
+            simulation_check_running: false,
+            last_simulation_check: Instant::now() - Duration::from_secs(30),
+            show_simulation_account: false,
             page: Page::Overview,
             symbol: "BTCUSDT".into(),
             interval: Interval::FourHours,
@@ -294,6 +305,16 @@ impl GqtApp {
                             self.account_error.clear();
                         }
                         Err(error) => self.account_error = error,
+                    }
+                }
+                TaskEvent::Simulation(result) => {
+                    self.simulation_check_running = false;
+                    match result {
+                        Ok(account) => {
+                            self.simulation_account = account;
+                            self.simulation_error.clear();
+                        }
+                        Err(error) => self.simulation_error = error,
                     }
                 }
             }
@@ -723,24 +744,52 @@ impl GqtApp {
 
     fn render_account(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Binance USDT-M Futures").strong());
+            if ui
+                .selectable_label(!self.show_simulation_account, "真实账户")
+                .clicked()
+            {
+                self.show_simulation_account = false;
+            }
+            if ui
+                .selectable_label(self.show_simulation_account, "模拟账户")
+                .clicked()
+            {
+                self.show_simulation_account = true;
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
                     .add_enabled(
-                        !self.account_check_running,
-                        theme::secondary_button(if self.account_check_running {
-                            "刷新中..."
+                        if self.show_simulation_account {
+                            !self.simulation_check_running
                         } else {
-                            "刷新账户"
-                        }),
+                            !self.account_check_running
+                        },
+                        theme::secondary_button(
+                            if (self.show_simulation_account && self.simulation_check_running)
+                                || (!self.show_simulation_account && self.account_check_running)
+                            {
+                                "刷新中..."
+                            } else {
+                                "刷新账户"
+                            },
+                        ),
                     )
                     .clicked()
                 {
-                    self.last_account_check = Instant::now() - Duration::from_secs(30);
-                    self.refresh_account();
+                    if self.show_simulation_account {
+                        self.last_simulation_check = Instant::now() - Duration::from_secs(30);
+                        self.refresh_simulation_account();
+                    } else {
+                        self.last_account_check = Instant::now() - Duration::from_secs(30);
+                        self.refresh_account();
+                    }
                 }
             });
         });
+        if self.show_simulation_account {
+            self.render_simulation_account(ui);
+            return;
+        }
         if !self.account_error.is_empty() {
             ui.colored_label(theme::RED, &self.account_error);
         }
@@ -839,6 +888,110 @@ impl GqtApp {
                                 );
                                 ui.label(format_price(position.liquidation_price));
                                 ui.label(&position.margin_type);
+                                ui.end_row();
+                            }
+                        });
+                });
+            });
+    }
+
+    fn render_simulation_account(&mut self, ui: &mut Ui) {
+        if !self.simulation_error.is_empty() {
+            ui.colored_label(theme::RED, &self.simulation_error);
+        }
+        ui.add_space(12.0);
+        let win_rate = if self.simulation_account.closed_trades > 0 {
+            self.simulation_account.winning_trades as f64
+                / self.simulation_account.closed_trades as f64
+                * 100.0
+        } else {
+            0.0
+        };
+        ui.columns(4, |cols| {
+            metric(
+                &mut cols[0],
+                "模拟权益",
+                &format!("{:.2} USDT", self.simulation_account.wallet_balance),
+                "独立虚拟资金",
+                theme::YELLOW,
+            );
+            metric(
+                &mut cols[1],
+                "模拟可用",
+                &format!("{:.2} USDT", self.simulation_account.available_balance),
+                &format!("持仓占用 {:.2}", self.simulation_account.open_stake),
+                theme::TEXT,
+            );
+            metric(
+                &mut cols[2],
+                "累计已实现",
+                &format!("{:+.2} USDT", self.simulation_account.realized_profit),
+                &format!("{} 笔已平仓", self.simulation_account.closed_trades),
+                if self.simulation_account.realized_profit >= 0.0 {
+                    theme::GREEN
+                } else {
+                    theme::RED
+                },
+            );
+            metric(
+                &mut cols[3],
+                "模拟胜率",
+                &format!("{win_rate:.1}%"),
+                &format!("{} 笔盈利", self.simulation_account.winning_trades),
+                theme::TEXT,
+            );
+        });
+        ui.add_space(18.0);
+        section_title(
+            ui,
+            "模拟持仓",
+            &format!("{} 个虚拟仓位", self.simulation_account.open_trades.len()),
+        );
+        Frame::NONE
+            .fill(theme::SURFACE)
+            .stroke(Stroke::new(1.0, theme::BORDER))
+            .corner_radius(5)
+            .inner_margin(Margin::same(14))
+            .show(ui, |ui| {
+                if self.simulation_account.open_trades.is_empty() {
+                    ui.label(RichText::new("当前没有模拟持仓").color(theme::MUTED));
+                    return;
+                }
+                ScrollArea::vertical().show(ui, |ui| {
+                    egui::Grid::new("simulation-positions-grid")
+                        .num_columns(8)
+                        .striped(true)
+                        .spacing([18.0, 12.0])
+                        .show(ui, |ui| {
+                            for heading in [
+                                "合约",
+                                "方向",
+                                "数量",
+                                "保证金",
+                                "开仓价",
+                                "杠杆",
+                                "开仓时间",
+                                "信号",
+                            ] {
+                                ui.label(RichText::new(heading).color(theme::MUTED).strong());
+                            }
+                            ui.end_row();
+                            for trade in &self.simulation_account.open_trades {
+                                ui.label(RichText::new(&trade.pair).strong());
+                                ui.colored_label(
+                                    if trade.side == "多" {
+                                        theme::GREEN
+                                    } else {
+                                        theme::RED
+                                    },
+                                    &trade.side,
+                                );
+                                ui.label(format!("{:.4}", trade.amount));
+                                ui.label(format!("{:.2}", trade.stake_amount));
+                                ui.label(format_price(trade.open_rate));
+                                ui.label(format!("{:.1}x", trade.leverage));
+                                ui.label(&trade.open_date);
+                                ui.label(&trade.tag);
                                 ui.end_row();
                             }
                         });
@@ -1456,6 +1609,24 @@ impl GqtApp {
         });
     }
 
+    fn refresh_simulation_account(&mut self) {
+        if self.simulation_check_running
+            || self.last_simulation_check.elapsed() < Duration::from_secs(3)
+        {
+            return;
+        }
+        self.simulation_check_running = true;
+        self.last_simulation_check = Instant::now();
+        let workspace = self.workspace.clone();
+        let sender = self.task_sender.clone();
+        thread::spawn(move || {
+            let result = workspace
+                .simulation_account()
+                .map_err(|error| error.to_string());
+            let _ = sender.send(TaskEvent::Simulation(result));
+        });
+    }
+
     fn render_settings(&mut self, ui: &mut Ui) {
         ScrollArea::vertical().show(ui, |ui| {
             settings_section(
@@ -1680,6 +1851,7 @@ impl eframe::App for GqtApp {
         if self.unlocked_key.is_some() {
             self.check_bot_health();
             self.refresh_account();
+            self.refresh_simulation_account();
         }
         ctx.request_repaint_after(Duration::from_millis(200));
     }

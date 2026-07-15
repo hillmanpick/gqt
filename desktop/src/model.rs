@@ -155,6 +155,29 @@ pub struct FuturesPosition {
     pub margin_type: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SimulationAccount {
+    pub wallet_balance: f64,
+    pub available_balance: f64,
+    pub realized_profit: f64,
+    pub open_stake: f64,
+    pub closed_trades: i64,
+    pub winning_trades: i64,
+    pub open_trades: Vec<SimulationTrade>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SimulationTrade {
+    pub pair: String,
+    pub side: String,
+    pub amount: f64,
+    pub stake_amount: f64,
+    pub open_rate: f64,
+    pub leverage: f64,
+    pub open_date: String,
+    pub tag: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiProvider {
     OpenAi,
