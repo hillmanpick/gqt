@@ -12,6 +12,7 @@ GQT Trader 是面向 Binance USDT-M 永续合约的 Windows 原生量化客户�
 - Freqtrade 合约策略启动、停止、日志与 Dry-run 异常恢复
 - 仓位、最大持仓数和爆仓缓冲风控
 - Windows DPAPI + AES-256-GCM 本地加密密钥库
+- 保存前使用 Binance Futures 签名账户接口验证 Key、Secret 和合约交易权限
 
 ## 运行要求
 

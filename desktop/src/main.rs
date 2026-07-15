@@ -2,6 +2,7 @@
 
 mod ai;
 mod app;
+mod exchange;
 mod market;
 mod model;
 mod store;

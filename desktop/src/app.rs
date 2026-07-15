@@ -13,7 +13,7 @@ use eframe::egui::{
 use zeroize::Zeroizing;
 
 use crate::{
-    ai, market,
+    ai, exchange, market,
     model::{
         AiProvider, Candle, CredentialDraft, Interval, MarketCommand, MarketEvent, MarketSnapshot,
         Page, SecretStatus,
@@ -33,6 +33,7 @@ pub struct GqtApp {
     workspace: TradingWorkspace,
     unlocked_key: Option<Zeroizing<[u8; 32]>>,
     credential_draft: CredentialDraft,
+    credential_check_running: bool,
     secret_status: SecretStatus,
     page: Page,
     symbol: String,
@@ -77,6 +78,18 @@ enum TaskEvent {
     Job(Result<String, String>),
     Ai(Result<String, String>),
     Health(bool, String),
+    BinanceValidation {
+        action: CredentialAction,
+        api_key: String,
+        api_secret: String,
+        result: Result<String, String>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum CredentialAction {
+    Setup,
+    Update,
 }
 
 impl GqtApp {
@@ -122,6 +135,7 @@ impl GqtApp {
             workspace,
             unlocked_key,
             credential_draft: CredentialDraft::default(),
+            credential_check_running: false,
             secret_status,
             page: Page::Overview,
             symbol: "BTCUSDT".into(),
@@ -223,6 +237,31 @@ impl GqtApp {
                         self.bot_action(true);
                     }
                 }
+                TaskEvent::BinanceValidation {
+                    action,
+                    api_key,
+                    api_secret,
+                    result,
+                } => {
+                    self.credential_check_running = false;
+                    match result {
+                        Ok(message) => {
+                            if self.credential_draft.binance_key.trim() != api_key
+                                || self.credential_draft.binance_secret.trim() != api_secret
+                            {
+                                self.toast("Binance 凭据已修改，请重新验证", true);
+                            } else {
+                                match action {
+                                    CredentialAction::Setup => self.finish_setup(&message),
+                                    CredentialAction::Update => {
+                                        self.finish_credential_update(&message)
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => self.toast(error, true),
+                    }
+                }
             }
         }
     }
@@ -314,10 +353,17 @@ impl GqtApp {
                                 });
                             ui.add_space(14.0);
                             if ui
-                                .add_sized(
-                                    [ui.available_width(), 40.0],
-                                    theme::primary_button("加密保存并进入"),
-                                )
+                                .add_enabled_ui(!self.credential_check_running, |ui| {
+                                    ui.add_sized(
+                                        [ui.available_width(), 40.0],
+                                        theme::primary_button(if self.credential_check_running {
+                                            "正在验证 Binance..."
+                                        } else {
+                                            "验证并加密保存"
+                                        }),
+                                    )
+                                })
+                                .inner
                                 .clicked()
                             {
                                 self.connect_binance();
@@ -332,15 +378,39 @@ impl GqtApp {
             self.toast(error, true);
             return;
         }
+        self.validate_binance_credentials(CredentialAction::Setup);
+    }
+
+    fn finish_setup(&mut self, validation_message: &str) {
         match self.store.setup(&self.credential_draft) {
             Ok(key) => {
                 self.unlocked_key = Some(key);
                 self.secret_status = self.store.secret_status().unwrap_or_default();
                 self.credential_draft = CredentialDraft::default();
-                self.toast("密钥已由当前 Windows 账户加密保护", false);
+                self.toast(validation_message, false);
             }
             Err(error) => self.toast(error.to_string(), true),
         }
+    }
+
+    fn validate_binance_credentials(&mut self, action: CredentialAction) {
+        if self.credential_check_running {
+            return;
+        }
+        let api_key = self.credential_draft.binance_key.trim().to_string();
+        let api_secret = self.credential_draft.binance_secret.trim().to_string();
+        self.credential_check_running = true;
+        let sender = self.task_sender.clone();
+        thread::spawn(move || {
+            let result = exchange::validate_futures_credentials(&api_key, &api_secret)
+                .map_err(|error| error.to_string());
+            let _ = sender.send(TaskEvent::BinanceValidation {
+                action,
+                api_key,
+                api_secret,
+                result,
+            });
+        });
     }
 
     fn render_shell(&mut self, root: &mut Ui) {
@@ -1101,19 +1171,18 @@ impl GqtApp {
                         .hint_text("https://example.com/v1"),
                 );
                 ui.add_space(10.0);
-                if ui.add(theme::primary_button("更新密钥")).clicked() {
-                    if let Err(error) = self.save_relay_endpoint() {
-                        self.toast(error, true);
-                    } else if let Some(key) = self.unlocked_key.as_ref() {
-                        match self.store.update_credentials(key, &self.credential_draft) {
-                            Ok(()) => {
-                                self.credential_draft = CredentialDraft::default();
-                                self.secret_status = self.store.secret_status().unwrap_or_default();
-                                self.toast("密钥已加密更新", false);
-                            }
-                            Err(error) => self.toast(error.to_string(), true),
-                        }
-                    }
+                if ui
+                    .add_enabled(
+                        !self.credential_check_running,
+                        theme::primary_button(if self.credential_check_running {
+                            "正在验证 Binance..."
+                        } else {
+                            "验证并更新密钥"
+                        }),
+                    )
+                    .clicked()
+                {
+                    self.request_credential_update();
                 }
             });
         });
@@ -1136,6 +1205,34 @@ impl GqtApp {
             .map_err(|error| error.to_string())?;
         self.relay_base_url = normalized;
         Ok(())
+    }
+
+    fn request_credential_update(&mut self) {
+        if let Err(error) = self.save_relay_endpoint() {
+            self.toast(error, true);
+            return;
+        }
+        let binance_supplied = !self.credential_draft.binance_key.trim().is_empty()
+            || !self.credential_draft.binance_secret.trim().is_empty();
+        if binance_supplied {
+            self.validate_binance_credentials(CredentialAction::Update);
+        } else {
+            self.finish_credential_update("密钥已加密更新");
+        }
+    }
+
+    fn finish_credential_update(&mut self, validation_message: &str) {
+        let Some(key) = self.unlocked_key.as_ref() else {
+            return;
+        };
+        match self.store.update_credentials(key, &self.credential_draft) {
+            Ok(()) => {
+                self.credential_draft = CredentialDraft::default();
+                self.secret_status = self.store.secret_status().unwrap_or_default();
+                self.toast(validation_message, false);
+            }
+            Err(error) => self.toast(error.to_string(), true),
+        }
     }
 
     fn select_market(&self) {
