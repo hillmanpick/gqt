@@ -1,0 +1,25 @@
+[Unit]
+Description=GQT Quant Platform
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=gqt
+Group=gqt
+SupplementaryGroups=docker
+WorkingDirectory=/opt/gqt
+EnvironmentFile=/etc/gqt/gqt.env
+ExecStart=/opt/node-v22/bin/node /opt/gqt/server.mjs
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/opt/gqt/data /opt/gqt/trading/user_data
+
+[Install]
+WantedBy=multi-user.target

@@ -95,6 +95,8 @@ Nginx 只代理到 `127.0.0.1:4173`，并传递 `Host`、`X-Forwarded-For` 和 `
 
 前端会根据入口 URL 自动识别部署前缀，因此也可以将 Nginx 的 `/gqt/` 代理到 GQT 根路径，同时保留域名下已有的其他服务。
 
+仓库中的 `deploy/gqt.service` 是可直接安装的 systemd 单元，`deploy/nginx/` 包含 HTTP 强制跳转和 HTTPS 反向代理片段。
+
 ## 启用实盘
 
 先完成数据下载、分段回测和至少数周 Dry-run。确认策略、手续费、滑点、最小下单量和极端行情保护后：
