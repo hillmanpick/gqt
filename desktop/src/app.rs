@@ -15,8 +15,8 @@ use zeroize::Zeroizing;
 use crate::{
     ai, exchange, market,
     model::{
-        AiProvider, Candle, CredentialDraft, Interval, MarketCommand, MarketEvent, MarketSnapshot,
-        Page, SecretStatus,
+        AiProvider, Candle, CredentialDraft, FuturesAccount, Interval, MarketCommand, MarketEvent,
+        MarketSnapshot, Page, SecretStatus,
     },
     store::SecretStore,
     theme,
@@ -35,6 +35,10 @@ pub struct GqtApp {
     credential_draft: CredentialDraft,
     credential_check_running: bool,
     secret_status: SecretStatus,
+    account: FuturesAccount,
+    account_error: String,
+    account_check_running: bool,
+    last_account_check: Instant,
     page: Page,
     symbol: String,
     interval: Interval,
@@ -52,6 +56,9 @@ pub struct GqtApp {
     docker_available: bool,
     bot_state: String,
     bot_log: String,
+    dry_run: bool,
+    live_confirmation: Option<LiveAction>,
+    live_acknowledged: bool,
     auto_restart: bool,
     health_check_running: bool,
     last_health_check: Instant,
@@ -84,12 +91,19 @@ enum TaskEvent {
         api_secret: String,
         result: Result<String, String>,
     },
+    Account(Result<FuturesAccount, String>),
 }
 
 #[derive(Clone, Copy)]
 enum CredentialAction {
     Setup,
     Update,
+}
+
+#[derive(Clone, Copy)]
+enum LiveAction {
+    Enable,
+    Start,
 }
 
 impl GqtApp {
@@ -120,11 +134,13 @@ impl GqtApp {
         });
         let (task_sender, task_receiver) = mpsc::channel();
         let (docker_available, bot_state) = workspace.docker_state();
-        let auto_restart = store
-            .setting("auto_restart")
-            .ok()
-            .flatten()
-            .is_some_and(|value| value == "true");
+        let dry_run = workspace.dry_run().unwrap_or(true);
+        let auto_restart = dry_run
+            && store
+                .setting("auto_restart")
+                .ok()
+                .flatten()
+                .is_some_and(|value| value == "true");
         let relay_base_url = store
             .setting("relay_base_url")
             .ok()
@@ -137,6 +153,10 @@ impl GqtApp {
             credential_draft: CredentialDraft::default(),
             credential_check_running: false,
             secret_status,
+            account: FuturesAccount::default(),
+            account_error: String::new(),
+            account_check_running: false,
+            last_account_check: Instant::now() - Duration::from_secs(30),
             page: Page::Overview,
             symbol: "BTCUSDT".into(),
             interval: Interval::FourHours,
@@ -154,6 +174,9 @@ impl GqtApp {
             docker_available,
             bot_state,
             bot_log: String::new(),
+            dry_run,
+            live_confirmation: None,
+            live_acknowledged: false,
             auto_restart,
             health_check_running: false,
             last_health_check: Instant::now(),
@@ -233,7 +256,8 @@ impl GqtApp {
                     self.health_check_running = false;
                     self.docker_available = available;
                     self.bot_state = state;
-                    if self.auto_restart && available && self.bot_state != "running" {
+                    if self.dry_run && self.auto_restart && available && self.bot_state != "running"
+                    {
                         self.bot_action(true);
                     }
                 }
@@ -260,6 +284,16 @@ impl GqtApp {
                             }
                         }
                         Err(error) => self.toast(error, true),
+                    }
+                }
+                TaskEvent::Account(result) => {
+                    self.account_check_running = false;
+                    match result {
+                        Ok(account) => {
+                            self.account = account;
+                            self.account_error.clear();
+                        }
+                        Err(error) => self.account_error = error,
                     }
                 }
             }
@@ -496,7 +530,15 @@ impl GqtApp {
                                 })
                                 .size(12.0),
                             );
-                            ui.label(RichText::new("DRY-RUN").size(10.0).color(theme::MUTED));
+                            ui.label(
+                                RichText::new(if self.dry_run { "DRY-RUN" } else { "LIVE" })
+                                    .size(10.0)
+                                    .color(if self.dry_run {
+                                        theme::MUTED
+                                    } else {
+                                        theme::RED
+                                    }),
+                            );
                         });
                     });
                 });
@@ -526,9 +568,13 @@ impl GqtApp {
                             .inner_margin(Margin::symmetric(9, 5))
                             .show(ui, |ui| {
                                 ui.label(
-                                    RichText::new("DRY-RUN")
+                                    RichText::new(if self.dry_run { "DRY-RUN" } else { "LIVE" })
                                         .size(11.0)
-                                        .color(theme::YELLOW)
+                                        .color(if self.dry_run {
+                                            theme::YELLOW
+                                        } else {
+                                            theme::RED
+                                        })
                                         .strong(),
                                 );
                             });
@@ -540,6 +586,7 @@ impl GqtApp {
             .frame(Frame::NONE.fill(theme::BG).inner_margin(Margin::same(24)))
             .show(root, |ui| match self.page {
                 Page::Overview => self.render_overview(ui),
+                Page::Account => self.render_account(ui),
                 Page::Market => self.render_market(ui),
                 Page::Strategy => self.render_strategy(ui),
                 Page::Backtest => self.render_backtest(ui),
@@ -551,43 +598,68 @@ impl GqtApp {
 
     fn render_overview(&mut self, ui: &mut Ui) {
         let exposure = self.stake_amount * self.max_open_trades as f64;
+        let account_loaded = self.account.updated_at > 0;
         let columns = 4;
         ui.columns(columns, |cols| {
             metric(
                 &mut cols[0],
-                "交易内核",
-                if self.bot_state == "running" {
-                    "运行中"
+                "合约权益",
+                &if account_loaded {
+                    format!("{:.2} USDT", self.account.margin_balance)
                 } else {
-                    "已停止"
+                    "--".into()
                 },
-                if self.docker_available {
-                    "Docker 已连接"
+                if account_loaded {
+                    "Binance Futures"
                 } else {
-                    "Docker 不可用"
+                    "正在读取账户"
                 },
                 theme::YELLOW,
             );
             metric(
                 &mut cols[1],
-                "运行模式",
-                "模拟盘",
-                "Isolated · Futures",
-                theme::GREEN,
+                "可用余额",
+                &if account_loaded {
+                    format!("{:.2} USDT", self.account.available_balance)
+                } else {
+                    "--".into()
+                },
+                "可用于新开仓",
+                theme::TEXT,
             );
             metric(
                 &mut cols[2],
-                "风险敞口",
-                &format!("{exposure:.0} USDT"),
-                &format!("{:.0} × {} 仓", self.stake_amount, self.max_open_trades),
-                theme::TEXT,
+                "未实现盈亏",
+                &if account_loaded {
+                    format!("{:+.2} USDT", self.account.unrealized_profit)
+                } else {
+                    "--".into()
+                },
+                &format!("{} 个持仓", self.account.positions.len()),
+                if self.account.unrealized_profit >= 0.0 {
+                    theme::GREEN
+                } else {
+                    theme::RED
+                },
             );
             metric(
                 &mut cols[3],
-                "当前策略",
-                "FuturesFactorStrategy",
-                "10 个永续合约",
-                theme::TEXT,
+                "量化策略",
+                if self.bot_state == "running" {
+                    "运行中"
+                } else {
+                    "已停止"
+                },
+                if self.dry_run {
+                    "FuturesFactorStrategy · Dry-run"
+                } else {
+                    "FuturesFactorStrategy · Live"
+                },
+                if self.bot_state == "running" {
+                    theme::GREEN
+                } else {
+                    theme::MUTED
+                },
             );
         });
         ui.add_space(18.0);
@@ -632,12 +704,146 @@ impl GqtApp {
                 );
                 status_row(
                     ui,
+                    "账户接口",
+                    if account_loaded {
+                        "已连接"
+                    } else {
+                        "连接中"
+                    },
+                );
+                status_row(
+                    ui,
                     "爆仓缓冲",
                     &format!("{:.0}%", self.liquidation_buffer * 100.0),
                 );
                 status_row(ui, "本地数据库", "key.db");
             });
         });
+    }
+
+    fn render_account(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Binance USDT-M Futures").strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        !self.account_check_running,
+                        theme::secondary_button(if self.account_check_running {
+                            "刷新中..."
+                        } else {
+                            "刷新账户"
+                        }),
+                    )
+                    .clicked()
+                {
+                    self.last_account_check = Instant::now() - Duration::from_secs(30);
+                    self.refresh_account();
+                }
+            });
+        });
+        if !self.account_error.is_empty() {
+            ui.colored_label(theme::RED, &self.account_error);
+        }
+        ui.add_space(12.0);
+        ui.columns(4, |cols| {
+            metric(
+                &mut cols[0],
+                "钱包余额",
+                &format!("{:.2} USDT", self.account.wallet_balance),
+                "账户余额",
+                theme::TEXT,
+            );
+            metric(
+                &mut cols[1],
+                "保证金余额",
+                &format!("{:.2} USDT", self.account.margin_balance),
+                &format!("占用 {:.2}", self.account.initial_margin),
+                theme::YELLOW,
+            );
+            metric(
+                &mut cols[2],
+                "可用余额",
+                &format!("{:.2} USDT", self.account.available_balance),
+                "可用于开仓",
+                theme::TEXT,
+            );
+            metric(
+                &mut cols[3],
+                "未实现盈亏",
+                &format!("{:+.2} USDT", self.account.unrealized_profit),
+                &format!("维持保证金 {:.2}", self.account.maintenance_margin),
+                if self.account.unrealized_profit >= 0.0 {
+                    theme::GREEN
+                } else {
+                    theme::RED
+                },
+            );
+        });
+        ui.add_space(18.0);
+        section_title(
+            ui,
+            "当前持仓",
+            &format!("{} 个有效仓位", self.account.positions.len()),
+        );
+        Frame::NONE
+            .fill(theme::SURFACE)
+            .stroke(Stroke::new(1.0, theme::BORDER))
+            .corner_radius(5)
+            .inner_margin(Margin::same(14))
+            .show(ui, |ui| {
+                if self.account.positions.is_empty() {
+                    ui.label(RichText::new("当前没有合约持仓").color(theme::MUTED));
+                    return;
+                }
+                ScrollArea::vertical().show(ui, |ui| {
+                    egui::Grid::new("positions-grid")
+                        .num_columns(9)
+                        .striped(true)
+                        .spacing([18.0, 12.0])
+                        .show(ui, |ui| {
+                            for heading in [
+                                "合约",
+                                "方向",
+                                "数量",
+                                "开仓价",
+                                "标记价",
+                                "杠杆",
+                                "未实现盈亏",
+                                "强平价",
+                                "模式",
+                            ] {
+                                ui.label(RichText::new(heading).color(theme::MUTED).strong());
+                            }
+                            ui.end_row();
+                            for position in &self.account.positions {
+                                ui.label(RichText::new(&position.symbol).strong());
+                                ui.colored_label(
+                                    if position.side == "多" {
+                                        theme::GREEN
+                                    } else {
+                                        theme::RED
+                                    },
+                                    &position.side,
+                                );
+                                ui.label(format!("{:.4}", position.quantity));
+                                ui.label(format_price(position.entry_price));
+                                ui.label(format_price(position.mark_price));
+                                ui.label(format!("{}x", position.leverage));
+                                ui.colored_label(
+                                    if position.unrealized_profit >= 0.0 {
+                                        theme::GREEN
+                                    } else {
+                                        theme::RED
+                                    },
+                                    format!("{:+.2}", position.unrealized_profit),
+                                );
+                                ui.label(format_price(position.liquidation_price));
+                                ui.label(&position.margin_type);
+                                ui.end_row();
+                            }
+                        });
+                });
+            });
     }
 
     fn render_market(&mut self, ui: &mut Ui) {
@@ -975,6 +1181,41 @@ impl GqtApp {
     }
 
     fn render_execution(&mut self, ui: &mut Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if ui.add(theme::secondary_button("编辑策略")).clicked() {
+                self.page = Page::Strategy;
+            }
+            if ui.add(theme::secondary_button("同步历史数据")).clicked() {
+                self.page = Page::Data;
+            }
+            if ui.add(theme::secondary_button("运行回测")).clicked() {
+                self.page = Page::Backtest;
+            }
+            ui.separator();
+            status_chip(ui, "4h 周期", true);
+            status_chip(ui, "多空双向", true);
+            status_chip(ui, "最高 2x", true);
+            ui.separator();
+            if ui.selectable_label(self.dry_run, "模拟盘").clicked() && !self.dry_run {
+                self.set_trading_mode(true);
+            }
+            if ui.selectable_label(!self.dry_run, "实盘").clicked() && self.dry_run {
+                if self.bot_state == "running" {
+                    self.toast("请先停止策略再切换运行模式", true);
+                } else {
+                    self.live_acknowledged = false;
+                    self.live_confirmation = Some(LiveAction::Enable);
+                }
+            }
+            ui.label(
+                RichText::new(format!(
+                    "单仓 {:.0} USDT · 最多 {} 仓",
+                    self.stake_amount, self.max_open_trades
+                ))
+                .color(theme::MUTED),
+            );
+        });
+        ui.add_space(14.0);
         Frame::NONE
             .fill(theme::SURFACE)
             .stroke(Stroke::new(1.0, theme::BORDER))
@@ -987,15 +1228,32 @@ impl GqtApp {
                         ui.label(RichText::new("Freqtrade").size(18.0).strong());
                         ui.label(
                             RichText::new(format!(
-                                "{} · DRY-RUN · FuturesFactorStrategy",
-                                self.bot_state
+                                "{} · {} · FuturesFactorStrategy",
+                                self.bot_state,
+                                if self.dry_run { "DRY-RUN" } else { "LIVE" }
                             ))
-                            .color(theme::MUTED),
+                            .color(if self.dry_run {
+                                theme::MUTED
+                            } else {
+                                theme::RED
+                            }),
                         );
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.add(theme::primary_button("启动策略")).clicked() {
-                            self.bot_action(true);
+                        if ui
+                            .add(theme::primary_button(if self.dry_run {
+                                "启动模拟策略"
+                            } else {
+                                "启动实盘策略"
+                            }))
+                            .clicked()
+                        {
+                            if self.dry_run {
+                                self.bot_action(true);
+                            } else {
+                                self.live_acknowledged = false;
+                                self.live_confirmation = Some(LiveAction::Start);
+                            }
                         }
                         if ui.add(theme::secondary_button("停止")).clicked() {
                             self.bot_action(false);
@@ -1039,12 +1297,17 @@ impl GqtApp {
             .unwrap_or_default();
         let workspace = self.workspace.clone();
         let sender = self.task_sender.clone();
+        let dry_run = self.dry_run;
         thread::spawn(move || {
             let result = workspace
                 .bot_action(start, &api_key, &api_secret)
                 .map(|_| {
                     if start {
-                        "Dry-run 策略已启动".into()
+                        if dry_run {
+                            "Dry-run 策略已启动".into()
+                        } else {
+                            "实盘策略已启动".into()
+                        }
                     } else {
                         "交易内核已停止".into()
                     }
@@ -1062,6 +1325,88 @@ impl GqtApp {
         });
     }
 
+    fn set_trading_mode(&mut self, dry_run: bool) {
+        if self.bot_state == "running" {
+            self.toast("请先停止策略再切换运行模式", true);
+            return;
+        }
+        match self.workspace.update_mode(dry_run) {
+            Ok(()) => {
+                self.dry_run = dry_run;
+                if !dry_run {
+                    self.auto_restart = false;
+                    let _ = self.store.set_setting("auto_restart", "false");
+                }
+                self.toast(
+                    if dry_run {
+                        "已切换到模拟盘"
+                    } else {
+                        "已启用实盘模式"
+                    },
+                    false,
+                );
+            }
+            Err(error) => self.toast(error.to_string(), true),
+        }
+    }
+
+    fn render_live_confirmation(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.live_confirmation else {
+            return;
+        };
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new(match action {
+            LiveAction::Enable => "启用实盘模式",
+            LiveAction::Start => "启动实盘策略",
+        })
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.set_min_width(420.0);
+            ui.colored_label(theme::RED, "实盘策略会自动发送 Binance Futures 订单");
+            ui.label(format!(
+                "单仓保证金 {:.0} USDT，最多同时持有 {} 个仓位，策略最高杠杆 2x。",
+                self.stake_amount, self.max_open_trades
+            ));
+            ui.add_space(10.0);
+            ui.checkbox(
+                &mut self.live_acknowledged,
+                "我确认使用真实资金并承担合约交易风险",
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        self.live_acknowledged,
+                        theme::primary_button(match action {
+                            LiveAction::Enable => "确认启用实盘",
+                            LiveAction::Start => "确认启动实盘策略",
+                        }),
+                    )
+                    .clicked()
+                {
+                    confirm = true;
+                }
+                if ui.add(theme::secondary_button("取消")).clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if confirm {
+            self.live_confirmation = None;
+            self.live_acknowledged = false;
+            match action {
+                LiveAction::Enable => self.set_trading_mode(false),
+                LiveAction::Start => self.bot_action(true),
+            }
+        } else if cancel {
+            self.live_confirmation = None;
+            self.live_acknowledged = false;
+        }
+    }
+
     fn check_bot_health(&mut self) {
         if self.health_check_running || self.last_health_check.elapsed() < Duration::from_secs(15) {
             return;
@@ -1076,25 +1421,71 @@ impl GqtApp {
         });
     }
 
+    fn refresh_account(&mut self) {
+        if self.account_check_running || self.last_account_check.elapsed() < Duration::from_secs(8)
+        {
+            return;
+        }
+        let Some(key) = self.unlocked_key.as_ref() else {
+            return;
+        };
+        let api_key = self
+            .store
+            .get_secret(key, "binance_api_key")
+            .ok()
+            .flatten()
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let api_secret = self
+            .store
+            .get_secret(key, "binance_api_secret")
+            .ok()
+            .flatten()
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        if api_key.is_empty() || api_secret.is_empty() {
+            return;
+        }
+        self.account_check_running = true;
+        self.last_account_check = Instant::now();
+        let sender = self.task_sender.clone();
+        thread::spawn(move || {
+            let result = exchange::fetch_futures_account(&api_key, &api_secret)
+                .map_err(|error| error.to_string());
+            let _ = sender.send(TaskEvent::Account(result));
+        });
+    }
+
     fn render_settings(&mut self, ui: &mut Ui) {
         ScrollArea::vertical().show(ui, |ui| {
-            settings_section(ui, "运行保护", "Dry-run", |ui| {
-                let changed = ui
-                    .checkbox(&mut self.auto_restart, "异常停止后自动恢复策略")
-                    .changed();
-                if changed {
-                    let value = if self.auto_restart { "true" } else { "false" };
-                    match self.store.set_setting("auto_restart", value) {
-                        Ok(()) => self.toast("运行保护设置已保存", false),
-                        Err(error) => self.toast(error.to_string(), true),
+            settings_section(
+                ui,
+                "运行保护",
+                if self.dry_run { "Dry-run" } else { "Live" },
+                |ui| {
+                    let changed = ui
+                        .add_enabled(
+                            self.dry_run,
+                            egui::Checkbox::new(
+                                &mut self.auto_restart,
+                                "异常停止后自动恢复模拟策略",
+                            ),
+                        )
+                        .changed();
+                    if changed {
+                        let value = if self.auto_restart { "true" } else { "false" };
+                        match self.store.set_setting("auto_restart", value) {
+                            Ok(()) => self.toast("运行保护设置已保存", false),
+                            Err(error) => self.toast(error.to_string(), true),
+                        }
                     }
-                }
-                ui.horizontal(|ui| {
-                    status_chip(ui, "仅模拟盘", true);
-                    status_chip(ui, "Docker", self.docker_available);
-                    status_row(ui, "当前状态", &self.bot_state);
-                });
-            });
+                    ui.horizontal(|ui| {
+                        status_chip(ui, if self.dry_run { "模拟盘" } else { "实盘" }, true);
+                        status_chip(ui, "Docker", self.docker_available);
+                        status_row(ui, "当前状态", &self.bot_state);
+                    });
+                },
+            );
             ui.add_space(12.0);
             settings_section(ui, "仓位限制", "USDT-M · Isolated", |ui| {
                 ui.columns(3, |cols| {
@@ -1288,6 +1679,7 @@ impl eframe::App for GqtApp {
         self.drain_events();
         if self.unlocked_key.is_some() {
             self.check_bot_health();
+            self.refresh_account();
         }
         ctx.request_repaint_after(Duration::from_millis(200));
     }
@@ -1298,6 +1690,7 @@ impl eframe::App for GqtApp {
         } else {
             self.render_shell(ui);
         }
+        self.render_live_confirmation(ui.ctx());
         if let Some((message, error, created)) = self.toast.clone() {
             if created.elapsed() < Duration::from_secs(3) {
                 egui::Area::new("toast".into())

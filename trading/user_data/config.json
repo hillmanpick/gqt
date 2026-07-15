@@ -79,10 +79,18 @@
     }
   ],
   "api_server": {
-    "enabled": false
+    "enabled": false,
+    "listen_ip_address": "127.0.0.1",
+    "listen_port": 8080,
+    "username": "gqt",
+    "password": "disabled-local-api",
+    "jwt_secret_key": "gqt-disabled-jwt-key-change-before-enabling-00000000",
+    "ws_token": "gqt-disabled-ws-token-change-before-enabling",
+    "CORS_origins": [],
+    "verbosity": "error"
   },
   "bot_name": "binance-futures-factor",
-  "initial_state": "stopped",
+  "initial_state": "running",
   "force_entry_enable": false,
   "internals": {
     "process_throttle_secs": 5,

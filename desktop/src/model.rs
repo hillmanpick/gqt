@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Overview,
+    Account,
     Market,
     Strategy,
     Backtest,
@@ -12,8 +13,9 @@ pub enum Page {
 }
 
 impl Page {
-    pub const ALL: [Page; 7] = [
+    pub const ALL: [Page; 8] = [
         Page::Overview,
+        Page::Account,
         Page::Market,
         Page::Strategy,
         Page::Backtest,
@@ -25,6 +27,7 @@ impl Page {
     pub fn label(self) -> &'static str {
         match self {
             Page::Overview => "总览",
+            Page::Account => "账户",
             Page::Market => "行情",
             Page::Strategy => "策略",
             Page::Backtest => "回测",
@@ -37,6 +40,7 @@ impl Page {
     pub fn icon(self) -> &'static str {
         match self {
             Page::Overview => "layout-dashboard",
+            Page::Account => "wallet-cards",
             Page::Market => "candlestick-chart",
             Page::Strategy => "braces",
             Page::Backtest => "chart-no-axes-combined",
@@ -49,6 +53,7 @@ impl Page {
     pub fn context(self) -> &'static str {
         match self {
             Page::Overview => "Binance U 本位永续",
+            Page::Account => "真实账户资金与合约持仓",
             Page::Market => "实时 K 线与市场情绪",
             Page::Strategy => "Rust 客户端 / Freqtrade Interface v3",
             Page::Backtest => "历史验证与成本压力测试",
@@ -123,6 +128,31 @@ pub struct MarketSnapshot {
     pub long_short_ratio: f64,
     pub open_interest: f64,
     pub sentiment: Sentiment,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FuturesAccount {
+    pub wallet_balance: f64,
+    pub available_balance: f64,
+    pub margin_balance: f64,
+    pub unrealized_profit: f64,
+    pub initial_margin: f64,
+    pub maintenance_margin: f64,
+    pub positions: Vec<FuturesPosition>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FuturesPosition {
+    pub symbol: String,
+    pub side: String,
+    pub quantity: f64,
+    pub entry_price: f64,
+    pub mark_price: f64,
+    pub leverage: i64,
+    pub unrealized_profit: f64,
+    pub liquidation_price: f64,
+    pub margin_type: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

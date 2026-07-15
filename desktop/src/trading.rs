@@ -6,7 +6,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
-use serde_json::Value;
+use rand::{RngCore, rngs::OsRng};
+use serde_json::{Value, json};
 
 const DEFAULT_CONFIG: &str = include_str!("../../trading/user_data/config.json");
 const DEFAULT_STRATEGY: &str =
@@ -28,6 +29,7 @@ impl TradingWorkspace {
         let strategy = strategy_dir.join("FuturesFactorStrategy.py");
         let compose = root.join("docker-compose.yml");
         write_if_missing(&config, DEFAULT_CONFIG)?;
+        migrate_config(&config)?;
         write_if_missing(&strategy, DEFAULT_STRATEGY)?;
         write_if_missing(&compose, DEFAULT_COMPOSE)?;
         Ok(Self {
@@ -76,6 +78,21 @@ impl TradingWorkspace {
             config["max_open_trades"].as_i64().unwrap_or(3),
             config["liquidation_buffer"].as_f64().unwrap_or(0.15),
         ))
+    }
+
+    pub fn dry_run(&self) -> Result<bool> {
+        let config: Value = serde_json::from_str(&fs::read_to_string(&self.config)?)?;
+        Ok(config["dry_run"].as_bool().unwrap_or(true))
+    }
+
+    pub fn update_mode(&self, dry_run: bool) -> Result<()> {
+        let mut config: Value = serde_json::from_str(&fs::read_to_string(&self.config)?)?;
+        config["dry_run"] = Value::from(dry_run);
+        fs::write(
+            &self.config,
+            format!("{}\n", serde_json::to_string_pretty(&config)?),
+        )?;
+        Ok(())
     }
 
     pub fn update_risk(&self, stake: f64, max_trades: i64, buffer: f64) -> Result<()> {
@@ -272,6 +289,42 @@ fn write_if_missing(path: &Path, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn migrate_config(path: &Path) -> Result<()> {
+    let source = fs::read_to_string(path).context("无法读取 Freqtrade 配置")?;
+    let mut config: Value = serde_json::from_str(&source).context("Freqtrade 配置 JSON 无效")?;
+    let api = config
+        .as_object_mut()
+        .context("Freqtrade 配置根节点无效")?
+        .entry("api_server")
+        .or_insert_with(|| json!({}));
+    let api = api.as_object_mut().context("api_server 配置无效")?;
+    api.entry("enabled").or_insert(json!(false));
+    api.entry("listen_ip_address").or_insert(json!("127.0.0.1"));
+    api.entry("listen_port").or_insert(json!(8080));
+    api.entry("username").or_insert(json!("gqt"));
+    api.entry("password")
+        .or_insert_with(|| json!(random_config_secret()));
+    api.entry("jwt_secret_key")
+        .or_insert_with(|| json!(random_config_secret()));
+    api.entry("ws_token")
+        .or_insert_with(|| json!(random_config_secret()));
+    api.entry("CORS_origins").or_insert(json!([]));
+    api.entry("verbosity").or_insert(json!("error"));
+
+    config["initial_state"] = json!("running");
+    let updated = format!("{}\n", serde_json::to_string_pretty(&config)?);
+    if updated != source {
+        fs::write(path, updated).context("无法更新 Freqtrade 配置")?;
+    }
+    Ok(())
+}
+
+fn random_config_secret() -> String {
+    let mut value = [0_u8; 32];
+    OsRng.fill_bytes(&mut value);
+    hex::encode(value)
+}
+
 fn python_command() -> &'static str {
     if cfg!(windows) { "python" } else { "python3" }
 }
@@ -290,5 +343,40 @@ mod tests {
     fn rejects_empty_or_invalid_pairs() {
         assert!(normalized_pairs(&[]).is_err());
         assert!(normalized_pairs(&["BTC/USDT".into()]).is_err());
+    }
+
+    #[test]
+    fn migrates_legacy_api_server_config() {
+        let path = std::env::temp_dir().join(format!(
+            "gqt-freqtrade-config-{}.json",
+            rand::random::<u64>()
+        ));
+        fs::write(
+            &path,
+            r#"{"dry_run":true,"api_server":{"enabled":false},"initial_state":"stopped"}"#,
+        )
+        .unwrap();
+        migrate_config(&path).unwrap();
+        let config: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(config["api_server"]["listen_ip_address"], "127.0.0.1");
+        assert!(
+            config["api_server"]["jwt_secret_key"]
+                .as_str()
+                .unwrap()
+                .len()
+                >= 32
+        );
+        assert_eq!(config["initial_state"], "running");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn updates_dry_run_mode() {
+        let root = std::env::temp_dir().join(format!("gqt-mode-{}", rand::random::<u64>()));
+        let workspace = TradingWorkspace::ensure(&root).unwrap();
+        assert!(workspace.dry_run().unwrap());
+        workspace.update_mode(false).unwrap();
+        assert!(!workspace.dry_run().unwrap());
+        let _ = fs::remove_dir_all(root);
     }
 }

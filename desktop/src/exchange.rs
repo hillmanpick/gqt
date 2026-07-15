@@ -6,6 +6,8 @@ use reqwest::blocking::{Client, Response};
 use serde_json::Value;
 use sha2::Sha256;
 
+use crate::model::{FuturesAccount, FuturesPosition};
+
 const BINANCE_FUTURES_BASE: &str = "https://fapi.binance.com";
 
 pub fn validate_futures_credentials(api_key: &str, api_secret: &str) -> Result<String> {
@@ -15,10 +17,89 @@ pub fn validate_futures_credentials(api_key: &str, api_secret: &str) -> Result<S
         bail!("Binance API Key 或 Secret 长度无效");
     }
 
-    let client = Client::builder()
+    let client = futures_client()?;
+    let server_time = server_time(&client)?;
+    let account = signed_get(
+        &client,
+        "/fapi/v3/account",
+        api_key,
+        api_secret,
+        server_time,
+    )?;
+    if !account["canTrade"].as_bool().unwrap_or(false) {
+        bail!("API Key 有效，但未开通 Binance Futures 交易权限");
+    }
+    Ok("Binance Futures API Key、Secret 和交易权限验证通过".into())
+}
+
+pub fn fetch_futures_account(api_key: &str, api_secret: &str) -> Result<FuturesAccount> {
+    let client = futures_client()?;
+    let server_time = server_time(&client)?;
+    let account = signed_get(
+        &client,
+        "/fapi/v3/account",
+        api_key.trim(),
+        api_secret.trim(),
+        server_time,
+    )?;
+    let position_data = signed_get(
+        &client,
+        "/fapi/v3/positionRisk",
+        api_key.trim(),
+        api_secret.trim(),
+        server_time,
+    )?;
+    parse_futures_account(&account, &position_data)
+}
+
+fn parse_futures_account(account: &Value, position_data: &Value) -> Result<FuturesAccount> {
+    let mut positions = position_data
+        .as_array()
+        .context("Binance 持仓响应无效")?
+        .iter()
+        .filter_map(|position| {
+            let amount = number(position, "positionAmt");
+            (amount.abs() > f64::EPSILON).then(|| FuturesPosition {
+                symbol: position["symbol"].as_str().unwrap_or_default().to_string(),
+                side: if amount >= 0.0 { "多" } else { "空" }.into(),
+                quantity: amount.abs(),
+                entry_price: number(position, "entryPrice"),
+                mark_price: number(position, "markPrice"),
+                leverage: position["leverage"]
+                    .as_str()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(1),
+                unrealized_profit: number(position, "unRealizedProfit"),
+                liquidation_price: number(position, "liquidationPrice"),
+                margin_type: position["marginType"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    positions.sort_by(|left, right| left.symbol.cmp(&right.symbol));
+
+    Ok(FuturesAccount {
+        wallet_balance: number(account, "totalWalletBalance"),
+        available_balance: number(account, "availableBalance"),
+        margin_balance: number(account, "totalMarginBalance"),
+        unrealized_profit: number(account, "totalUnrealizedProfit"),
+        initial_margin: number(account, "totalInitialMargin"),
+        maintenance_margin: number(account, "totalMaintMargin"),
+        positions,
+        updated_at: chrono::Utc::now().timestamp_millis(),
+    })
+}
+
+fn futures_client() -> Result<Client> {
+    Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
-        .context("无法创建 Binance 验证客户端")?;
+        .context("无法创建 Binance 请求客户端")
+}
+
+fn server_time(client: &Client) -> Result<i64> {
     let time = read_json(
         client
             .get(format!("{BINANCE_FUTURES_BASE}/fapi/v1/time"))
@@ -26,25 +107,38 @@ pub fn validate_futures_credentials(api_key: &str, api_secret: &str) -> Result<S
             .context("无法连接 Binance Futures")?,
         "同步 Binance 服务器时间失败",
     )?;
-    let server_time = time["serverTime"]
+    time["serverTime"]
         .as_i64()
-        .context("Binance 服务器时间响应无效")?;
+        .context("Binance 服务器时间响应无效")
+}
+
+fn signed_get(
+    client: &Client,
+    path: &str,
+    api_key: &str,
+    api_secret: &str,
+    server_time: i64,
+) -> Result<Value> {
     let query = format!("timestamp={server_time}&recvWindow=5000");
     let signature = sign_query(api_secret, &query)?;
-    let account = read_json(
+    read_json(
         client
             .get(format!(
-                "{BINANCE_FUTURES_BASE}/fapi/v3/account?{query}&signature={signature}"
+                "{BINANCE_FUTURES_BASE}{path}?{query}&signature={signature}"
             ))
             .header("X-MBX-APIKEY", api_key)
             .send()
-            .context("Binance Futures 凭据验证请求失败")?,
-        "Binance Futures 凭据验证失败",
-    )?;
-    if !account["canTrade"].as_bool().unwrap_or(false) {
-        bail!("API Key 有效，但未开通 Binance Futures 交易权限");
-    }
-    Ok("Binance Futures API Key、Secret 和交易权限验证通过".into())
+            .context("Binance Futures 签名请求失败")?,
+        "Binance Futures 签名请求被拒绝",
+    )
+}
+
+fn number(value: &Value, key: &str) -> f64 {
+    value[key]
+        .as_str()
+        .and_then(|value| value.parse().ok())
+        .or_else(|| value[key].as_f64())
+        .unwrap_or_default()
 }
 
 fn sign_query(secret: &str, query: &str) -> Result<String> {
@@ -85,5 +179,31 @@ mod tests {
             sign_query("key", "The quick brown fox jumps over the lazy dog").unwrap(),
             "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
         );
+    }
+
+    #[test]
+    fn parses_account_balances_and_active_positions() {
+        let account = serde_json::json!({
+            "totalWalletBalance": "1250.50",
+            "availableBalance": "900.25",
+            "totalMarginBalance": "1275.75",
+            "totalUnrealizedProfit": "25.25",
+            "totalInitialMargin": "100.0",
+            "totalMaintMargin": "5.0"
+        });
+        let positions = serde_json::json!([
+            {
+                "symbol": "BTCUSDT", "positionAmt": "0.01", "entryPrice": "60000",
+                "markPrice": "61000", "leverage": "2", "unRealizedProfit": "10",
+                "liquidationPrice": "30000", "marginType": "isolated"
+            },
+            {"symbol": "ETHUSDT", "positionAmt": "0"}
+        ]);
+        let parsed = parse_futures_account(&account, &positions).unwrap();
+        assert_eq!(parsed.wallet_balance, 1250.5);
+        assert_eq!(parsed.available_balance, 900.25);
+        assert_eq!(parsed.positions.len(), 1);
+        assert_eq!(parsed.positions[0].side, "多");
+        assert_eq!(parsed.positions[0].leverage, 2);
     }
 }

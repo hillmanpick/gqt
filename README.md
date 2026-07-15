@@ -6,10 +6,12 @@ GQT Trader 是面向 Binance USDT-M 永续合约的 Windows 原生量化客户�
 
 - Binance Futures 实时 K 线、交易对和周期切换
 - 标记价格、资金费率、多空比、持仓量和 24 小时成交额
+- Binance U 本位真实钱包余额、可用余额、保证金、未实现盈亏和当前持仓
 - 趋势、仓位、资金费率组成的 0-100 市场情绪分值
 - OpenAI、Claude、DeepSeek 和 OpenAI 兼容中转站风险研判，AI 不具备下单能力
 - 本地策略编辑、Python 语法校验、历史数据下载和回测
-- Freqtrade 合约策略启动、停止、日志与 Dry-run 异常恢复
+- Freqtrade 数据同步、回测、策略启动、停止、日志与 Dry-run 异常恢复
+- 模拟盘与实盘模式切换；启用和启动实盘均需在客户端二次确认
 - 仓位、最大持仓数和爆仓缓冲风控
 - Windows DPAPI + AES-256-GCM 本地加密密钥库
 - 保存前使用 Binance Futures 签名账户接口验证 Key、Secret 和合约交易权限
@@ -43,7 +45,7 @@ cargo build --release --manifest-path desktop\Cargo.toml
 
 内置 `FuturesFactorStrategy` 是可编辑的 Freqtrade Interface v3 基线策略，包含多空方向、动量、趋势、波动率和成交量因子。回测与数据下载由客户端调用本机 Docker 执行，默认时间周期为 `4h`。
 
-当前客户端强制展示并使用 `dry_run: true`。不要在没有完成历史数据验证、分段回测和至少数周模拟运行之前改为实盘。合约杠杆可能造成全部保证金损失，任何策略都不保证收益。
+客户端默认使用 `dry_run: true`。账户页显示真实 Binance Futures 资金和持仓，但模拟策略不会操作这些资金。完成历史数据验证、分段回测和至少数周模拟运行后，才应在执行页显式切换并二次确认实盘。合约杠杆可能造成全部保证金损失，任何策略都不保证收益。
 
 ## 安全边界
 
@@ -53,5 +55,6 @@ cargo build --release --manifest-path desktop\Cargo.toml
 - Binance Key 应关闭提现权限，并只授予合约交易所需权限。
 - `desktop/target/`、`desktop/dist/`、交易数据库、日志和回测结果不会提交到 Git。
 - 自动恢复只作用于 Dry-run Freqtrade 容器，不会切换为实盘。
+- Freqtrade 旧配置会自动迁移到当前 schema；实盘模式不会自动恢复或静默启动。
 
 仓库根目录中的 Node/Web 代码是前期版本，原生 Rust 客户端是当前主线。
