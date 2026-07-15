@@ -29,6 +29,8 @@ const CONFIG_PATH = path.join(TRADING_ROOT, "user_data", "config.json");
 const STRATEGY_ROOT = path.join(TRADING_ROOT, "user_data", "strategies");
 const PORT = Number(process.env.PORT ?? 4173);
 const HOST = process.env.HOST ?? "127.0.0.1";
+const PYTHON_COMMAND =
+  process.env.PYTHON_COMMAND ?? (process.platform === "win32" ? "python" : "python3");
 const MAX_LOG_SIZE = 240_000;
 const activeProcesses = new Map();
 const VENDOR_FILES = new Map([
@@ -373,7 +375,7 @@ async function startJob(type, parameters) {
 
 async function validatePython(source) {
   const result = await runProcess(
-    "python",
+    PYTHON_COMMAND,
     ["-c", "import ast,sys; ast.parse(sys.stdin.read()); print('ok')"],
     { input: source, timeoutMs: 8_000 },
   );
