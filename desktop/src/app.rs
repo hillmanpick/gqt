@@ -29,7 +29,7 @@ use crate::{
 
 const AI_TIMEFRAMES: [&str; 6] = ["1m", "5m", "15m", "1h", "4h", "1d"];
 const BUILD_LABEL: &str = "0.3.3-ai-json-repair";
-const RELAY_DEFAULT_MODEL: &str = "gpt5.5";
+const RELAY_DEFAULT_MODEL: &str = "gpt-5.6-luna";
 
 pub struct GqtApp {
     store: SecretStore,
@@ -2189,7 +2189,9 @@ impl GqtApp {
     fn normalize_ai_model_for_provider(&mut self) {
         if self.ai_provider == AiProvider::Relay
             && (self.ai_model.trim().is_empty()
-                || self.ai_model.trim().eq_ignore_ascii_case("gpt-4o-mini"))
+                || ["gpt-4o-mini", "gpt5.5"]
+                    .iter()
+                    .any(|legacy| self.ai_model.trim().eq_ignore_ascii_case(legacy)))
         {
             self.ai_model = RELAY_DEFAULT_MODEL.into();
         }

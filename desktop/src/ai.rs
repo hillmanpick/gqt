@@ -245,14 +245,17 @@ fn default_model(provider: AiProvider) -> &'static str {
         AiProvider::OpenAi => "gpt-4.1-mini",
         AiProvider::Claude => "claude-sonnet-4-20250514",
         AiProvider::DeepSeek => "deepseek-chat",
-        AiProvider::Relay => "gpt5.5",
+        AiProvider::Relay => "gpt-5.6-luna",
     }
 }
 
 fn selected_model<'a>(provider: AiProvider, requested_model: &'a str) -> &'a str {
     let requested_model = requested_model.trim();
     if requested_model.is_empty()
-        || (provider == AiProvider::Relay && requested_model.eq_ignore_ascii_case("gpt-4o-mini"))
+        || (provider == AiProvider::Relay
+            && ["gpt-4o-mini", "gpt5.5"]
+                .iter()
+                .any(|legacy| requested_model.eq_ignore_ascii_case(legacy)))
     {
         default_model(provider)
     } else {
@@ -790,7 +793,11 @@ mod tests {
 
     #[test]
     fn migrates_old_relay_default_model() {
-        assert_eq!(selected_model(AiProvider::Relay, "gpt-4o-mini"), "gpt5.5");
-        assert_eq!(selected_model(AiProvider::Relay, ""), "gpt5.5");
+        assert_eq!(
+            selected_model(AiProvider::Relay, "gpt-4o-mini"),
+            "gpt-5.6-luna"
+        );
+        assert_eq!(selected_model(AiProvider::Relay, "gpt5.5"), "gpt-5.6-luna");
+        assert_eq!(selected_model(AiProvider::Relay, ""), "gpt-5.6-luna");
     }
 }
