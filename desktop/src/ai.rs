@@ -513,6 +513,69 @@ fn chat_completions(
     temperature: f32,
     json_output: bool,
 ) -> Result<String> {
+    match chat_completions_attempt(
+        client,
+        endpoint,
+        provider,
+        model,
+        api_key,
+        system,
+        input,
+        max_tokens,
+        temperature,
+        json_output,
+    ) {
+        Ok(text) => Ok(text),
+        Err(error) if provider == "中转站" && is_no_available_channel_error(&error) => {
+            let candidates = discover_relay_model_candidates(client, endpoint, api_key, model)
+                .with_context(|| format!("中转站模型 {model} 不可用，且自动读取模型列表失败"))?;
+            let mut failures = vec![format!("{model}: {error}")];
+            for candidate in candidates.iter().take(8) {
+                match chat_completions_attempt(
+                    client,
+                    endpoint,
+                    provider,
+                    candidate,
+                    api_key,
+                    system,
+                    input,
+                    max_tokens,
+                    temperature,
+                    json_output,
+                ) {
+                    Ok(text) => return Ok(text),
+                    Err(error) if is_transient_provider_error(&error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "中转站模型 {model} 不可用，自动切换到 {candidate} 时服务端仍不可用"
+                            )
+                        });
+                    }
+                    Err(error) => failures.push(format!("{candidate}: {error}")),
+                }
+            }
+            bail!(
+                "中转站模型 {model} 不可用，自动尝试 {} 个模型仍失败：{}",
+                candidates.len().min(8),
+                failures.join("；").chars().take(900).collect::<String>()
+            )
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn chat_completions_attempt(
+    client: &Client,
+    endpoint: &str,
+    provider: &str,
+    model: &str,
+    api_key: &str,
+    system: &str,
+    input: &str,
+    max_tokens: u32,
+    temperature: f32,
+    json_output: bool,
+) -> Result<String> {
     match chat_completions_once(
         client,
         endpoint,
@@ -540,6 +603,114 @@ fn chat_completions(
         .with_context(|| format!("{provider} 不支持 JSON mode，降级重试仍失败")),
         result => result,
     }
+}
+
+fn discover_relay_model_candidates(
+    client: &Client,
+    chat_endpoint: &str,
+    api_key: &str,
+    current_model: &str,
+) -> Result<Vec<String>> {
+    let endpoint = model_list_endpoint(chat_endpoint)?;
+    let response = client
+        .get(endpoint)
+        .bearer_auth(api_key.trim())
+        .send()
+        .context("中转站模型列表请求失败")?;
+    let body = read_response_text(response, "中转站模型列表")?;
+    let value: Value = serde_json::from_str(&body)
+        .with_context(|| format!("中转站模型列表不是有效 JSON: {}", preview_text(&body)))?;
+    let candidates = rank_chat_model_ids(parse_model_ids(&value), current_model);
+    if candidates.is_empty() {
+        bail!("中转站模型列表里没有可用聊天模型");
+    }
+    Ok(candidates)
+}
+
+fn model_list_endpoint(chat_endpoint: &str) -> Result<String> {
+    chat_endpoint
+        .trim_end_matches('/')
+        .strip_suffix("/chat/completions")
+        .map(|base| format!("{base}/models"))
+        .context("中转站 Chat Completions 地址无效，无法推导 /models")
+}
+
+fn parse_model_ids(value: &Value) -> Vec<String> {
+    let Some(items) = value
+        .get("data")
+        .and_then(|data| data.as_array())
+        .or_else(|| value.as_array())
+    else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    for item in items {
+        let id = item
+            .get("id")
+            .and_then(|value| value.as_str())
+            .or_else(|| item.get("model").and_then(|value| value.as_str()))
+            .or_else(|| item.as_str());
+        if let Some(id) = id {
+            let id = id.trim();
+            if !id.is_empty() && !ids.iter().any(|existing| existing == id) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    ids
+}
+
+fn rank_chat_model_ids(ids: Vec<String>, current_model: &str) -> Vec<String> {
+    let preferred = [
+        "gpt-5.6-luna",
+        "gpt-5",
+        "gpt-4.1",
+        "gpt-4o",
+        "deepseek-chat",
+        "claude-sonnet-4-20250514",
+        "gemini-2.5-pro",
+        "qwen-max",
+        "gpt-3.5-turbo",
+    ];
+    let mut ranked = Vec::new();
+    for wanted in preferred {
+        if let Some(id) = ids
+            .iter()
+            .find(|id| id.eq_ignore_ascii_case(wanted) && !id.eq_ignore_ascii_case(current_model))
+        {
+            ranked.push(id.clone());
+        }
+    }
+    for id in ids {
+        if id.eq_ignore_ascii_case(current_model)
+            || !is_chat_model_candidate(&id)
+            || ranked
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(&id))
+        {
+            continue;
+        }
+        ranked.push(id);
+    }
+    ranked
+}
+
+fn is_chat_model_candidate(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    let excluded = [
+        "embedding",
+        "rerank",
+        "moderation",
+        "whisper",
+        "tts",
+        "dall",
+        "image",
+        "vision-only",
+        "audio",
+        "sd-",
+        "stable-diffusion",
+    ];
+    !excluded.iter().any(|item| lower.contains(item))
 }
 
 fn chat_completions_once(
@@ -590,6 +761,20 @@ fn is_response_format_error(error: &anyhow::Error) -> bool {
     message.contains("response_format")
         || message.contains("json_object")
         || message.contains("json mode")
+}
+
+fn is_no_available_channel_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("no available channel")
+        || message.contains("model") && message.contains("under group")
+}
+
+fn is_transient_provider_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("system cpu overloaded")
+        || message.contains("service temporarily unavailable")
+        || message.contains("too many requests")
+        || message.contains("rate limit")
 }
 
 fn extract_json_object(value: &str) -> Result<String> {
@@ -788,6 +973,28 @@ mod tests {
         assert_eq!(
             chat_completion_text_from_value(&body, "test").unwrap(),
             r#"{"action":"hold","confidence":0.2}"#
+        );
+    }
+
+    #[test]
+    fn parses_and_ranks_relay_models() {
+        let body = json!({
+            "data": [
+                {"id": "text-embedding-3-small"},
+                {"id": "deepseek-chat"},
+                {"id": "gpt-5.6-luna"},
+                {"id": "whisper-1"}
+            ]
+        });
+        let ranked = rank_chat_model_ids(parse_model_ids(&body), "gpt-5.6-luna");
+        assert_eq!(ranked, vec!["deepseek-chat".to_string()]);
+    }
+
+    #[test]
+    fn derives_models_endpoint_from_chat_endpoint() {
+        assert_eq!(
+            model_list_endpoint("https://api.example.com/v1/chat/completions").unwrap(),
+            "https://api.example.com/v1/models"
         );
     }
 
