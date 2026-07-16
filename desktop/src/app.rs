@@ -81,6 +81,7 @@ pub struct GqtApp {
     ai_running: bool,
     ai_decision_running: bool,
     last_ai_decision_check: Instant,
+    ai_provider_cooldown_until: Option<Instant>,
     ai_decision_status: String,
     ai_processed_candles: BTreeMap<String, i64>,
     toast: Option<(String, bool, Instant)>,
@@ -114,6 +115,7 @@ enum TaskEvent {
 struct AiDecisionSummary {
     message: String,
     processed: Vec<(String, i64)>,
+    provider_cooldown_seconds: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -239,6 +241,7 @@ impl GqtApp {
             ai_running: false,
             ai_decision_running: false,
             last_ai_decision_check: Instant::now() - Duration::from_secs(60),
+            ai_provider_cooldown_until: None,
             ai_decision_status: "AI 闭环等待启动".into(),
             ai_processed_candles: BTreeMap::new(),
             toast: None,
@@ -363,6 +366,10 @@ impl GqtApp {
                         Ok(summary) => {
                             for (symbol, candle_open_time) in summary.processed {
                                 self.ai_processed_candles.insert(symbol, candle_open_time);
+                            }
+                            if let Some(seconds) = summary.provider_cooldown_seconds {
+                                self.ai_provider_cooldown_until =
+                                    Some(Instant::now() + Duration::from_secs(seconds));
                             }
                             self.ai_decision_status = summary.message;
                         }
@@ -1766,6 +1773,18 @@ impl GqtApp {
         {
             return;
         }
+        if let Some(until) = self.ai_provider_cooldown_until {
+            if Instant::now() < until {
+                let seconds = until
+                    .saturating_duration_since(Instant::now())
+                    .as_secs()
+                    .max(1);
+                self.ai_decision_status =
+                    format!("中转站冷却中，约 {seconds} 秒后再试。请先确认模型/分组有可用通道。");
+                return;
+            }
+            self.ai_provider_cooldown_until = None;
+        }
         if self.bot_state != "running" {
             self.ai_decision_status = "等待策略运行后开始 AI 闭环".into();
             return;
@@ -2264,6 +2283,7 @@ impl GqtApp {
                     format_symbol_whitelist(&self.ai_config.symbol_whitelist);
                 self.refresh_whitelist_selection();
                 self.ai_processed_candles.clear();
+                self.ai_provider_cooldown_until = None;
                 self.ai_decision_status = "AI 设置已更新，等待下一轮决策".into();
                 self.toast("AI 自动交易参数已保存", false);
             }
@@ -2467,6 +2487,7 @@ fn run_ai_decision_cycle_inner(cycle: AiDecisionCycle) -> anyhow::Result<AiDecis
                 return Ok(AiDecisionSummary {
                     message: "AI 闭环已暂停：Binance Futures 拒绝了当前网络位置（HTTP 451）。实时模拟盘和实盘都需要能访问 Binance Futures 的合规网络；当前只能使用离线回测或已有本地数据测试。".into(),
                     processed,
+                    provider_cooldown_seconds: None,
                 });
             }
             Err(error) if is_ai_output_format_error(&error) => {
@@ -2481,6 +2502,7 @@ fn run_ai_decision_cycle_inner(cycle: AiDecisionCycle) -> anyhow::Result<AiDecis
                         compact_error(&error.to_string(), 520)
                     ),
                     processed,
+                    provider_cooldown_seconds: None,
                 });
             }
             Err(error) if is_ai_provider_capacity_error(&error) => {
@@ -2495,6 +2517,7 @@ fn run_ai_decision_cycle_inner(cycle: AiDecisionCycle) -> anyhow::Result<AiDecis
                         compact_error(&error.to_string(), 520)
                     ),
                     processed,
+                    provider_cooldown_seconds: Some(300),
                 });
             }
             Err(error) => failures.push(format!("{symbol}: {error}")),
@@ -2512,7 +2535,11 @@ fn run_ai_decision_cycle_inner(cycle: AiDecisionCycle) -> anyhow::Result<AiDecis
     if !failures.is_empty() {
         message.push_str(&format!("；失败：{}", failures.join("；")));
     }
-    Ok(AiDecisionSummary { message, processed })
+    Ok(AiDecisionSummary {
+        message,
+        processed,
+        provider_cooldown_seconds: None,
+    })
 }
 
 fn simulation_to_futures_account(account: &SimulationAccount) -> FuturesAccount {
