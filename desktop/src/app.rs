@@ -29,6 +29,7 @@ use crate::{
 
 const AI_TIMEFRAMES: [&str; 6] = ["1m", "5m", "15m", "1h", "4h", "1d"];
 const BUILD_LABEL: &str = "0.3.3-ai-json-repair";
+const RELAY_DEFAULT_MODEL: &str = "gpt5.5";
 
 pub struct GqtApp {
     store: SecretStore,
@@ -227,7 +228,11 @@ impl GqtApp {
             ai_config,
             ai_symbol_whitelist,
             ai_provider,
-            ai_model: String::new(),
+            ai_model: if ai_provider == AiProvider::Relay {
+                RELAY_DEFAULT_MODEL.into()
+            } else {
+                String::new()
+            },
             relay_base_url,
             ai_prompt: "判断当前市场状态、主要风险与需要等待的确认信号。".into(),
             ai_output: "暂无分析".into(),
@@ -1205,7 +1210,14 @@ impl GqtApp {
                             ui.selectable_value(&mut self.ai_provider, provider, provider.label());
                         }
                     });
-                ui.add(TextEdit::singleline(&mut self.ai_model).hint_text("模型（可选）"));
+                self.normalize_ai_model_for_provider();
+                ui.add(TextEdit::singleline(&mut self.ai_model).hint_text(
+                    if self.ai_provider == AiProvider::Relay {
+                        RELAY_DEFAULT_MODEL
+                    } else {
+                        "模型（可选）"
+                    },
+                ));
                 ui.add_sized(
                     [ui.available_width(), 74.0],
                     TextEdit::multiline(&mut self.ai_prompt),
@@ -1964,10 +1976,16 @@ impl GqtApp {
                                 );
                             }
                         });
+                    self.normalize_ai_model_for_provider();
                     field_label(&mut cols[1], "模型名（可选）");
                     cols[1].add_sized(
                         [cols[1].available_width(), 36.0],
-                        TextEdit::singleline(&mut self.ai_model).hint_text("默认模型"),
+                        TextEdit::singleline(&mut self.ai_model)
+                            .hint_text(if self.ai_provider == AiProvider::Relay {
+                                RELAY_DEFAULT_MODEL
+                            } else {
+                                "默认模型"
+                            }),
                     );
                 });
                 field_label(ui, "币种白名单");
@@ -2166,6 +2184,15 @@ impl GqtApp {
             .map_err(|error| error.to_string())?;
         self.relay_base_url = normalized;
         Ok(())
+    }
+
+    fn normalize_ai_model_for_provider(&mut self) {
+        if self.ai_provider == AiProvider::Relay
+            && (self.ai_model.trim().is_empty()
+                || self.ai_model.trim().eq_ignore_ascii_case("gpt-4o-mini"))
+        {
+            self.ai_model = RELAY_DEFAULT_MODEL.into();
+        }
     }
 
     fn request_credential_update(&mut self) {
