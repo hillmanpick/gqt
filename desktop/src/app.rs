@@ -2481,6 +2481,20 @@ fn run_ai_decision_cycle_inner(cycle: AiDecisionCycle) -> anyhow::Result<AiDecis
                     processed,
                 });
             }
+            Err(error) if is_ai_provider_capacity_error(&error) => {
+                let processed = cycle
+                    .symbols
+                    .iter()
+                    .map(|symbol| (symbol.clone(), cycle.candle_open_time))
+                    .collect();
+                return Ok(AiDecisionSummary {
+                    message: format!(
+                        "AI 闭环已暂停：中转站当前不可用。{}。这通常是模型在当前分组没有可用通道，或中转站服务器过载；请在中转站后台确认模型名/分组，换一个有通道的模型，或稍后重试。",
+                        compact_error(&error.to_string(), 520)
+                    ),
+                    processed,
+                });
+            }
             Err(error) => failures.push(format!("{symbol}: {error}")),
         }
     }
@@ -2524,6 +2538,15 @@ fn is_ai_output_format_error(error: &anyhow::Error) -> bool {
         || message.contains("AI JSON 修复响应")
         || message.contains("AI 决策 JSON")
         || message.contains("返回不是有效 JSON")
+}
+
+fn is_ai_provider_capacity_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("503 service unavailable")
+        || message.contains("no available channel")
+        || message.contains("system cpu overloaded")
+        || message.contains("rate limit")
+        || message.contains("too many requests")
 }
 
 fn compact_error(value: &str, limit: usize) -> String {
