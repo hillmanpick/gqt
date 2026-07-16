@@ -2126,6 +2126,11 @@ impl GqtApp {
                     TextEdit::singleline(&mut self.relay_base_url)
                         .hint_text("https://example.com/v1"),
                 );
+                ui.label(
+                    RichText::new("只填 API 根路径，不填中转站网页/控制台地址；程序会自动请求 /chat/completions。")
+                        .size(11.0)
+                        .color(theme::MUTED),
+                );
                 ui.add_space(10.0);
                 if ui
                     .add_enabled(

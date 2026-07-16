@@ -678,6 +678,11 @@ pub fn normalize_relay_base_url(value: &str) -> Result<String> {
 
 fn read_json(response: reqwest::blocking::Response, provider: &str) -> Result<Value> {
     let body = read_response_text(response, provider)?;
+    if looks_like_html(&body) {
+        bail!(
+            "{provider} 返回的是网页 HTML，不是 API JSON。中转站 Base URL 可能填成了官网/控制台地址，请改成 OpenAI-compatible API 地址，例如 https://example.com/v1"
+        );
+    }
     serde_json::from_str(&body)
         .with_context(|| format!("{provider} 返回不是有效 JSON: {}", preview_text(&body)))
 }
@@ -686,6 +691,11 @@ fn read_response_text(response: reqwest::blocking::Response, provider: &str) -> 
     let status = response.status();
     let body = response.text().context("无法读取 AI 返回")?;
     if !status.is_success() {
+        if looks_like_html(&body) {
+            bail!(
+                "{provider} 接口返回 {status}: 收到网页 HTML，不是 API JSON。中转站 Base URL 可能填成了官网/控制台地址，请改成 OpenAI-compatible API 地址，例如 https://example.com/v1"
+            );
+        }
         let detail = serde_json::from_str::<Value>(&body)
             .ok()
             .and_then(|value| {
@@ -697,7 +707,20 @@ fn read_response_text(response: reqwest::blocking::Response, provider: &str) -> 
             .unwrap_or_else(|| body.chars().take(300).collect());
         bail!("{} 接口返回 {}: {}", provider, status, detail);
     }
+    if looks_like_html(&body) {
+        bail!(
+            "{provider} 返回的是网页 HTML，不是 API JSON。中转站 Base URL 可能填成了官网/控制台地址，请改成 OpenAI-compatible API 地址，例如 https://example.com/v1"
+        );
+    }
     Ok(body)
+}
+
+fn looks_like_html(value: &str) -> bool {
+    let trimmed = value.trim_start().to_ascii_lowercase();
+    trimmed.starts_with("<!doctype html")
+        || trimmed.starts_with("<html")
+        || trimmed.contains("<head>")
+        || trimmed.contains("<body")
 }
 
 fn preview_text(value: &str) -> String {
