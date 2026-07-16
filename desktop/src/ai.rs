@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use crate::model::{
     AiAction, AiProvider, AiTradeSignal, AiTradingConfig, AiTradingInput, MarketSnapshot,
 };
+use crate::network;
 
 const ANALYST_RULES: &str = "你是加密货币合约市场的风险分析助手。只分析给定市场数据，输出简洁中文；必须列出市场状态、支持因素、反对因素、风险和需要等待的确认信号。不得声称已经下单，不得要求或使用交易权限，不得把分析写成确定收益承诺。";
 const TRADE_DECISION_RULES: &str = "你是加密货币合约交易信号研究助手。你只能基于输入数据输出严格 JSON，不能输出 Markdown、解释段落、代码块或额外文字。回复必须以 { 开头并以 } 结尾。允许的 action 只有 long、short、close、hold。你不能承诺收益，遇到不确定、震荡、数据不足或风险过高必须输出 hold。stop_loss_percent 和 take_profit_percent 使用价格波动百分比，不使用杠杆后收益百分比。";
@@ -67,10 +68,8 @@ pub fn analyze(
         snapshot.sentiment.funding,
         prompt.trim(),
     );
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(45))
-        .build()
-        .context("无法创建 AI 请求客户端")?;
+    let client =
+        network::client(std::time::Duration::from_secs(45)).context("无法创建 AI 请求客户端")?;
 
     match provider {
         AiProvider::OpenAi => openai(&client, model, api_key, &market_context),
@@ -94,9 +93,7 @@ pub fn decide_trade(
 
     let model = selected_model(provider, requested_model).to_string();
     let prompt = trade_decision_prompt(input, config)?;
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(config.model_timeout_seconds))
-        .build()
+    let client = network::client(std::time::Duration::from_secs(config.model_timeout_seconds))
         .context("无法创建 AI 决策请求客户端")?;
     let raw_output = request_text(
         provider,

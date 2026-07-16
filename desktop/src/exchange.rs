@@ -7,10 +7,33 @@ use serde_json::Value;
 use sha2::Sha256;
 
 use crate::model::{FuturesAccount, FuturesPosition};
+use crate::network;
 
 const BINANCE_FUTURES_BASE: &str = "https://fapi.binance.com";
 
 pub fn validate_futures_credentials(api_key: &str, api_secret: &str) -> Result<String> {
+    let account = validate_and_fetch_account(api_key, api_secret)?;
+    if account["canTrade"].as_bool().unwrap_or(false) {
+        Ok("Binance Futures API Key、Secret 和交易权限验证通过".into())
+    } else {
+        Ok(
+            "Binance API Key 和 Secret 验证通过；当前账户返回 canTrade=false，已按只读/模拟盘模式保存，实盘启动前仍会被阻止"
+                .into(),
+        )
+    }
+}
+
+pub fn ensure_live_futures_trading(api_key: &str, api_secret: &str) -> Result<()> {
+    let account = validate_and_fetch_account(api_key, api_secret)?;
+    if !account["canTrade"].as_bool().unwrap_or(false) {
+        bail!(
+            "Binance 账户当前返回 canTrade=false，不能启动实盘。请先在 Binance 官方账户中开通 USDⓈ-M Futures，并确认 API Key 的合约交易权限已经保存生效"
+        );
+    }
+    Ok(())
+}
+
+fn validate_and_fetch_account(api_key: &str, api_secret: &str) -> Result<Value> {
     let api_key = api_key.trim();
     let api_secret = api_secret.trim();
     if !(10..=512).contains(&api_key.len()) || !(10..=512).contains(&api_secret.len()) {
@@ -19,17 +42,13 @@ pub fn validate_futures_credentials(api_key: &str, api_secret: &str) -> Result<S
 
     let client = futures_client()?;
     let server_time = server_time(&client)?;
-    let account = signed_get(
+    signed_get(
         &client,
         "/fapi/v3/account",
         api_key,
         api_secret,
         server_time,
-    )?;
-    if !account["canTrade"].as_bool().unwrap_or(false) {
-        bail!("API Key 有效，但未开通 Binance Futures 交易权限");
-    }
-    Ok("Binance Futures API Key、Secret 和交易权限验证通过".into())
+    )
 }
 
 pub fn fetch_futures_account(api_key: &str, api_secret: &str) -> Result<FuturesAccount> {
@@ -93,10 +112,7 @@ fn parse_futures_account(account: &Value, position_data: &Value) -> Result<Futur
 }
 
 fn futures_client() -> Result<Client> {
-    Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .context("无法创建 Binance 请求客户端")
+    network::client(Duration::from_secs(15)).context("无法创建 Binance 请求客户端")
 }
 
 fn server_time(client: &Client) -> Result<i64> {

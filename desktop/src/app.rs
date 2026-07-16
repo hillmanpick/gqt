@@ -310,7 +310,11 @@ impl GqtApp {
                     self.health_check_running = false;
                     self.docker_available = available;
                     self.bot_state = state;
-                    if self.dry_run && self.auto_restart && available && self.bot_state != "running"
+                    if self.dry_run
+                        && self.auto_restart
+                        && !self.job_running
+                        && available
+                        && self.bot_state != "running"
                     {
                         self.bot_action(true);
                     }
@@ -1638,20 +1642,24 @@ impl GqtApp {
         let sender = self.task_sender.clone();
         let dry_run = self.dry_run;
         thread::spawn(move || {
-            let result = workspace
-                .bot_action(start, &api_key, &api_secret)
-                .map(|_| {
-                    if start {
-                        if dry_run {
-                            "Dry-run 策略已启动".into()
-                        } else {
-                            "实盘策略已启动".into()
-                        }
+            let result = (|| {
+                if start && !dry_run {
+                    exchange::ensure_live_futures_trading(&api_key, &api_secret)?;
+                }
+                workspace.bot_action(start, &api_key, &api_secret)
+            })()
+            .map(|_| {
+                if start {
+                    if dry_run {
+                        "Dry-run 策略已启动".into()
                     } else {
-                        "交易内核已停止".into()
+                        "实盘策略已启动".into()
                     }
-                })
-                .map_err(|error| error.to_string());
+                } else {
+                    "交易内核已停止".into()
+                }
+            })
+            .map_err(|error| error.to_string());
             let _ = sender.send(TaskEvent::Bot(result));
         });
     }
@@ -2407,9 +2415,7 @@ fn run_ai_decision_cycle(cycle: AiDecisionCycle) -> Result<AiDecisionSummary, St
 }
 
 fn run_ai_decision_cycle_inner(cycle: AiDecisionCycle) -> anyhow::Result<AiDecisionSummary> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()?;
+    let client = crate::network::client(Duration::from_secs(20))?;
     let audit = AuditLog::open(&cycle.workspace.ai_audit)?;
     let account = if !cycle.dry_run
         && !cycle.binance_api_key.is_empty()
