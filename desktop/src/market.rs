@@ -6,15 +6,17 @@ use reqwest::blocking::{Client, Response};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::model::{Candle, Interval, MarketCommand, MarketEvent, MarketSnapshot, Sentiment};
+use crate::{
+    model::{Candle, Interval, MarketCommand, MarketEvent, MarketSnapshot, Sentiment},
+    network,
+};
 
 const BINANCE_BASE: &str = "https://fapi.binance.com";
 const RESTRICTED_LOCATION_HINT: &str = "Binance Futures 拒绝了当前网络位置（HTTP 451 restricted location）。实时模拟盘和实盘都需要能访问 Binance Futures 的合规网络；当前只能使用离线回测或已有本地数据测试。";
 
 pub fn start_worker(commands: Receiver<MarketCommand>, events: Sender<MarketEvent>) {
     thread::spawn(move || {
-        let client = match Client::builder()
-            .timeout(Duration::from_secs(12))
+        let client = match network::client_builder(Duration::from_secs(12))
             .user_agent("GQT-Trader/0.2")
             .build()
         {

@@ -7,6 +7,7 @@ mod audit;
 mod exchange;
 mod market;
 mod model;
+mod network;
 mod store;
 mod theme;
 mod trading;
