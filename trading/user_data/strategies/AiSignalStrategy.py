@@ -34,6 +34,14 @@ class AiSignalStrategy(IStrategy):
     def _config(self) -> dict:
         return self._read_json("ai_config.json")
 
+    @staticmethod
+    def _float(value, fallback: float) -> float:
+        try:
+            parsed = float(value)
+            return parsed if parsed == parsed else fallback
+        except (TypeError, ValueError):
+            return fallback
+
     def _signal(self, pair: str) -> dict | None:
         signal = self._read_json("ai_signals.json").get(pair)
         return signal if isinstance(signal, dict) else None
@@ -91,6 +99,38 @@ class AiSignalStrategy(IStrategy):
     ) -> bool:
         signal = self._valid_signal(pair)
         return signal is not None and entry_tag == f'ai:{signal["decision_id"]}'
+
+    def custom_stake_amount(
+        self, pair: str, current_time: datetime, current_rate: float,
+        proposed_stake: float, min_stake: float | None, max_stake: float,
+        leverage: float, entry_tag: str | None, side: str, **kwargs,
+    ) -> float:
+        config = self._config()
+        configured_cap = self._float(config.get("max_stake_amount"), proposed_stake)
+        usage_cap = max_stake * self._float(config.get("capital_usage_percent"), 10.0) / 100.0
+        stake = min(configured_cap, usage_cap, max_stake)
+        signal = self._valid_signal(pair)
+        if config.get("allow_ai_risk_sizing", False) and signal is not None:
+            stake = min(stake, self._float(signal.get("stake_amount"), stake))
+        if min_stake is not None:
+            stake = max(stake, min_stake)
+        return max(0.0, min(stake, max_stake))
+
+    def custom_exit(
+        self, pair: str, trade, current_time: datetime, current_rate: float,
+        current_profit: float, **kwargs,
+    ) -> str | None:
+        signal = self._signal(pair)
+        stop_loss = self._float(
+            signal.get("stop_loss_percent") if signal else None,
+            1.5,
+        ) / 100.0
+        reward = stop_loss * self._float(self._config().get("risk_reward_ratio"), 2.0)
+        if current_profit >= reward:
+            return "ai_risk_reward_take_profit"
+        if current_profit <= -stop_loss:
+            return "ai_risk_stop_loss"
+        return None
 
     def leverage(
         self, pair: str, current_time: datetime, current_rate: float,

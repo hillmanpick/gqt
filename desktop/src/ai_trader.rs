@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -19,13 +19,36 @@ pub fn validate_config(config: &AiTradingConfig) -> Result<()> {
     if config.symbol_whitelist.is_empty() {
         bail!("AI 交易币种白名单不能为空");
     }
+    let mut seen = BTreeSet::new();
+    for symbol in &config.symbol_whitelist {
+        validate_symbol(symbol)?;
+        if !seen.insert(symbol) {
+            bail!("AI 交易币种白名单不能重复");
+        }
+    }
+    if !matches!(
+        config.timeframe.as_str(),
+        "1m" | "5m" | "15m" | "1h" | "4h" | "1d"
+    ) {
+        bail!("AI 交易周期不支持");
+    }
     if !(1..=125).contains(&config.leverage) {
         bail!("杠杆必须在 1 到 125 倍之间");
     }
-    if !(1.0..=100.0).contains(&config.capital_usage_percent) {
+    if !config.max_stake_amount.is_finite()
+        || !(5.0..=1_000_000.0).contains(&config.max_stake_amount)
+    {
+        bail!("单仓保证金上限必须在 5 到 1,000,000 USDT 之间");
+    }
+    if !config.capital_usage_percent.is_finite()
+        || !(1.0..=100.0).contains(&config.capital_usage_percent)
+    {
         bail!("资金使用比例必须在 1% 到 100% 之间");
     }
-    if !(0.0..=1.0).contains(&config.minimum_confidence) {
+    if !config.risk_reward_ratio.is_finite() || !(0.5..=10.0).contains(&config.risk_reward_ratio) {
+        bail!("单仓盈亏比必须在 0.5 到 10 之间");
+    }
+    if !config.minimum_confidence.is_finite() || !(0.0..=1.0).contains(&config.minimum_confidence) {
         bail!("最低置信度必须在 0 到 1 之间");
     }
     if !(5..=120).contains(&config.model_timeout_seconds) {
@@ -33,6 +56,20 @@ pub fn validate_config(config: &AiTradingConfig) -> Result<()> {
     }
     if !(15..=3_600).contains(&config.market_max_age_seconds) {
         bail!("行情最大延迟必须在 15 到 3600 秒之间");
+    }
+    Ok(())
+}
+
+fn validate_symbol(symbol: &str) -> Result<()> {
+    let Some(base) = symbol.strip_suffix("USDT") else {
+        bail!("AI 白名单只支持 U 本位永续合约");
+    };
+    if !(2..=12).contains(&base.len())
+        || !base
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+    {
+        bail!("AI 白名单合约代码格式无效");
     }
     Ok(())
 }
@@ -64,6 +101,11 @@ pub fn validate_signal(
         || signal.confidence < config.minimum_confidence
     {
         Some("AI 信号置信度不足或无效")
+    } else if signal
+        .stake_amount
+        .is_some_and(|stake| !stake.is_finite() || stake < 5.0 || stake > config.max_stake_amount)
+    {
+        Some("AI 给出的仓位金额超出单仓上限")
     } else if signal.action == AiAction::Hold {
         Some("AI 决策为 hold")
     } else {
@@ -99,7 +141,7 @@ pub fn write_signal_atomically(path: &Path, signal: &AiTradeSignal) -> Result<()
         &temporary,
         format!("{}\n", serde_json::to_string_pretty(&signals)?),
     )?;
-    fs::rename(&temporary, path).context("无法原子更新 AI 信号文件")?;
+    replace_file(&temporary, path).context("无法原子更新 AI 信号文件")?;
     Ok(())
 }
 
@@ -111,7 +153,20 @@ fn freqtrade_pair(symbol: &str) -> String {
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
-    path.with_extension("json.tmp")
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("ai_signals.json");
+    path.with_file_name(format!("{file_name}.{}.tmp", rand::random::<u64>()))
+}
+
+fn replace_file(temporary: &Path, target: &Path) -> Result<()> {
+    #[cfg(windows)]
+    if target.exists() {
+        fs::remove_file(target)?;
+    }
+    fs::rename(temporary, target)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -126,7 +181,7 @@ mod tests {
             ..Default::default()
         };
         let input = AiTradingInput {
-            symbol: "SOLUSDT".into(),
+            symbol: "UNIUSDT".into(),
             timeframe: "1h".into(),
             candle_open_time: 10,
             candles: vec![],
@@ -142,12 +197,13 @@ mod tests {
         };
         let signal = AiTradeSignal {
             decision_id: "one".into(),
-            symbol: "SOLUSDT".into(),
+            symbol: "UNIUSDT".into(),
             timeframe: "1h".into(),
             candle_open_time: 10,
             valid_until: 100,
             action: AiAction::Long,
             confidence: 0.9,
+            stake_amount: None,
             stop_loss_percent: 1.0,
             take_profit_percent: 2.0,
             reason: "test".into(),
@@ -155,5 +211,44 @@ mod tests {
         let decision = validate_signal(&config, &input, signal, 20);
         assert!(!decision.approved);
         assert_eq!(decision.signal.action, AiAction::Hold);
+    }
+
+    #[test]
+    fn rejects_invalid_ai_config_symbols() {
+        let config = AiTradingConfig {
+            symbol_whitelist: vec!["BTC/USDT:USDT".into()],
+            ..Default::default()
+        };
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn updates_signal_file_repeatedly() {
+        let path =
+            std::env::temp_dir().join(format!("gqt-ai-signals-{}.json", rand::random::<u64>()));
+        let first = AiTradeSignal {
+            decision_id: "one".into(),
+            symbol: "BTCUSDT".into(),
+            timeframe: "1h".into(),
+            candle_open_time: 10,
+            valid_until: 100,
+            action: AiAction::Long,
+            confidence: 0.9,
+            stake_amount: None,
+            stop_loss_percent: 1.0,
+            take_profit_percent: 2.0,
+            reason: "first".into(),
+        };
+        let second = AiTradeSignal {
+            decision_id: "two".into(),
+            reason: "second".into(),
+            ..first.clone()
+        };
+        write_signal_atomically(&path, &first).unwrap();
+        write_signal_atomically(&path, &second).unwrap();
+        let stored: BTreeMap<String, AiTradeSignal> =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(stored["BTC/USDT:USDT"].decision_id, "two");
+        let _ = fs::remove_file(path);
     }
 }

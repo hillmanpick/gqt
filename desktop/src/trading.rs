@@ -8,9 +8,12 @@ use anyhow::{Context, Result, bail};
 use chrono::{Duration as ChronoDuration, NaiveDate};
 use rand::{RngCore, rngs::OsRng};
 use rusqlite::{Connection, OpenFlags};
+use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::model::{AiTradingConfig, SimulationAccount, SimulationTrade};
+use crate::model::{
+    AiTradingConfig, MarginMode, SimulationAccount, SimulationTrade, default_ai_symbol_whitelist,
+};
 
 const DEFAULT_CONFIG: &str = include_str!("../../trading/user_data/config.json");
 const DEFAULT_STRATEGY: &str =
@@ -45,9 +48,10 @@ impl TradingWorkspace {
         write_if_missing(&strategy, DEFAULT_STRATEGY)?;
         write_if_missing(&ai_strategy, DEFAULT_AI_STRATEGY)?;
         write_if_missing(&ai_config, DEFAULT_AI_CONFIG)?;
+        migrate_ai_config(&ai_config)?;
         write_if_missing(&compose, DEFAULT_COMPOSE)?;
         migrate_compose(&compose)?;
-        Ok(Self {
+        let workspace = Self {
             root: root.to_path_buf(),
             config,
             strategy,
@@ -55,7 +59,10 @@ impl TradingWorkspace {
             ai_config,
             ai_signals: root.join("user_data").join("ai_signals.json"),
             ai_audit: root.join("user_data").join("ai_audit.sqlite"),
-        })
+        };
+        let ai_config = workspace.ai_trading_config().unwrap_or_default();
+        workspace.sync_ai_runtime_config(&ai_config)?;
+        Ok(workspace)
     }
 
     pub fn ai_trading_config(&self) -> Result<AiTradingConfig> {
@@ -66,12 +73,39 @@ impl TradingWorkspace {
 
     pub fn save_ai_trading_config(&self, config: &AiTradingConfig) -> Result<()> {
         crate::ai_trader::validate_config(config)?;
-        let temporary = self.ai_config.with_extension("json.tmp");
-        fs::write(
-            &temporary,
-            format!("{}\n", serde_json::to_string_pretty(config)?),
-        )?;
-        fs::rename(temporary, &self.ai_config).context("无法保存 AI 自动交易配置")?;
+        write_json_atomic(&self.ai_config, config).context("无法保存 AI 自动交易配置")?;
+        self.sync_ai_runtime_config(config)?;
+        Ok(())
+    }
+
+    fn sync_ai_runtime_config(&self, ai_config: &AiTradingConfig) -> Result<()> {
+        let pairs = normalized_pairs(&ai_config.symbol_whitelist)?;
+        let mut config: Value = serde_json::from_str(&fs::read_to_string(&self.config)?)?;
+        let exchange = config
+            .as_object_mut()
+            .context("Freqtrade 配置根节点无效")?
+            .entry("exchange")
+            .or_insert_with(|| json!({}));
+        let exchange = exchange.as_object_mut().context("exchange 配置无效")?;
+        exchange.insert("pair_whitelist".into(), json!(pairs));
+        ensure_order_book_pricing(&mut config)?;
+        config["stake_amount"] = json!(ai_config.max_stake_amount);
+        config["gqt_max_stake_amount"] = json!(ai_config.max_stake_amount);
+        config["gqt_risk_reward_ratio"] = json!(ai_config.risk_reward_ratio);
+        config["gqt_ai_risk_sizing"] = json!(ai_config.allow_ai_risk_sizing);
+        if ai_config.enabled {
+            config["strategy"] = json!("AiSignalStrategy");
+            config["timeframe"] = json!(ai_config.timeframe);
+            config["margin_mode"] = json!(match ai_config.margin_mode {
+                MarginMode::Cross => "cross",
+                MarginMode::Isolated => "isolated",
+            });
+        } else if config["strategy"].as_str() == Some("AiSignalStrategy") {
+            config["strategy"] = json!("FuturesFactorStrategy");
+            config["timeframe"] = json!("4h");
+            config["margin_mode"] = json!("isolated");
+        }
+        write_json_atomic(&self.config, &config).context("无法同步 Freqtrade 交易白名单")?;
         Ok(())
     }
 
@@ -107,12 +141,21 @@ impl TradingWorkspace {
         Ok(())
     }
 
-    pub fn risk(&self) -> Result<(f64, i64, f64)> {
+    pub fn risk(&self) -> Result<(f64, i64, f64, bool)> {
         let config: Value = serde_json::from_str(&fs::read_to_string(&self.config)?)?;
+        let ai_config = self.ai_trading_config().unwrap_or_default();
         Ok((
-            config["stake_amount"].as_f64().unwrap_or(50.0),
+            config["gqt_max_stake_amount"]
+                .as_f64()
+                .or_else(|| config["stake_amount"].as_f64())
+                .unwrap_or(ai_config.max_stake_amount),
             config["max_open_trades"].as_i64().unwrap_or(3),
-            config["liquidation_buffer"].as_f64().unwrap_or(0.15),
+            config["gqt_risk_reward_ratio"]
+                .as_f64()
+                .unwrap_or(ai_config.risk_reward_ratio),
+            config["gqt_ai_risk_sizing"]
+                .as_bool()
+                .unwrap_or(ai_config.allow_ai_risk_sizing),
         ))
     }
 
@@ -124,28 +167,42 @@ impl TradingWorkspace {
     pub fn update_mode(&self, dry_run: bool) -> Result<()> {
         let mut config: Value = serde_json::from_str(&fs::read_to_string(&self.config)?)?;
         config["dry_run"] = Value::from(dry_run);
-        fs::write(
-            &self.config,
-            format!("{}\n", serde_json::to_string_pretty(&config)?),
-        )?;
+        write_json_atomic(&self.config, &config)?;
         Ok(())
     }
 
-    pub fn update_risk(&self, stake: f64, max_trades: i64, buffer: f64) -> Result<()> {
-        if !(5.0..=1_000_000.0).contains(&stake)
+    pub fn update_risk(
+        &self,
+        max_stake: f64,
+        max_trades: i64,
+        risk_reward_ratio: f64,
+        allow_ai_risk_sizing: bool,
+    ) -> Result<()> {
+        if !max_stake.is_finite()
+            || !(5.0..=1_000_000.0).contains(&max_stake)
             || !(1..=20).contains(&max_trades)
-            || !(0.05..=0.5).contains(&buffer)
+            || !risk_reward_ratio.is_finite()
+            || !(0.5..=10.0).contains(&risk_reward_ratio)
         {
             bail!("风控参数超出允许范围");
         }
         let mut config: Value = serde_json::from_str(&fs::read_to_string(&self.config)?)?;
-        config["stake_amount"] = Value::from(stake);
+        config["stake_amount"] = Value::from(max_stake);
+        config["gqt_max_stake_amount"] = Value::from(max_stake);
         config["max_open_trades"] = Value::from(max_trades);
-        config["liquidation_buffer"] = Value::from(buffer);
-        fs::write(
-            &self.config,
-            format!("{}\n", serde_json::to_string_pretty(&config)?),
-        )?;
+        config["gqt_risk_reward_ratio"] = Value::from(risk_reward_ratio);
+        config["gqt_ai_risk_sizing"] = Value::from(allow_ai_risk_sizing);
+        if config["liquidation_buffer"].as_f64().is_none() {
+            config["liquidation_buffer"] = Value::from(0.15);
+        }
+        write_json_atomic(&self.config, &config)?;
+
+        let mut ai_config = self.ai_trading_config().unwrap_or_default();
+        ai_config.max_stake_amount = max_stake;
+        ai_config.risk_reward_ratio = risk_reward_ratio;
+        ai_config.allow_ai_risk_sizing = allow_ai_risk_sizing;
+        crate::ai_trader::validate_config(&ai_config)?;
+        write_json_atomic(&self.ai_config, &ai_config)?;
         Ok(())
     }
 
@@ -420,9 +477,56 @@ fn write_if_missing(path: &Path, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn migrate_ai_config(path: &Path) -> Result<()> {
+    let source = fs::read_to_string(path).context("无法读取 AI 自动交易配置")?;
+    let mut config: AiTradingConfig =
+        serde_json::from_str(&source).context("AI 自动交易配置 JSON 无效")?;
+    if config.symbol_whitelist == ["BTCUSDT".to_string(), "ETHUSDT".to_string()] {
+        config.symbol_whitelist = default_ai_symbol_whitelist();
+        write_json_atomic(path, &config).context("无法迁移 AI 默认白名单")?;
+    }
+    Ok(())
+}
+
+fn write_json_atomic<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
+    write_text_atomic(path, &format!("{}\n", serde_json::to_string_pretty(value)?))
+}
+
+fn write_text_atomic(path: &Path, value: &str) -> Result<()> {
+    let temporary = unique_temporary_path(path);
+    fs::write(&temporary, value)?;
+    replace_file(&temporary, path)?;
+    Ok(())
+}
+
+fn replace_file(temporary: &Path, target: &Path) -> Result<()> {
+    #[cfg(windows)]
+    if target.exists() {
+        fs::remove_file(target)
+            .with_context(|| format!("无法替换现有文件 {}", target.to_string_lossy()))?;
+    }
+    fs::rename(temporary, target).with_context(|| {
+        format!(
+            "无法把 {} 替换为 {}",
+            temporary.to_string_lossy(),
+            target.to_string_lossy()
+        )
+    })?;
+    Ok(())
+}
+
+fn unique_temporary_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("config.json");
+    path.with_file_name(format!("{file_name}.{}.tmp", rand::random::<u64>()))
+}
+
 fn migrate_config(path: &Path) -> Result<()> {
     let source = fs::read_to_string(path).context("无法读取 Freqtrade 配置")?;
     let mut config: Value = serde_json::from_str(&source).context("Freqtrade 配置 JSON 无效")?;
+    ensure_order_book_pricing(&mut config)?;
     let api = config
         .as_object_mut()
         .context("Freqtrade 配置根节点无效")?
@@ -446,6 +550,19 @@ fn migrate_config(path: &Path) -> Result<()> {
     let updated = format!("{}\n", serde_json::to_string_pretty(&config)?);
     if updated != source {
         fs::write(path, updated).context("无法更新 Freqtrade 配置")?;
+    }
+    Ok(())
+}
+
+fn ensure_order_book_pricing(config: &mut Value) -> Result<()> {
+    let root = config.as_object_mut().context("Freqtrade 配置根节点无效")?;
+    for key in ["entry_pricing", "exit_pricing"] {
+        let pricing = root.entry(key).or_insert_with(|| json!({}));
+        let pricing = pricing
+            .as_object_mut()
+            .with_context(|| format!("{key} 配置无效"))?;
+        pricing.insert("use_order_book".into(), json!(true));
+        pricing.entry("order_book_top").or_insert(json!(1));
     }
     Ok(())
 }
@@ -513,6 +630,10 @@ mod tests {
         migrate_config(&path).unwrap();
         let config: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(config["api_server"]["listen_ip_address"], "127.0.0.1");
+        assert_eq!(config["entry_pricing"]["use_order_book"], true);
+        assert_eq!(config["entry_pricing"]["order_book_top"], 1);
+        assert_eq!(config["exit_pricing"]["use_order_book"], true);
+        assert_eq!(config["exit_pricing"]["order_book_top"], 1);
         assert!(
             config["api_server"]["jwt_secret_key"]
                 .as_str()
@@ -531,6 +652,92 @@ mod tests {
         assert!(workspace.dry_run().unwrap());
         workspace.update_mode(false).unwrap();
         assert!(!workspace.dry_run().unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn updates_risk_limits_and_ai_sizing_config() {
+        let root = std::env::temp_dir().join(format!("gqt-risk-{}", rand::random::<u64>()));
+        let workspace = TradingWorkspace::ensure(&root).unwrap();
+        workspace.update_risk(500.0, 10, 3.0, true).unwrap();
+        assert_eq!(workspace.risk().unwrap(), (500.0, 10, 3.0, true));
+        let ai_config = workspace.ai_trading_config().unwrap();
+        assert_eq!(ai_config.max_stake_amount, 500.0);
+        assert_eq!(ai_config.risk_reward_ratio, 3.0);
+        assert!(ai_config.allow_ai_risk_sizing);
+        let config: Value =
+            serde_json::from_str(&fs::read_to_string(&workspace.config).unwrap()).unwrap();
+        assert_eq!(config["stake_amount"], 500.0);
+        assert_eq!(config["gqt_risk_reward_ratio"], 3.0);
+        assert_eq!(config["gqt_ai_risk_sizing"], true);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn saves_ai_config_and_syncs_runtime_whitelist() {
+        let root = std::env::temp_dir().join(format!("gqt-ai-runtime-{}", rand::random::<u64>()));
+        let workspace = TradingWorkspace::ensure(&root).unwrap();
+        let ai_config = AiTradingConfig {
+            enabled: true,
+            symbol_whitelist: vec!["SOLUSDT".into(), "DOGEUSDT".into()],
+            timeframe: "1h".into(),
+            margin_mode: MarginMode::Cross,
+            leverage: 3,
+            ..Default::default()
+        };
+        workspace.save_ai_trading_config(&ai_config).unwrap();
+        workspace.save_ai_trading_config(&ai_config).unwrap();
+        let stored_ai = workspace.ai_trading_config().unwrap();
+        assert_eq!(
+            stored_ai.symbol_whitelist,
+            vec!["SOLUSDT".to_string(), "DOGEUSDT".to_string()]
+        );
+        let config: Value =
+            serde_json::from_str(&fs::read_to_string(&workspace.config).unwrap()).unwrap();
+        assert_eq!(config["strategy"], "AiSignalStrategy");
+        assert_eq!(config["timeframe"], "1h");
+        assert_eq!(config["margin_mode"], "cross");
+        assert_eq!(
+            config["exchange"]["pair_whitelist"],
+            json!(["SOL/USDT:USDT", "DOGE/USDT:USDT"])
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn migrates_legacy_two_symbol_ai_whitelist() {
+        let root = std::env::temp_dir().join(format!("gqt-ai-migrate-{}", rand::random::<u64>()));
+        let user_data = root.join("user_data");
+        fs::create_dir_all(&user_data).unwrap();
+        fs::write(
+            user_data.join("ai_config.json"),
+            r#"{
+              "enabled": false,
+              "dry_run_only": true,
+              "symbol_whitelist": ["BTCUSDT", "ETHUSDT"],
+              "timeframe": "1h",
+              "margin_mode": "cross",
+              "leverage": 2,
+              "capital_usage_percent": 10.0,
+              "minimum_confidence": 0.75,
+              "model_timeout_seconds": 30,
+              "market_max_age_seconds": 90,
+              "one_signal_per_candle": true
+            }"#,
+        )
+        .unwrap();
+        let workspace = TradingWorkspace::ensure(&root).unwrap();
+        let stored_ai = workspace.ai_trading_config().unwrap();
+        assert_eq!(stored_ai.symbol_whitelist, default_ai_symbol_whitelist());
+        let config: Value =
+            serde_json::from_str(&fs::read_to_string(&workspace.config).unwrap()).unwrap();
+        assert_eq!(
+            config["exchange"]["pair_whitelist"]
+                .as_array()
+                .unwrap()
+                .len(),
+            10
+        );
         let _ = fs::remove_dir_all(root);
     }
 

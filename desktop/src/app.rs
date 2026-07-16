@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -13,20 +14,21 @@ use eframe::egui::{
 use zeroize::Zeroizing;
 
 use crate::{
-    ai, exchange, market,
+    ai, ai_trader,
+    audit::AuditLog,
+    exchange, market,
     model::{
-        AiProvider, Candle, CredentialDraft, FuturesAccount, Interval, MarketCommand, MarketEvent,
-        MarketSnapshot, Page, SecretStatus, SimulationAccount,
+        AiProvider, AiTradingConfig, AiTradingInput, Candle, CredentialDraft, FuturesAccount,
+        FuturesPosition, Interval, MarginMode, MarketCommand, MarketEvent, MarketSnapshot, Page,
+        SecretStatus, SimulationAccount,
     },
     store::SecretStore,
     theme,
     trading::TradingWorkspace,
 };
 
-const SYMBOLS: [&str; 10] = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "LINKUSDT",
-    "AVAXUSDT", "LTCUSDT",
-];
+const AI_TIMEFRAMES: [&str; 6] = ["1m", "5m", "15m", "1h", "4h", "1d"];
+const BUILD_LABEL: &str = "0.3.3-ai-json-repair";
 
 pub struct GqtApp {
     store: SecretStore,
@@ -57,7 +59,8 @@ pub struct GqtApp {
     strategy_state: String,
     stake_amount: f64,
     max_open_trades: i64,
-    liquidation_buffer: f64,
+    risk_reward_ratio: f64,
+    allow_ai_risk_sizing: bool,
     docker_available: bool,
     bot_state: String,
     bot_log: String,
@@ -67,12 +70,18 @@ pub struct GqtApp {
     auto_restart: bool,
     health_check_running: bool,
     last_health_check: Instant,
+    ai_config: AiTradingConfig,
+    ai_symbol_whitelist: String,
     ai_provider: AiProvider,
     ai_model: String,
     relay_base_url: String,
     ai_prompt: String,
     ai_output: String,
     ai_running: bool,
+    ai_decision_running: bool,
+    last_ai_decision_check: Instant,
+    ai_decision_status: String,
+    ai_processed_candles: BTreeMap<String, i64>,
     toast: Option<(String, bool, Instant)>,
     task_sender: mpsc::Sender<TaskEvent>,
     task_receiver: mpsc::Receiver<TaskEvent>,
@@ -98,6 +107,12 @@ enum TaskEvent {
     },
     Account(Result<FuturesAccount, String>),
     Simulation(Result<SimulationAccount, String>),
+    AiDecision(Result<AiDecisionSummary, String>),
+}
+
+struct AiDecisionSummary {
+    message: String,
+    processed: Vec<(String, i64)>,
 }
 
 #[derive(Clone, Copy)]
@@ -129,13 +144,25 @@ impl GqtApp {
         let workspace =
             TradingWorkspace::ensure(&data_root.join("trading")).expect("create trading workspace");
         let strategy_source = workspace.strategy_source().unwrap_or_default();
-        let (stake_amount, max_open_trades, liquidation_buffer) =
-            workspace.risk().unwrap_or((50.0, 3, 0.15));
+        let (stake_amount, max_open_trades, risk_reward_ratio, allow_ai_risk_sizing) =
+            workspace.risk().unwrap_or((50.0, 3, 2.0, false));
+        let ai_config = workspace.ai_trading_config().unwrap_or_default();
+        let initial_symbol = ai_config
+            .symbol_whitelist
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "BTCUSDT".into());
+        let ai_symbol_whitelist = format_symbol_whitelist(&ai_config.symbol_whitelist);
+        let selected_pairs = if ai_config.symbol_whitelist.is_empty() {
+            vec![initial_symbol.clone()]
+        } else {
+            ai_config.symbol_whitelist.clone()
+        };
         let (market_commands, command_receiver) = unbounded();
         let (event_sender, market_events) = unbounded();
         market::start_worker(command_receiver, event_sender);
         let _ = market_commands.send(MarketCommand::Select {
-            symbol: "BTCUSDT".into(),
+            symbol: initial_symbol.clone(),
             interval: Interval::FourHours,
         });
         let (task_sender, task_receiver) = mpsc::channel();
@@ -152,6 +179,11 @@ impl GqtApp {
             .ok()
             .flatten()
             .unwrap_or_default();
+        let ai_provider = if secret_status.relay {
+            AiProvider::Relay
+        } else {
+            AiProvider::DeepSeek
+        };
         Self {
             store,
             workspace,
@@ -169,7 +201,7 @@ impl GqtApp {
             last_simulation_check: Instant::now() - Duration::from_secs(30),
             show_simulation_account: false,
             page: Page::Overview,
-            symbol: "BTCUSDT".into(),
+            symbol: initial_symbol,
             interval: Interval::FourHours,
             candles: Vec::new(),
             snapshot: MarketSnapshot::default(),
@@ -181,7 +213,8 @@ impl GqtApp {
             strategy_state: "未修改".into(),
             stake_amount,
             max_open_trades,
-            liquidation_buffer,
+            risk_reward_ratio,
+            allow_ai_risk_sizing,
             docker_available,
             bot_state,
             bot_log: String::new(),
@@ -191,12 +224,18 @@ impl GqtApp {
             auto_restart,
             health_check_running: false,
             last_health_check: Instant::now(),
-            ai_provider: AiProvider::DeepSeek,
+            ai_config,
+            ai_symbol_whitelist,
+            ai_provider,
             ai_model: String::new(),
             relay_base_url,
             ai_prompt: "判断当前市场状态、主要风险与需要等待的确认信号。".into(),
             ai_output: "暂无分析".into(),
             ai_running: false,
+            ai_decision_running: false,
+            last_ai_decision_check: Instant::now() - Duration::from_secs(60),
+            ai_decision_status: "AI 闭环等待启动".into(),
+            ai_processed_candles: BTreeMap::new(),
             toast: None,
             task_sender,
             task_receiver,
@@ -204,11 +243,7 @@ impl GqtApp {
             backtest_end: "2026-01-01".into(),
             backtest_fee: 0.0005,
             download_days: 1095,
-            selected_pairs: SYMBOLS
-                .iter()
-                .take(5)
-                .map(|value| value.to_string())
-                .collect(),
+            selected_pairs,
             job_running: false,
         }
     }
@@ -315,6 +350,21 @@ impl GqtApp {
                             self.simulation_error.clear();
                         }
                         Err(error) => self.simulation_error = error,
+                    }
+                }
+                TaskEvent::AiDecision(result) => {
+                    self.ai_decision_running = false;
+                    match result {
+                        Ok(summary) => {
+                            for (symbol, candle_open_time) in summary.processed {
+                                self.ai_processed_candles.insert(symbol, candle_open_time);
+                            }
+                            self.ai_decision_status = summary.message;
+                        }
+                        Err(error) => {
+                            self.ai_decision_status = error.clone();
+                            self.toast(error, true);
+                        }
                     }
                 }
             }
@@ -560,6 +610,7 @@ impl GqtApp {
                                         theme::RED
                                     }),
                             );
+                            ui.label(RichText::new(BUILD_LABEL).size(9.0).color(theme::MUTED));
                         });
                     });
                 });
@@ -583,22 +634,54 @@ impl GqtApp {
                         );
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let (state_label, _, state_color, _) = self.execution_status();
                         Frame::NONE
-                            .fill(Color32::from_rgba_premultiplied(240, 185, 11, 22))
-                            .corner_radius(3)
-                            .inner_margin(Margin::symmetric(9, 5))
+                            .fill(if self.dry_run {
+                                theme::YELLOW
+                            } else {
+                                theme::RED
+                            })
+                            .stroke(Stroke::new(
+                                1.0,
+                                if self.dry_run {
+                                    theme::YELLOW
+                                } else {
+                                    theme::RED
+                                },
+                            ))
+                            .corner_radius(5)
+                            .inner_margin(Margin::symmetric(13, 7))
                             .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new(if self.dry_run { "DRY-RUN" } else { "LIVE" })
-                                        .size(11.0)
-                                        .color(if self.dry_run {
-                                            theme::YELLOW
+                                ui.set_min_width(118.0);
+                                ui.vertical_centered(|ui| {
+                                    ui.label(
+                                        RichText::new(if self.dry_run {
+                                            "模拟盘"
                                         } else {
-                                            theme::RED
+                                            "实盘"
+                                        })
+                                        .size(14.0)
+                                        .color(if self.dry_run {
+                                            Color32::BLACK
+                                        } else {
+                                            theme::TEXT
                                         })
                                         .strong(),
-                                );
+                                    );
+                                    ui.label(
+                                        RichText::new(state_label)
+                                            .size(11.0)
+                                            .color(if self.dry_run {
+                                                Color32::from_rgb(25, 25, 25)
+                                            } else {
+                                                theme::TEXT
+                                            })
+                                            .strong(),
+                                    );
+                                });
                             });
+                        ui.add_space(8.0);
+                        ui.colored_label(state_color, "●");
                     });
                 });
             });
@@ -734,8 +817,8 @@ impl GqtApp {
                 );
                 status_row(
                     ui,
-                    "爆仓缓冲",
-                    &format!("{:.0}%", self.liquidation_buffer * 100.0),
+                    "单仓盈亏比",
+                    &format!("1:{:.1}", self.risk_reward_ratio),
                 );
                 status_row(ui, "本地数据库", "key.db");
             });
@@ -1000,14 +1083,15 @@ impl GqtApp {
     }
 
     fn render_market(&mut self, ui: &mut Ui) {
+        let symbols = self.visible_symbols();
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("symbol")
                 .selected_text(&self.symbol)
                 .width(150.0)
                 .show_ui(ui, |ui| {
-                    for symbol in SYMBOLS {
+                    for symbol in symbols {
                         if ui
-                            .selectable_value(&mut self.symbol, symbol.to_string(), symbol)
+                            .selectable_value(&mut self.symbol, symbol.clone(), &symbol)
                             .clicked()
                         {
                             self.select_market();
@@ -1205,6 +1289,7 @@ impl GqtApp {
     }
 
     fn job_controls(&mut self, ui: &mut Ui, backtest: bool) {
+        let symbols = self.visible_symbols();
         Frame::NONE
             .fill(theme::SURFACE)
             .stroke(Stroke::new(1.0, theme::BORDER))
@@ -1248,16 +1333,16 @@ impl GqtApp {
                 });
                 ui.separator();
                 ui.horizontal_wrapped(|ui| {
-                    for symbol in SYMBOLS {
-                        let mut selected = self.selected_pairs.iter().any(|value| value == symbol);
+                    for symbol in symbols {
+                        let mut selected = self.selected_pairs.iter().any(|value| value == &symbol);
                         if ui
                             .checkbox(&mut selected, symbol.trim_end_matches("USDT"))
                             .changed()
                         {
                             if selected {
-                                self.selected_pairs.push(symbol.to_string());
+                                self.selected_pairs.push(symbol);
                             } else {
-                                self.selected_pairs.retain(|value| value != symbol);
+                                self.selected_pairs.retain(|value| value != &symbol);
                             }
                         }
                     }
@@ -1334,6 +1419,12 @@ impl GqtApp {
     }
 
     fn render_execution(&mut self, ui: &mut Ui) {
+        let strategy_name = if self.ai_config.enabled {
+            "AiSignalStrategy"
+        } else {
+            "FuturesFactorStrategy"
+        };
+        let (state_label, state_detail, state_color, state_icon) = self.execution_status();
         ui.horizontal_wrapped(|ui| {
             if ui.add(theme::secondary_button("编辑策略")).clicked() {
                 self.page = Page::Strategy;
@@ -1345,9 +1436,9 @@ impl GqtApp {
                 self.page = Page::Backtest;
             }
             ui.separator();
-            status_chip(ui, "4h 周期", true);
+            status_chip(ui, &format!("{} 周期", self.ai_config.timeframe), true);
             status_chip(ui, "多空双向", true);
-            status_chip(ui, "最高 2x", true);
+            status_chip(ui, &format!("最高 {}x", self.ai_config.leverage), true);
             ui.separator();
             if ui.selectable_label(self.dry_run, "模拟盘").clicked() && !self.dry_run {
                 self.set_trading_mode(true);
@@ -1362,7 +1453,7 @@ impl GqtApp {
             }
             ui.label(
                 RichText::new(format!(
-                    "单仓 {:.0} USDT · 最多 {} 仓",
+                    "单仓上限 {:.0} USDT · 最多 {} 仓",
                     self.stake_amount, self.max_open_trades
                 ))
                 .color(theme::MUTED),
@@ -1371,25 +1462,61 @@ impl GqtApp {
         ui.add_space(14.0);
         Frame::NONE
             .fill(theme::SURFACE)
-            .stroke(Stroke::new(1.0, theme::BORDER))
+            .stroke(Stroke::new(1.5, state_color))
             .corner_radius(5)
-            .inner_margin(Margin::same(16))
+            .inner_margin(Margin::same(18))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(theme::icon("radio-tower", 28.0, theme::YELLOW));
+                    Frame::NONE
+                        .fill(Color32::from_rgba_premultiplied(
+                            state_color.r(),
+                            state_color.g(),
+                            state_color.b(),
+                            35,
+                        ))
+                        .corner_radius(5)
+                        .inner_margin(Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.label(theme::icon(state_icon, 30.0, state_color));
+                        });
                     ui.vertical(|ui| {
-                        ui.label(RichText::new("Freqtrade").size(18.0).strong());
+                        ui.label(
+                            RichText::new(state_label)
+                                .size(23.0)
+                                .color(state_color)
+                                .strong(),
+                        );
                         ui.label(
                             RichText::new(format!(
-                                "{} · {} · FuturesFactorStrategy",
-                                self.bot_state,
-                                if self.dry_run { "DRY-RUN" } else { "LIVE" }
+                                "{} · {} · {}",
+                                state_detail,
+                                if self.dry_run { "模拟盘" } else { "实盘" },
+                                strategy_name
                             ))
-                            .color(if self.dry_run {
-                                theme::MUTED
-                            } else {
-                                theme::RED
-                            }),
+                            .size(13.0)
+                            .color(theme::TEXT),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "Freqtrade: {} · Docker: {}",
+                                self.bot_state,
+                                if self.docker_available {
+                                    "已连接"
+                                } else {
+                                    "不可用"
+                                }
+                            ))
+                            .size(11.0)
+                            .color(theme::MUTED),
+                        );
+                        ui.label(
+                            RichText::new(format!("AI 闭环: {}", self.ai_decision_status))
+                                .size(11.0)
+                                .color(if self.ai_config.enabled {
+                                    theme::YELLOW
+                                } else {
+                                    theme::MUTED
+                                }),
                         );
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1428,6 +1555,46 @@ impl GqtApp {
             },
         );
         log_view(ui, &self.bot_log, 500.0);
+    }
+
+    fn execution_status(&self) -> (&'static str, &'static str, Color32, &'static str) {
+        if !self.docker_available {
+            return (
+                "Docker 不可用",
+                "交易内核无法启动",
+                theme::RED,
+                "circle-alert",
+            );
+        }
+        match self.bot_state.to_ascii_lowercase().as_str() {
+            "running" => (
+                "策略运行中",
+                "正在监听信号并执行策略",
+                theme::GREEN,
+                "circle-play",
+            ),
+            "created" | "restarting" => (
+                "正在启动",
+                "交易内核正在准备",
+                theme::YELLOW,
+                "loader-circle",
+            ),
+            "paused" => (
+                "策略已暂停",
+                "容器存在但未执行",
+                theme::YELLOW,
+                "circle-pause",
+            ),
+            "exited" | "dead" | "removing" | "stopped" => {
+                ("策略未启动", "不会自动下单", theme::RED, "circle-stop")
+            }
+            _ => (
+                "状态检查中",
+                "等待 Docker 返回状态",
+                theme::MUTED,
+                "circle-help",
+            ),
+        }
     }
 
     fn bot_action(&mut self, start: bool) {
@@ -1520,8 +1687,11 @@ impl GqtApp {
             ui.set_min_width(420.0);
             ui.colored_label(theme::RED, "实盘策略会自动发送 Binance Futures 订单");
             ui.label(format!(
-                "单仓保证金 {:.0} USDT，最多同时持有 {} 个仓位，策略最高杠杆 2x。",
-                self.stake_amount, self.max_open_trades
+                "单仓保证金上限 {:.0} USDT，最多同时持有 {} 个仓位，策略最高杠杆 {}x，盈亏比 1:{:.1}。",
+                self.stake_amount,
+                self.max_open_trades,
+                self.ai_config.leverage,
+                self.risk_reward_ratio
             ));
             ui.add_space(10.0);
             ui.checkbox(
@@ -1571,6 +1741,119 @@ impl GqtApp {
         thread::spawn(move || {
             let (available, state) = workspace.docker_state();
             let _ = sender.send(TaskEvent::Health(available, state));
+        });
+    }
+
+    fn maybe_run_ai_decision_loop(&mut self) {
+        if !self.ai_config.enabled {
+            self.ai_decision_status = "AI 闭环未启用".into();
+            return;
+        }
+        if self.ai_decision_running
+            || self.last_ai_decision_check.elapsed() < Duration::from_secs(15)
+        {
+            return;
+        }
+        if self.bot_state != "running" {
+            self.ai_decision_status = "等待策略运行后开始 AI 闭环".into();
+            return;
+        }
+        if !self.dry_run && self.ai_config.dry_run_only {
+            self.ai_decision_status = "实盘已被“仅允许模拟盘”拦截".into();
+            return;
+        }
+        let Some(interval) = Interval::from_timeframe(&self.ai_config.timeframe) else {
+            self.ai_decision_status = "AI 周期配置无效".into();
+            return;
+        };
+        let candle_open_time = last_closed_candle_open(interval);
+        let symbols = self
+            .ai_config
+            .symbol_whitelist
+            .iter()
+            .filter(|symbol| {
+                !self.ai_config.one_signal_per_candle
+                    || self.ai_processed_candles.get(*symbol) != Some(&candle_open_time)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if symbols.is_empty() {
+            self.ai_decision_status =
+                format!("本根 {} K 线已完成 AI 决策", self.ai_config.timeframe);
+            return;
+        }
+
+        let Some(key) = self.unlocked_key.as_ref() else {
+            return;
+        };
+        let secret_name = match self.ai_provider {
+            AiProvider::OpenAi => "openai_api_key",
+            AiProvider::Claude => "anthropic_api_key",
+            AiProvider::DeepSeek => "deepseek_api_key",
+            AiProvider::Relay => "relay_api_key",
+        };
+        let api_key = self
+            .store
+            .get_secret(key, secret_name)
+            .ok()
+            .flatten()
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        if api_key.is_empty() {
+            self.ai_decision_status = format!("尚未配置 {} API Key", self.ai_provider.label());
+            return;
+        }
+        let binance_api_key = self
+            .store
+            .get_secret(key, "binance_api_key")
+            .ok()
+            .flatten()
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let binance_api_secret = self
+            .store
+            .get_secret(key, "binance_api_secret")
+            .ok()
+            .flatten()
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+
+        self.ai_decision_running = true;
+        self.last_ai_decision_check = Instant::now();
+        self.ai_decision_status = format!(
+            "AI 正在决策 {} 根 {} K 线",
+            symbols.len(),
+            self.ai_config.timeframe
+        );
+        let sender = self.task_sender.clone();
+        let provider = self.ai_provider;
+        let model = self.ai_model.clone();
+        let relay_base_url = self.relay_base_url.clone();
+        let config = self.ai_config.clone();
+        let workspace = self.workspace.clone();
+        let dry_run = self.dry_run;
+        let account_snapshot = if dry_run {
+            simulation_to_futures_account(&self.simulation_account)
+        } else {
+            self.account.clone()
+        };
+        thread::spawn(move || {
+            let result = run_ai_decision_cycle(AiDecisionCycle {
+                provider,
+                model,
+                api_key,
+                relay_base_url,
+                config,
+                workspace,
+                dry_run,
+                binance_api_key,
+                binance_api_secret,
+                account_snapshot,
+                interval,
+                candle_open_time,
+                symbols,
+            });
+            let _ = sender.send(TaskEvent::AiDecision(result));
         });
     }
 
@@ -1658,28 +1941,139 @@ impl GqtApp {
                 },
             );
             ui.add_space(12.0);
-            settings_section(ui, "仓位限制", "USDT-M · Isolated", |ui| {
+            settings_section(ui, "AI 自动交易", "白名单 / 执行参数", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut self.ai_config.enabled, "启用 AI 自动交易");
+                    ui.checkbox(&mut self.ai_config.dry_run_only, "仅允许模拟盘");
+                    ui.checkbox(
+                        &mut self.ai_config.one_signal_per_candle,
+                        "每根 K 线只执行一次",
+                    );
+                });
+                ui.add_space(8.0);
+                ui.columns(2, |cols| {
+                    field_label(&mut cols[0], "AI 提供商");
+                    egui::ComboBox::from_id_salt("settings-ai-provider")
+                        .selected_text(self.ai_provider.label())
+                        .show_ui(&mut cols[0], |ui| {
+                            for provider in AiProvider::ALL {
+                                ui.selectable_value(
+                                    &mut self.ai_provider,
+                                    provider,
+                                    provider.label(),
+                                );
+                            }
+                        });
+                    field_label(&mut cols[1], "模型名（可选）");
+                    cols[1].add_sized(
+                        [cols[1].available_width(), 36.0],
+                        TextEdit::singleline(&mut self.ai_model).hint_text("默认模型"),
+                    );
+                });
+                field_label(ui, "币种白名单");
+                ui.add_sized(
+                    [ui.available_width(), 38.0],
+                    TextEdit::singleline(&mut self.ai_symbol_whitelist)
+                        .hint_text("BTCUSDT, ETHUSDT"),
+                );
+                ui.add_space(8.0);
+                ui.columns(4, |cols| {
+                    field_label(&mut cols[0], "K 线周期");
+                    egui::ComboBox::from_id_salt("ai-timeframe")
+                        .selected_text(&self.ai_config.timeframe)
+                        .show_ui(&mut cols[0], |ui| {
+                            for timeframe in AI_TIMEFRAMES {
+                                ui.selectable_value(
+                                    &mut self.ai_config.timeframe,
+                                    timeframe.to_string(),
+                                    timeframe,
+                                );
+                            }
+                        });
+                    field_label(&mut cols[1], "保证金模式");
+                    egui::ComboBox::from_id_salt("ai-margin-mode")
+                        .selected_text(match self.ai_config.margin_mode {
+                            MarginMode::Cross => "Cross",
+                            MarginMode::Isolated => "Isolated",
+                        })
+                        .show_ui(&mut cols[1], |ui| {
+                            ui.selectable_value(
+                                &mut self.ai_config.margin_mode,
+                                MarginMode::Cross,
+                                "Cross",
+                            );
+                            ui.selectable_value(
+                                &mut self.ai_config.margin_mode,
+                                MarginMode::Isolated,
+                                "Isolated",
+                            );
+                        });
+                    field_label(&mut cols[2], "杠杆");
+                    cols[2].add(egui::DragValue::new(&mut self.ai_config.leverage).range(1..=125));
+                    field_label(&mut cols[3], "资金比例 %");
+                    cols[3].add(
+                        egui::DragValue::new(&mut self.ai_config.capital_usage_percent)
+                            .speed(0.5)
+                            .range(1.0..=100.0),
+                    );
+                });
+                ui.add_space(8.0);
                 ui.columns(3, |cols| {
-                    field_label(&mut cols[0], "单仓保证金（USDT）");
+                    field_label(&mut cols[0], "最低置信度");
+                    cols[0].add(
+                        egui::DragValue::new(&mut self.ai_config.minimum_confidence)
+                            .speed(0.01)
+                            .range(0.0..=1.0),
+                    );
+                    field_label(&mut cols[1], "模型超时秒");
+                    cols[1].add(
+                        egui::DragValue::new(&mut self.ai_config.model_timeout_seconds)
+                            .range(5..=120),
+                    );
+                    field_label(&mut cols[2], "行情最大延迟秒");
+                    cols[2].add(
+                        egui::DragValue::new(&mut self.ai_config.market_max_age_seconds)
+                            .range(15..=3_600),
+                    );
+                });
+                ui.add_space(10.0);
+                if ui.add(theme::primary_button("保存 AI 参数")).clicked() {
+                    self.save_ai_settings();
+                }
+            });
+            ui.add_space(12.0);
+            settings_section(ui, "仓位风控", "上限 / 盈亏比", |ui| {
+                ui.columns(3, |cols| {
+                    field_label(&mut cols[0], "单仓保证金上限（USDT）");
                     cols[0]
                         .add(egui::DragValue::new(&mut self.stake_amount).range(5.0..=1_000_000.0));
                     field_label(&mut cols[1], "最大同时持仓");
                     cols[1].add(egui::DragValue::new(&mut self.max_open_trades).range(1..=20));
-                    field_label(&mut cols[2], "爆仓缓冲");
+                    field_label(&mut cols[2], "单仓盈亏比");
                     cols[2].add(
-                        egui::DragValue::new(&mut self.liquidation_buffer)
-                            .speed(0.01)
-                            .range(0.05..=0.5),
+                        egui::DragValue::new(&mut self.risk_reward_ratio)
+                            .speed(0.1)
+                            .range(0.5..=10.0),
                     );
                 });
+                ui.checkbox(
+                    &mut self.allow_ai_risk_sizing,
+                    "AI 在上限内判断仓位 / 止盈止损",
+                );
                 ui.add_space(10.0);
                 if ui.add(theme::primary_button("保存风控")).clicked() {
                     match self.workspace.update_risk(
                         self.stake_amount,
                         self.max_open_trades,
-                        self.liquidation_buffer,
+                        self.risk_reward_ratio,
+                        self.allow_ai_risk_sizing,
                     ) {
-                        Ok(()) => self.toast("风控参数已保存", false),
+                        Ok(()) => {
+                            self.ai_config.max_stake_amount = self.stake_amount;
+                            self.ai_config.risk_reward_ratio = self.risk_reward_ratio;
+                            self.ai_config.allow_ai_risk_sizing = self.allow_ai_risk_sizing;
+                            self.toast("风控参数已保存", false);
+                        }
                         Err(error) => self.toast(error.to_string(), true),
                     }
                 }
@@ -1797,6 +2191,52 @@ impl GqtApp {
         }
     }
 
+    fn visible_symbols(&self) -> Vec<String> {
+        if self.ai_config.symbol_whitelist.is_empty() {
+            vec!["BTCUSDT".into()]
+        } else {
+            self.ai_config.symbol_whitelist.clone()
+        }
+    }
+
+    fn refresh_whitelist_selection(&mut self) {
+        let symbols = self.visible_symbols();
+        self.selected_pairs
+            .retain(|selected| symbols.iter().any(|symbol| symbol == selected));
+        if self.selected_pairs.is_empty() {
+            self.selected_pairs = symbols.clone();
+        }
+        if !symbols.iter().any(|symbol| symbol == &self.symbol) {
+            self.symbol = symbols.first().cloned().unwrap_or_else(|| "BTCUSDT".into());
+            self.select_market();
+        }
+    }
+
+    fn save_ai_settings(&mut self) {
+        let symbols = match parse_symbol_whitelist(&self.ai_symbol_whitelist) {
+            Ok(symbols) => symbols,
+            Err(error) => {
+                self.toast(error, true);
+                return;
+            }
+        };
+        self.ai_config.symbol_whitelist = symbols;
+        self.ai_config.max_stake_amount = self.stake_amount;
+        self.ai_config.risk_reward_ratio = self.risk_reward_ratio;
+        self.ai_config.allow_ai_risk_sizing = self.allow_ai_risk_sizing;
+        match self.workspace.save_ai_trading_config(&self.ai_config) {
+            Ok(()) => {
+                self.ai_symbol_whitelist =
+                    format_symbol_whitelist(&self.ai_config.symbol_whitelist);
+                self.refresh_whitelist_selection();
+                self.ai_processed_candles.clear();
+                self.ai_decision_status = "AI 设置已更新，等待下一轮决策".into();
+                self.toast("AI 自动交易参数已保存", false);
+            }
+            Err(error) => self.toast(error.to_string(), true),
+        }
+    }
+
     fn select_market(&self) {
         let _ = self.market_commands.send(MarketCommand::Select {
             symbol: self.symbol.clone(),
@@ -1852,6 +2292,7 @@ impl eframe::App for GqtApp {
             self.check_bot_health();
             self.refresh_account();
             self.refresh_simulation_account();
+            self.maybe_run_ai_decision_loop();
         }
         ctx.request_repaint_after(Duration::from_millis(200));
     }
@@ -1888,6 +2329,206 @@ impl eframe::App for GqtApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         let _ = self.market_commands.send(MarketCommand::Stop);
+    }
+}
+
+struct AiDecisionCycle {
+    provider: AiProvider,
+    model: String,
+    api_key: String,
+    relay_base_url: String,
+    config: AiTradingConfig,
+    workspace: TradingWorkspace,
+    dry_run: bool,
+    binance_api_key: String,
+    binance_api_secret: String,
+    account_snapshot: FuturesAccount,
+    interval: Interval,
+    candle_open_time: i64,
+    symbols: Vec<String>,
+}
+
+fn run_ai_decision_cycle(cycle: AiDecisionCycle) -> Result<AiDecisionSummary, String> {
+    run_ai_decision_cycle_inner(cycle).map_err(|error| error.to_string())
+}
+
+fn run_ai_decision_cycle_inner(cycle: AiDecisionCycle) -> anyhow::Result<AiDecisionSummary> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()?;
+    let audit = AuditLog::open(&cycle.workspace.ai_audit)?;
+    let account = if !cycle.dry_run
+        && !cycle.binance_api_key.is_empty()
+        && !cycle.binance_api_secret.is_empty()
+    {
+        exchange::fetch_futures_account(&cycle.binance_api_key, &cycle.binance_api_secret)
+            .unwrap_or(cycle.account_snapshot)
+    } else {
+        cycle.account_snapshot
+    };
+
+    let mut processed = Vec::new();
+    let mut messages = Vec::new();
+    let mut failures = Vec::new();
+    for symbol in &cycle.symbols {
+        let result = (|| -> anyhow::Result<String> {
+            let candles = market::fetch_candles(&client, symbol, cycle.interval, 160)?;
+            let snapshot = market::fetch_snapshot(&client, symbol)?;
+            let input = AiTradingInput {
+                symbol: symbol.clone(),
+                timeframe: cycle.config.timeframe.clone(),
+                candle_open_time: cycle.candle_open_time,
+                candles,
+                snapshot,
+                account: account.clone(),
+                current_position: position_for_symbol(&account, symbol),
+                configured_leverage: cycle.config.leverage,
+                configured_capital_usage_percent: cycle.config.capital_usage_percent,
+            };
+            let output = ai::decide_trade(
+                cycle.provider,
+                &cycle.model,
+                &cycle.api_key,
+                &cycle.relay_base_url,
+                &input,
+                &cycle.config,
+            )?;
+            let decision = ai_trader::validate_signal(
+                &cycle.config,
+                &input,
+                output.signal,
+                chrono::Utc::now().timestamp(),
+            );
+            audit.record_decision(
+                cycle.provider.label(),
+                &output.model,
+                &input,
+                &output.raw_output,
+                &decision.signal,
+                decision.approved,
+                &decision.reason,
+            )?;
+            ai_trader::write_signal_atomically(&cycle.workspace.ai_signals, &decision.signal)?;
+            processed.push((symbol.clone(), cycle.candle_open_time));
+            Ok(format!(
+                "{} {} {} ({:.0}%)",
+                symbol,
+                action_label(&decision.signal.action),
+                if decision.approved {
+                    "通过"
+                } else {
+                    "拦截/观望"
+                },
+                decision.signal.confidence * 100.0
+            ))
+        })();
+        match result {
+            Ok(message) => messages.push(message),
+            Err(error) if is_restricted_location_error(&error) => {
+                let processed = cycle
+                    .symbols
+                    .iter()
+                    .map(|symbol| (symbol.clone(), cycle.candle_open_time))
+                    .collect();
+                return Ok(AiDecisionSummary {
+                    message: "AI 闭环已暂停：Binance Futures 拒绝了当前网络位置（HTTP 451）。实时模拟盘和实盘都需要能访问 Binance Futures 的合规网络；当前只能使用离线回测或已有本地数据测试。".into(),
+                    processed,
+                });
+            }
+            Err(error) if is_ai_output_format_error(&error) => {
+                let processed = cycle
+                    .symbols
+                    .iter()
+                    .map(|symbol| (symbol.clone(), cycle.candle_open_time))
+                    .collect();
+                return Ok(AiDecisionSummary {
+                    message: format!(
+                        "AI 闭环已暂停：AI 输出不是可执行 JSON。{}。请检查中转站 Base URL 是否为 OpenAI-compatible /v1、模型名是否支持 chat/completions，或换支持 JSON 输出的模型。",
+                        compact_error(&error.to_string(), 520)
+                    ),
+                    processed,
+                });
+            }
+            Err(error) => failures.push(format!("{symbol}: {error}")),
+        }
+    }
+
+    if messages.is_empty() && !failures.is_empty() {
+        anyhow::bail!("{}", failures.join("; "));
+    }
+    let mut message = if messages.is_empty() {
+        "AI 本轮没有生成新信号".to_string()
+    } else {
+        format!("AI 决策完成：{}", messages.join("，"))
+    };
+    if !failures.is_empty() {
+        message.push_str(&format!("；失败：{}", failures.join("；")));
+    }
+    Ok(AiDecisionSummary { message, processed })
+}
+
+fn simulation_to_futures_account(account: &SimulationAccount) -> FuturesAccount {
+    FuturesAccount {
+        wallet_balance: account.wallet_balance,
+        available_balance: account.available_balance,
+        margin_balance: account.wallet_balance,
+        unrealized_profit: 0.0,
+        initial_margin: account.open_stake,
+        maintenance_margin: 0.0,
+        positions: Vec::new(),
+        updated_at: chrono::Utc::now().timestamp_millis(),
+    }
+}
+
+fn is_restricted_location_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("restricted location") || message.contains("http 451")
+}
+
+fn is_ai_output_format_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("AI 决策中没有 JSON 对象")
+        || message.contains("AI 输出没有 JSON")
+        || message.contains("AI JSON 修复响应")
+        || message.contains("AI 决策 JSON")
+        || message.contains("返回不是有效 JSON")
+}
+
+fn compact_error(value: &str, limit: usize) -> String {
+    let compact = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(limit)
+        .collect::<String>();
+    if compact.is_empty() {
+        "没有返回可读错误内容".into()
+    } else {
+        compact
+    }
+}
+
+fn position_for_symbol(account: &FuturesAccount, symbol: &str) -> Option<FuturesPosition> {
+    account
+        .positions
+        .iter()
+        .find(|position| position.symbol == symbol)
+        .cloned()
+}
+
+fn last_closed_candle_open(interval: Interval) -> i64 {
+    let seconds = interval.seconds();
+    let now = chrono::Utc::now().timestamp();
+    (now / seconds) * seconds - seconds
+}
+
+fn action_label(action: &crate::model::AiAction) -> &'static str {
+    match action {
+        crate::model::AiAction::Long => "做多",
+        crate::model::AiAction::Short => "做空",
+        crate::model::AiAction::Close => "平仓",
+        crate::model::AiAction::Hold => "观望",
     }
 }
 
@@ -2097,6 +2738,47 @@ fn status_chip(ui: &mut Ui, label: &str, configured: bool) {
                 );
             });
         });
+}
+
+fn format_symbol_whitelist(symbols: &[String]) -> String {
+    symbols.join(", ")
+}
+
+fn parse_symbol_whitelist(value: &str) -> Result<Vec<String>, String> {
+    let mut symbols = Vec::new();
+    for raw in value.split(|character: char| {
+        character == ','
+            || character == ';'
+            || character == '，'
+            || character == '；'
+            || character.is_whitespace()
+    }) {
+        let compact = raw
+            .trim()
+            .to_ascii_uppercase()
+            .replace("/", "")
+            .replace(":USDT", "");
+        if compact.is_empty() {
+            continue;
+        }
+        let Some(base) = compact.strip_suffix("USDT") else {
+            return Err(format!("{compact} 不是 U 本位永续合约代码"));
+        };
+        if !(2..=12).contains(&base.len())
+            || !base
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+        {
+            return Err(format!("{compact} 合约代码格式无效"));
+        }
+        if !symbols.iter().any(|symbol| symbol == &compact) {
+            symbols.push(compact);
+        }
+    }
+    if symbols.is_empty() {
+        return Err("币种白名单不能为空".into());
+    }
+    Ok(symbols)
 }
 
 fn log_view(ui: &mut Ui, log: &str, height: f32) {

@@ -157,6 +157,15 @@ fn read_json(response: Response, context: &str) -> Result<Value> {
     }
 
     let code = value["code"].as_i64().unwrap_or_default();
+    if status.as_u16() == 451
+        || value["msg"]
+            .as_str()
+            .is_some_and(|message| message.to_ascii_lowercase().contains("restricted location"))
+    {
+        bail!(
+            "{context}: Binance Futures 拒绝了当前网络位置（HTTP 451 restricted location）。实时模拟盘和实盘都需要能访问 Binance Futures 的合规网络；当前只能使用离线回测或已有本地数据测试。（错误码 {code}）"
+        )
+    }
     let message = match code {
         -1022 => "Secret 不正确，签名验证失败".to_string(),
         -2014 => "API Key 格式无效".to_string(),

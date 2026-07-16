@@ -94,6 +94,29 @@ impl Interval {
             Interval::OneDay => "1d",
         }
     }
+
+    pub fn from_timeframe(value: &str) -> Option<Self> {
+        match value {
+            "1m" => Some(Interval::OneMinute),
+            "5m" => Some(Interval::FiveMinutes),
+            "15m" => Some(Interval::FifteenMinutes),
+            "1h" => Some(Interval::OneHour),
+            "4h" => Some(Interval::FourHours),
+            "1d" => Some(Interval::OneDay),
+            _ => None,
+        }
+    }
+
+    pub fn seconds(self) -> i64 {
+        match self {
+            Interval::OneMinute => 60,
+            Interval::FiveMinutes => 5 * 60,
+            Interval::FifteenMinutes => 15 * 60,
+            Interval::OneHour => 60 * 60,
+            Interval::FourHours => 4 * 60 * 60,
+            Interval::OneDay => 24 * 60 * 60,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -195,6 +218,7 @@ pub enum MarginMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AiTradingConfig {
     pub enabled: bool,
     pub dry_run_only: bool,
@@ -202,7 +226,10 @@ pub struct AiTradingConfig {
     pub timeframe: String,
     pub margin_mode: MarginMode,
     pub leverage: u8,
+    pub max_stake_amount: f64,
     pub capital_usage_percent: f64,
+    pub risk_reward_ratio: f64,
+    pub allow_ai_risk_sizing: bool,
     pub minimum_confidence: f64,
     pub model_timeout_seconds: u64,
     pub market_max_age_seconds: i64,
@@ -214,17 +241,30 @@ impl Default for AiTradingConfig {
         Self {
             enabled: false,
             dry_run_only: true,
-            symbol_whitelist: vec!["BTCUSDT".into(), "ETHUSDT".into()],
+            symbol_whitelist: default_ai_symbol_whitelist(),
             timeframe: "1h".into(),
             margin_mode: MarginMode::Cross,
             leverage: 2,
+            max_stake_amount: 50.0,
             capital_usage_percent: 10.0,
+            risk_reward_ratio: 2.0,
+            allow_ai_risk_sizing: false,
             minimum_confidence: 0.75,
             model_timeout_seconds: 30,
             market_max_age_seconds: 90,
             one_signal_per_candle: true,
         }
     }
+}
+
+pub fn default_ai_symbol_whitelist() -> Vec<String> {
+    [
+        "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "LINKUSDT",
+        "AVAXUSDT", "LTCUSDT",
+    ]
+    .iter()
+    .map(|symbol| symbol.to_string())
+    .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,6 +285,8 @@ pub struct AiTradeSignal {
     pub valid_until: i64,
     pub action: AiAction,
     pub confidence: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stake_amount: Option<f64>,
     pub stop_loss_percent: f64,
     pub take_profit_percent: f64,
     pub reason: String,

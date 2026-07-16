@@ -2,12 +2,14 @@ use std::{thread, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender};
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, Response};
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::model::{Candle, Interval, MarketCommand, MarketEvent, MarketSnapshot, Sentiment};
 
 const BINANCE_BASE: &str = "https://fapi.binance.com";
+const RESTRICTED_LOCATION_HINT: &str = "Binance Futures 拒绝了当前网络位置（HTTP 451 restricted location）。实时模拟盘和实盘都需要能访问 Binance Futures 的合规网络；当前只能使用离线回测或已有本地数据测试。";
 
 pub fn start_worker(commands: Receiver<MarketCommand>, events: Sender<MarketEvent>) {
     thread::spawn(move || {
@@ -86,24 +88,25 @@ pub fn start_worker(commands: Receiver<MarketCommand>, events: Sender<MarketEven
     });
 }
 
-fn fetch_candles(
+pub fn fetch_candles(
     client: &Client,
     symbol: &str,
     interval: Interval,
     limit: usize,
 ) -> Result<Vec<Candle>> {
     validate_symbol(symbol)?;
-    let rows: Vec<Vec<Value>> = client
-        .get(format!("{BINANCE_BASE}/fapi/v1/klines"))
-        .query(&[
-            ("symbol", symbol),
-            ("interval", interval.as_str()),
-            ("limit", &limit.clamp(50, 1000).to_string()),
-        ])
-        .send()?
-        .error_for_status()?
-        .json()
-        .context("Binance K线响应格式无效")?;
+    let rows: Vec<Vec<Value>> = read_binance_json(
+        client
+            .get(format!("{BINANCE_BASE}/fapi/v1/klines"))
+            .query(&[
+                ("symbol", symbol),
+                ("interval", interval.as_str()),
+                ("limit", &limit.clamp(50, 1000).to_string()),
+            ])
+            .send()
+            .context("无法连接 Binance Futures K线接口")?,
+        "Binance K线请求失败",
+    )?;
     rows.into_iter()
         .map(|row| {
             if row.len() < 6 {
@@ -121,19 +124,21 @@ fn fetch_candles(
         .collect()
 }
 
-fn fetch_snapshot(client: &Client, symbol: &str) -> Result<MarketSnapshot> {
+pub fn fetch_snapshot(client: &Client, symbol: &str) -> Result<MarketSnapshot> {
     validate_symbol(symbol)?;
     let ticker: Value = get_json(client, "/fapi/v1/ticker/24hr", symbol)?;
     let premium: Value = get_json(client, "/fapi/v1/premiumIndex", symbol)?;
     let open_interest: Value = get_json(client, "/fapi/v1/openInterest", symbol)?;
-    let long_short: Vec<Value> = client
-        .get(format!(
-            "{BINANCE_BASE}/futures/data/globalLongShortAccountRatio"
-        ))
-        .query(&[("symbol", symbol), ("period", "5m"), ("limit", "1")])
-        .send()?
-        .error_for_status()?
-        .json()?;
+    let long_short: Vec<Value> = read_binance_json(
+        client
+            .get(format!(
+                "{BINANCE_BASE}/futures/data/globalLongShortAccountRatio"
+            ))
+            .query(&[("symbol", symbol), ("period", "5m"), ("limit", "1")])
+            .send()
+            .context("无法连接 Binance Futures 多空比接口")?,
+        "Binance 多空比请求失败",
+    )?;
     let change_percent = field_number(&ticker, "priceChangePercent")?;
     let funding_rate = field_number(&premium, "lastFundingRate")?;
     let long_short_ratio = long_short
@@ -160,12 +165,36 @@ fn fetch_snapshot(client: &Client, symbol: &str) -> Result<MarketSnapshot> {
 }
 
 fn get_json(client: &Client, path: &str, symbol: &str) -> Result<Value> {
-    Ok(client
-        .get(format!("{BINANCE_BASE}{path}"))
-        .query(&[("symbol", symbol)])
-        .send()?
-        .error_for_status()?
-        .json()?)
+    read_binance_json(
+        client
+            .get(format!("{BINANCE_BASE}{path}"))
+            .query(&[("symbol", symbol)])
+            .send()
+            .context("无法连接 Binance Futures 行情接口")?,
+        "Binance 行情请求失败",
+    )
+}
+
+fn read_binance_json<T: DeserializeOwned>(response: Response, context: &str) -> Result<T> {
+    let status = response.status();
+    let body = response.text().context("无法读取 Binance 返回")?;
+    if status.is_success() {
+        return serde_json::from_str(&body).context("Binance 返回不是有效 JSON");
+    }
+
+    let message = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("msg")
+                .and_then(|message| message.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.trim().to_string());
+    if status.as_u16() == 451 || message.to_ascii_lowercase().contains("restricted location") {
+        bail!("{context}: {RESTRICTED_LOCATION_HINT}");
+    }
+    bail!("{context}: HTTP {status} {message}");
 }
 
 fn parse_number(value: &Value) -> Result<f64> {
