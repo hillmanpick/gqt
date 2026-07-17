@@ -1,3 +1,5 @@
+use std::{collections::BTreeMap, thread, time::Duration};
+
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Deserializer};
@@ -11,10 +13,10 @@ use crate::network;
 const ANALYST_RULES: &str = "你是加密货币合约市场的风险分析助手。只分析给定市场数据，输出简洁中文；必须列出市场状态、支持因素、反对因素、风险和需要等待的确认信号。不得声称已经下单，不得要求或使用交易权限，不得把分析写成确定收益承诺。";
 const TRADE_DECISION_RULES: &str = "你是加密货币合约交易信号研究助手。你只能基于输入数据输出严格 JSON，不能输出 Markdown、解释段落、代码块或额外文字。回复必须以 { 开头并以 } 结尾。允许的 action 只有 long、short、close、hold。你不能承诺收益，遇到不确定、震荡、数据不足或风险过高必须输出 hold。stop_loss_percent 和 take_profit_percent 使用价格波动百分比，不使用杠杆后收益百分比。";
 
-pub struct AiDecisionOutput {
+pub struct AiBatchDecisionOutput {
     pub model: String,
     pub raw_output: String,
-    pub signal: AiTradeSignal,
+    pub signals: Vec<AiTradeSignal>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -30,6 +32,13 @@ struct RawTradeDecision {
     take_profit_percent: Option<f64>,
     #[serde(default)]
     reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSymbolTradeDecision {
+    symbol: String,
+    #[serde(flatten)]
+    decision: RawTradeDecision,
 }
 
 pub fn analyze(
@@ -79,22 +88,30 @@ pub fn analyze(
     }
 }
 
-pub fn decide_trade(
+pub fn decide_trades(
     provider: AiProvider,
     requested_model: &str,
     api_key: &str,
     relay_base_url: &str,
-    input: &AiTradingInput,
+    inputs: &[AiTradingInput],
     config: &AiTradingConfig,
-) -> Result<AiDecisionOutput> {
+) -> Result<AiBatchDecisionOutput> {
     if api_key.trim().is_empty() {
         bail!("尚未配置 {} API Key", provider.label());
     }
+    if inputs.is_empty() {
+        return Ok(AiBatchDecisionOutput {
+            model: selected_model(provider, requested_model).to_string(),
+            raw_output: "{}".into(),
+            signals: Vec::new(),
+        });
+    }
 
     let model = selected_model(provider, requested_model).to_string();
-    let prompt = trade_decision_prompt(input, config)?;
+    let prompt = trade_decision_batch_prompt(inputs, config)?;
     let client = network::client(std::time::Duration::from_secs(config.model_timeout_seconds))
-        .context("无法创建 AI 决策请求客户端")?;
+        .context("无法创建 AI 批量决策请求客户端")?;
+    let max_tokens = (450 + inputs.len() as u32 * 260).clamp(900, 4200);
     let raw_output = request_text(
         provider,
         &client,
@@ -103,119 +120,91 @@ pub fn decide_trade(
         relay_base_url,
         TRADE_DECISION_RULES,
         &prompt,
-        700,
+        max_tokens,
         0.0,
     )?;
     let mut raw_output = raw_output;
     let decision_json = match extract_json_object(&raw_output) {
         Ok(value) => value,
-        Err(first_error) => {
-            let repaired = repair_trade_decision_json(
+        Err(_) => {
+            let repaired = repair_trade_decision_batch_json(
                 provider,
                 &client,
                 &model,
                 api_key,
                 relay_base_url,
                 &raw_output,
-                input,
+                inputs,
                 config,
             )
             .with_context(|| {
                 format!(
-                    "AI 输出没有 JSON，自动修复失败。原始返回: {}",
+                    "AI 批量输出没有 JSON，自动修复失败。原始返回: {}",
                     preview_text(&raw_output)
                 )
             })?;
             raw_output = format!("{raw_output}\n\n[json_repair]\n{repaired}");
-            if repaired.trim().is_empty() {
-                bail!("{first_error}: {}", preview_text(&raw_output));
-            }
             repaired
         }
     };
-    let raw_decision: RawTradeDecision =
-        serde_json::from_str(&decision_json).with_context(|| {
-            format!(
-                "AI 决策 JSON 字段格式无效: {}",
-                preview_text(&decision_json)
-            )
-        })?;
-    let now = chrono::Utc::now().timestamp();
-    let timeframe_seconds = crate::model::Interval::from_timeframe(&input.timeframe)
-        .map(crate::model::Interval::seconds)
-        .unwrap_or(60);
-    let stop_loss = raw_decision
-        .stop_loss_percent
-        .unwrap_or(1.5)
-        .clamp(0.1, 20.0);
-    let take_profit = raw_decision
-        .take_profit_percent
-        .unwrap_or(stop_loss * config.risk_reward_ratio)
-        .clamp(0.1, 100.0)
-        .max(stop_loss * 0.5);
-    Ok(AiDecisionOutput {
+
+    let raw_decisions = parse_batch_trade_decisions(&decision_json)?;
+    let mut by_symbol = BTreeMap::new();
+    for raw in raw_decisions {
+        by_symbol.insert(raw.symbol.trim().to_ascii_uppercase(), raw.decision);
+    }
+
+    let signals = inputs
+        .iter()
+        .map(|input| {
+            let raw = by_symbol
+                .remove(&input.symbol.to_ascii_uppercase())
+                .unwrap_or_else(|| hold_decision("AI 未返回该交易对，安全观望"));
+            raw_decision_to_signal(input, config, raw)
+        })
+        .collect();
+
+    Ok(AiBatchDecisionOutput {
         model,
         raw_output,
-        signal: AiTradeSignal {
-            decision_id: format!(
-                "ai-{}-{}-{}",
-                input.symbol, input.timeframe, input.candle_open_time
-            ),
-            symbol: input.symbol.clone(),
-            timeframe: input.timeframe.clone(),
-            candle_open_time: input.candle_open_time,
-            valid_until: now.max(input.candle_open_time + timeframe_seconds) + timeframe_seconds,
-            action: raw_decision.action,
-            confidence: raw_decision.confidence,
-            stake_amount: raw_decision.stake_amount,
-            stop_loss_percent: stop_loss,
-            take_profit_percent: take_profit,
-            reason: raw_decision
-                .reason
-                .unwrap_or_else(|| "AI 未提供理由".into())
-                .chars()
-                .take(300)
-                .collect(),
-        },
+        signals,
     })
 }
 
-fn repair_trade_decision_json(
+fn repair_trade_decision_batch_json(
     provider: AiProvider,
     client: &Client,
     model: &str,
     api_key: &str,
     relay_base_url: &str,
     raw_output: &str,
-    input: &AiTradingInput,
+    inputs: &[AiTradingInput],
     config: &AiTradingConfig,
 ) -> Result<String> {
+    let symbols = inputs
+        .iter()
+        .map(|input| input.symbol.as_str())
+        .collect::<Vec<_>>();
     let repair_prompt = serde_json::to_string_pretty(&json!({
         "task": "The previous response was not valid JSON. Convert it into one valid JSON object only.",
-        "hard_rule": "If the previous response is not a clear actionable signal, return hold with confidence 0.",
-        "previous_response": raw_output.chars().take(2000).collect::<String>(),
+        "hard_rule": "Return decisions for every requested symbol. If unclear, return hold with confidence 0.",
+        "previous_response": raw_output.chars().take(3000).collect::<String>(),
+        "required_symbols": symbols,
         "required_output_schema": {
-            "action": "long | short | close | hold",
-            "confidence": "number from 0 to 1",
-            "stake_amount": "optional number or null",
-            "stop_loss_percent": "number from 0.1 to 20",
-            "take_profit_percent": "number from 0.1 to 100",
-            "reason": "short Chinese reason"
+            "decisions": [{
+                "symbol": "BTCUSDT",
+                "action": "long | short | close | hold",
+                "confidence": "number from 0 to 1",
+                "stake_amount": "optional number or null",
+                "stop_loss_percent": "number from 0.1 to 20",
+                "take_profit_percent": "number from 0.1 to 100",
+                "reason": "short Chinese reason"
+            }]
         },
         "must_respect": {
-            "symbol": input.symbol,
-            "timeframe": input.timeframe,
             "max_stake_amount": config.max_stake_amount,
             "risk_reward_ratio": config.risk_reward_ratio,
             "minimum_confidence": config.minimum_confidence
-        },
-        "fallback_output": {
-            "action": "hold",
-            "confidence": 0.0,
-            "stake_amount": null,
-            "stop_loss_percent": 1.5,
-            "take_profit_percent": 3.0,
-            "reason": "AI 原始输出不是有效 JSON，安全观望"
         }
     }))?;
     let repaired = request_text(
@@ -226,12 +215,12 @@ fn repair_trade_decision_json(
         relay_base_url,
         TRADE_DECISION_RULES,
         &repair_prompt,
-        350,
+        (420 + inputs.len() as u32 * 160).clamp(800, 2800),
         0.0,
     )?;
     extract_json_object(&repaired).with_context(|| {
         format!(
-            "AI JSON 修复响应仍没有 JSON。修复返回: {}",
+            "AI 批量 JSON 修复响应仍没有 JSON。修复返回: {}",
             preview_text(&repaired)
         )
     })
@@ -260,42 +249,73 @@ fn selected_model<'a>(provider: AiProvider, requested_model: &'a str) -> &'a str
     }
 }
 
-fn trade_decision_prompt(input: &AiTradingInput, config: &AiTradingConfig) -> Result<String> {
-    let recent: Vec<Value> = input
-        .candles
+fn trade_decision_batch_prompt(
+    inputs: &[AiTradingInput],
+    config: &AiTradingConfig,
+) -> Result<String> {
+    let markets: Vec<Value> = inputs
         .iter()
-        .rev()
-        .take(80)
-        .rev()
-        .map(|candle| {
+        .map(|input| {
+            let recent: Vec<Value> = input
+                .candles
+                .iter()
+                .rev()
+                .take(36)
+                .rev()
+                .map(|candle| {
+                    json!({
+                        "time": candle.time,
+                        "open": candle.open,
+                        "high": candle.high,
+                        "low": candle.low,
+                        "close": candle.close,
+                        "volume": candle.volume,
+                    })
+                })
+                .collect();
             json!({
-                "time": candle.time,
-                "open": candle.open,
-                "high": candle.high,
-                "low": candle.low,
-                "close": candle.close,
-                "volume": candle.volume,
+                "symbol": input.symbol,
+                "timeframe": input.timeframe,
+                "candle_open_time": input.candle_open_time,
+                "configured_leverage": input.configured_leverage,
+                "configured_capital_usage_percent": input.configured_capital_usage_percent,
+                "current_position": input.current_position,
+                "snapshot": input.snapshot,
+                "recent_candles": recent
             })
         })
         .collect();
+    let account = inputs.first().map(|input| &input.account);
     Ok(serde_json::to_string_pretty(&json!({
-        "task": "Return one trading decision as JSON only.",
-        "strict_output": "Return exactly one JSON object. Do not wrap it in Markdown. Do not add comments.",
+        "task": "Return batch futures trading decisions as JSON only.",
+        "strict_output": "Return exactly one JSON object with a decisions array. Do not wrap it in Markdown. Do not add comments.",
+        "hard_rules": [
+            "Return one decision for every requested symbol exactly once.",
+            "Use hold when data is unclear, choppy, stale, insufficient, or risk is too high.",
+            "Do not invent missing market data.",
+            "stake_amount is USDT margin and must not exceed max_stake_amount."
+        ],
         "output_schema": {
-            "action": "long | short | close | hold",
-            "confidence": "number from 0 to 1",
-            "stake_amount": "optional USDT margin, must be <= max_stake_amount",
-            "stop_loss_percent": "price move percent, 0.1 to 20",
-            "take_profit_percent": "price move percent, should respect risk_reward_ratio",
-            "reason": "short Chinese reason"
+            "decisions": [{
+                "symbol": "BTCUSDT",
+                "action": "long | short | close | hold",
+                "confidence": "number from 0 to 1",
+                "stake_amount": "optional USDT margin, must be <= max_stake_amount",
+                "stop_loss_percent": "price move percent, 0.1 to 20",
+                "take_profit_percent": "price move percent, should respect risk_reward_ratio",
+                "reason": "short Chinese reason"
+            }]
         },
         "example_output": {
-            "action": "hold",
-            "confidence": 0.0,
-            "stake_amount": null,
-            "stop_loss_percent": 1.5,
-            "take_profit_percent": 3.0,
-            "reason": "数据不足，等待确认"
+            "decisions": [{
+                "symbol": "BTCUSDT",
+                "action": "hold",
+                "confidence": 0.0,
+                "stake_amount": null,
+                "stop_loss_percent": 1.5,
+                "take_profit_percent": 3.0,
+                "reason": "数据不足，等待确认"
+            }]
         },
         "constraints": {
             "symbol_whitelist": config.symbol_whitelist,
@@ -309,23 +329,126 @@ fn trade_decision_prompt(input: &AiTradingInput, config: &AiTradingConfig) -> Re
             "dry_run_only": config.dry_run_only,
             "one_signal_per_candle": config.one_signal_per_candle
         },
-        "input": {
-            "symbol": input.symbol,
-            "timeframe": input.timeframe,
-            "candle_open_time": input.candle_open_time,
-            "configured_leverage": input.configured_leverage,
-            "configured_capital_usage_percent": input.configured_capital_usage_percent,
-            "account": {
-                "available_balance": input.account.available_balance,
-                "margin_balance": input.account.margin_balance,
-                "unrealized_profit": input.account.unrealized_profit,
-                "open_positions": input.account.positions.len()
-            },
-            "current_position": input.current_position,
-            "snapshot": input.snapshot,
-            "recent_candles": recent
-        }
+        "account": account.map(|account| json!({
+            "available_balance": account.available_balance,
+            "margin_balance": account.margin_balance,
+            "unrealized_profit": account.unrealized_profit,
+            "open_positions": account.positions.len()
+        })),
+        "markets": markets
     }))?)
+}
+
+fn parse_batch_trade_decisions(value: &str) -> Result<Vec<RawSymbolTradeDecision>> {
+    let body: Value = serde_json::from_str(value)
+        .with_context(|| format!("AI 批量决策 JSON 无效: {}", preview_text(value)))?;
+    if let Some(items) = body
+        .get("decisions")
+        .or_else(|| body.get("signals"))
+        .and_then(|value| value.as_array())
+    {
+        return serde_json::from_value(Value::Array(items.clone()))
+            .context("AI 批量决策 decisions 字段格式无效");
+    }
+    if let Some(items) = body
+        .get("decisions")
+        .or_else(|| body.get("signals"))
+        .and_then(|value| value.as_object())
+    {
+        return parse_decision_object_map(items);
+    }
+    if let Some(items) = body.as_object() {
+        let parsed = parse_decision_object_map(items)?;
+        if !parsed.is_empty() {
+            return Ok(parsed);
+        }
+    }
+    bail!(
+        "AI 批量决策 JSON 中没有 decisions 数组: {}",
+        preview_text(value)
+    )
+}
+
+fn parse_decision_object_map(
+    items: &serde_json::Map<String, Value>,
+) -> Result<Vec<RawSymbolTradeDecision>> {
+    let mut parsed = Vec::new();
+    for (symbol, value) in items {
+        if !looks_like_symbol(symbol) {
+            continue;
+        }
+        let Some(decision) = value.as_object() else {
+            continue;
+        };
+        let mut decision = decision.clone();
+        decision.insert("symbol".into(), Value::String(symbol.to_ascii_uppercase()));
+        parsed.push(
+            serde_json::from_value(Value::Object(decision))
+                .with_context(|| format!("AI 批量决策 {symbol} 字段格式无效"))?,
+        );
+    }
+    Ok(parsed)
+}
+
+fn raw_decision_to_signal(
+    input: &AiTradingInput,
+    config: &AiTradingConfig,
+    raw_decision: RawTradeDecision,
+) -> AiTradeSignal {
+    let now = chrono::Utc::now().timestamp();
+    let timeframe_seconds = crate::model::Interval::from_timeframe(&input.timeframe)
+        .map(crate::model::Interval::seconds)
+        .unwrap_or(60);
+    let stop_loss = raw_decision
+        .stop_loss_percent
+        .unwrap_or(1.5)
+        .clamp(0.1, 20.0);
+    let take_profit = raw_decision
+        .take_profit_percent
+        .unwrap_or(stop_loss * config.risk_reward_ratio)
+        .clamp(0.1, 100.0)
+        .max(stop_loss * 0.5);
+    AiTradeSignal {
+        decision_id: format!(
+            "ai-{}-{}-{}",
+            input.symbol, input.timeframe, input.candle_open_time
+        ),
+        symbol: input.symbol.clone(),
+        timeframe: input.timeframe.clone(),
+        candle_open_time: input.candle_open_time,
+        valid_until: now.max(input.candle_open_time + timeframe_seconds) + timeframe_seconds,
+        action: raw_decision.action,
+        confidence: raw_decision.confidence,
+        stake_amount: raw_decision.stake_amount,
+        stop_loss_percent: stop_loss,
+        take_profit_percent: take_profit,
+        reason: raw_decision
+            .reason
+            .unwrap_or_else(|| "AI 未提供理由".into())
+            .chars()
+            .take(300)
+            .collect(),
+    }
+}
+
+fn hold_decision(reason: &str) -> RawTradeDecision {
+    RawTradeDecision {
+        action: AiAction::Hold,
+        confidence: 0.0,
+        stake_amount: None,
+        stop_loss_percent: Some(1.5),
+        take_profit_percent: Some(3.0),
+        reason: Some(reason.into()),
+    }
+}
+
+fn looks_like_symbol(value: &str) -> bool {
+    let value = value.trim();
+    value.ends_with("USDT")
+        && (6..=20).contains(&value.len())
+        && value
+            .chars()
+            .all(|character| character.is_ascii_uppercase() || character.is_ascii_digit())
 }
 
 fn request_text(
@@ -373,7 +496,7 @@ fn request_text(
                 input,
                 max_tokens,
                 temperature,
-                true,
+                false,
             )
         }
     }
@@ -510,7 +633,7 @@ fn chat_completions(
     temperature: f32,
     json_output: bool,
 ) -> Result<String> {
-    match chat_completions_attempt(
+    match chat_completions_attempt_with_retry(
         client,
         endpoint,
         provider,
@@ -528,7 +651,7 @@ fn chat_completions(
                 .with_context(|| format!("中转站模型 {model} 不可用，且自动读取模型列表失败"))?;
             let mut failures = vec![format!("{model}: {error}")];
             for candidate in candidates.iter().take(8) {
-                match chat_completions_attempt(
+                match chat_completions_attempt_with_retry(
                     client,
                     endpoint,
                     provider,
@@ -559,6 +682,43 @@ fn chat_completions(
         }
         Err(error) => Err(error),
     }
+}
+
+fn chat_completions_attempt_with_retry(
+    client: &Client,
+    endpoint: &str,
+    provider: &str,
+    model: &str,
+    api_key: &str,
+    system: &str,
+    input: &str,
+    max_tokens: u32,
+    temperature: f32,
+    json_output: bool,
+) -> Result<String> {
+    let mut last_error = None;
+    for attempt in 0..3 {
+        match chat_completions_attempt(
+            client,
+            endpoint,
+            provider,
+            model,
+            api_key,
+            system,
+            input,
+            max_tokens,
+            temperature,
+            json_output,
+        ) {
+            Ok(text) => return Ok(text),
+            Err(error) if is_transient_provider_error(&error) && attempt < 2 => {
+                last_error = Some(error);
+                thread::sleep(Duration::from_millis(450 + attempt as u64 * 650));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("{provider} 请求失败")))
 }
 
 fn chat_completions_attempt(
@@ -971,6 +1131,28 @@ mod tests {
             chat_completion_text_from_value(&body, "test").unwrap(),
             r#"{"action":"hold","confidence":0.2}"#
         );
+    }
+
+    #[test]
+    fn parses_batch_decisions_array() {
+        let decisions = parse_batch_trade_decisions(
+            r#"{"decisions":[{"symbol":"BTCUSDT","action":"hold","confidence":0.2}]}"#,
+        )
+        .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].symbol, "BTCUSDT");
+        assert_eq!(decisions[0].decision.action, AiAction::Hold);
+    }
+
+    #[test]
+    fn parses_batch_decisions_symbol_map() {
+        let decisions = parse_batch_trade_decisions(
+            r#"{"BTCUSDT":{"action":"long","confidence":0.82},"ETHUSDT":{"action":"hold","confidence":0.1}}"#,
+        )
+        .unwrap();
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(decisions[0].symbol, "BTCUSDT");
+        assert_eq!(decisions[0].decision.action, AiAction::Long);
     }
 
     #[test]

@@ -28,7 +28,7 @@ use crate::{
 };
 
 const AI_TIMEFRAMES: [&str; 6] = ["1m", "5m", "15m", "1h", "4h", "1d"];
-const BUILD_LABEL: &str = "0.3.3-ai-json-repair";
+const BUILD_LABEL: &str = "0.3.4-relay-batch-retry";
 const RELAY_DEFAULT_MODEL: &str = "gpt-5.6-luna";
 
 pub struct GqtApp {
@@ -2407,14 +2407,13 @@ fn run_ai_decision_cycle_inner(cycle: AiDecisionCycle) -> anyhow::Result<AiDecis
         cycle.account_snapshot
     };
 
-    let mut processed = Vec::new();
-    let mut messages = Vec::new();
+    let mut inputs = Vec::new();
     let mut failures = Vec::new();
     for symbol in &cycle.symbols {
-        let result = (|| -> anyhow::Result<String> {
+        let result = (|| -> anyhow::Result<AiTradingInput> {
             let candles = market::fetch_candles(&client, symbol, cycle.interval, 160)?;
             let snapshot = market::fetch_snapshot(&client, symbol)?;
-            let input = AiTradingInput {
+            Ok(AiTradingInput {
                 symbol: symbol.clone(),
                 timeframe: cycle.config.timeframe.clone(),
                 candle_open_time: cycle.candle_open_time,
@@ -2424,46 +2423,10 @@ fn run_ai_decision_cycle_inner(cycle: AiDecisionCycle) -> anyhow::Result<AiDecis
                 current_position: position_for_symbol(&account, symbol),
                 configured_leverage: cycle.config.leverage,
                 configured_capital_usage_percent: cycle.config.capital_usage_percent,
-            };
-            let output = ai::decide_trade(
-                cycle.provider,
-                &cycle.model,
-                &cycle.api_key,
-                &cycle.relay_base_url,
-                &input,
-                &cycle.config,
-            )?;
-            let decision = ai_trader::validate_signal(
-                &cycle.config,
-                &input,
-                output.signal,
-                chrono::Utc::now().timestamp(),
-            );
-            audit.record_decision(
-                cycle.provider.label(),
-                &output.model,
-                &input,
-                &output.raw_output,
-                &decision.signal,
-                decision.approved,
-                &decision.reason,
-            )?;
-            ai_trader::write_signal_atomically(&cycle.workspace.ai_signals, &decision.signal)?;
-            processed.push((symbol.clone(), cycle.candle_open_time));
-            Ok(format!(
-                "{} {} {} ({:.0}%)",
-                symbol,
-                action_label(&decision.signal.action),
-                if decision.approved {
-                    "通过"
-                } else {
-                    "拦截/观望"
-                },
-                decision.signal.confidence * 100.0
-            ))
+            })
         })();
         match result {
-            Ok(message) => messages.push(message),
+            Ok(input) => inputs.push(input),
             Err(error) if is_restricted_location_error(&error) => {
                 let processed = cycle
                     .symbols
@@ -2476,34 +2439,92 @@ fn run_ai_decision_cycle_inner(cycle: AiDecisionCycle) -> anyhow::Result<AiDecis
                 });
             }
             Err(error) if is_ai_output_format_error(&error) => {
-                let processed = cycle
-                    .symbols
-                    .iter()
-                    .map(|symbol| (symbol.clone(), cycle.candle_open_time))
-                    .collect();
                 return Ok(AiDecisionSummary {
                     message: format!(
                         "AI 闭环已暂停：AI 输出不是可执行 JSON。{}。请检查中转站 Base URL 是否为 OpenAI-compatible /v1、模型名是否支持 chat/completions，或换支持 JSON 输出的模型。",
                         compact_error(&error.to_string(), 520)
                     ),
-                    processed,
+                    processed: Vec::new(),
                 });
             }
             Err(error) if is_ai_provider_capacity_error(&error) => {
-                let processed = cycle
-                    .symbols
-                    .iter()
-                    .map(|symbol| (symbol.clone(), cycle.candle_open_time))
-                    .collect();
                 return Ok(AiDecisionSummary {
                     message: format!(
-                        "AI 闭环已暂停：中转站当前不可用。{}。这通常是模型在当前分组没有可用通道，或中转站服务器过载；请在中转站后台确认模型名/分组，换一个有通道的模型，或稍后重试。",
+                        "AI 本轮未生成信号：中转站当前不可用。{}。程序已做即时重试；下一轮会继续尝试，请确认模型/分组有可用通道。",
                         compact_error(&error.to_string(), 520)
                     ),
-                    processed,
+                    processed: Vec::new(),
                 });
             }
             Err(error) => failures.push(format!("{symbol}: {error}")),
+        }
+    }
+
+    let mut processed = Vec::new();
+    let mut messages = Vec::new();
+    if !inputs.is_empty() {
+        match ai::decide_trades(
+            cycle.provider,
+            &cycle.model,
+            &cycle.api_key,
+            &cycle.relay_base_url,
+            &inputs,
+            &cycle.config,
+        ) {
+            Ok(output) => {
+                for (input, signal) in inputs.iter().zip(output.signals.into_iter()) {
+                    let decision = ai_trader::validate_signal(
+                        &cycle.config,
+                        input,
+                        signal,
+                        chrono::Utc::now().timestamp(),
+                    );
+                    audit.record_decision(
+                        cycle.provider.label(),
+                        &output.model,
+                        input,
+                        &output.raw_output,
+                        &decision.signal,
+                        decision.approved,
+                        &decision.reason,
+                    )?;
+                    ai_trader::write_signal_atomically(
+                        &cycle.workspace.ai_signals,
+                        &decision.signal,
+                    )?;
+                    processed.push((input.symbol.clone(), cycle.candle_open_time));
+                    messages.push(format!(
+                        "{} {} {} ({:.0}%)",
+                        input.symbol,
+                        action_label(&decision.signal.action),
+                        if decision.approved {
+                            "通过"
+                        } else {
+                            "拦截/观望"
+                        },
+                        decision.signal.confidence * 100.0
+                    ));
+                }
+            }
+            Err(error) if is_ai_output_format_error(&error) => {
+                return Ok(AiDecisionSummary {
+                    message: format!(
+                        "AI 本轮未生成信号：AI 输出不是可执行 JSON。{}。请检查中转站 Base URL 是否为 OpenAI-compatible /v1、模型名是否支持 chat/completions，或换支持 JSON 输出的模型。",
+                        compact_error(&error.to_string(), 520)
+                    ),
+                    processed: Vec::new(),
+                });
+            }
+            Err(error) if is_ai_provider_capacity_error(&error) => {
+                return Ok(AiDecisionSummary {
+                    message: format!(
+                        "AI 本轮未生成信号：中转站当前不可用。{}。程序已做即时重试；下一轮会继续尝试，请确认模型/分组有可用通道。",
+                        compact_error(&error.to_string(), 520)
+                    ),
+                    processed: Vec::new(),
+                });
+            }
+            Err(error) => failures.push(error.to_string()),
         }
     }
 
@@ -2553,6 +2574,7 @@ fn is_ai_provider_capacity_error(error: &anyhow::Error) -> bool {
     message.contains("503 service unavailable")
         || message.contains("no available channel")
         || message.contains("system cpu overloaded")
+        || message.contains("temporarily unavailable")
         || message.contains("rate limit")
         || message.contains("too many requests")
 }
