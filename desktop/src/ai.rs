@@ -204,7 +204,8 @@ fn repair_trade_decision_batch_json(
         "must_respect": {
             "max_stake_amount": config.max_stake_amount,
             "risk_reward_ratio": config.risk_reward_ratio,
-            "minimum_confidence": config.minimum_confidence
+            "minimum_confidence": config.minimum_confidence,
+            "factor_gate": factor_gate_json(config)
         }
     }))?;
     let repaired = request_text(
@@ -280,6 +281,7 @@ fn trade_decision_batch_prompt(
                 "configured_leverage": input.configured_leverage,
                 "configured_capital_usage_percent": input.configured_capital_usage_percent,
                 "current_position": input.current_position,
+                "local_factor": input.factor,
                 "snapshot": input.snapshot,
                 "recent_candles": recent
             })
@@ -292,6 +294,10 @@ fn trade_decision_batch_prompt(
         "hard_rules": [
             "Return one decision for every requested symbol exactly once.",
             "Use hold when data is unclear, choppy, stale, insufficient, or risk is too high.",
+            format!("Use local_factor as a hard reference. Only use long when local_factor.long_score >= {:.2}, local_factor.score >= {:.2}, trend_quality >= {:.2}, adx >= {:.1}, and volume_ratio >= {:.2}.", config.minimum_long_score, config.minimum_factor_score, config.minimum_trend_quality, config.minimum_adx, config.minimum_volume_ratio),
+            format!("Only use short when local_factor.short_score >= {:.2}, local_factor.score <= -{:.2}, trend_quality >= {:.2}, adx >= {:.1}, and volume_ratio >= {:.2}.", config.minimum_short_score, config.minimum_factor_score, config.minimum_trend_quality, config.minimum_adx, config.minimum_volume_ratio),
+            "Prefer hold when local_factor.bias is neutral, ADX is weak, RSI is outside the directional range, or price action has no volume confirmation.",
+            "Avoid chasing long when funding_rate is positive and long_short_ratio is crowded; avoid chasing short when funding_rate is negative and shorts are crowded.",
             "Do not invent missing market data.",
             "stake_amount is USDT margin and must not exceed max_stake_amount."
         ],
@@ -325,6 +331,7 @@ fn trade_decision_batch_prompt(
             "capital_usage_percent": config.capital_usage_percent,
             "risk_reward_ratio": config.risk_reward_ratio,
             "minimum_confidence": config.minimum_confidence,
+            "factor_gate": factor_gate_json(config),
             "allow_ai_risk_sizing": config.allow_ai_risk_sizing,
             "dry_run_only": config.dry_run_only,
             "one_signal_per_candle": config.one_signal_per_candle
@@ -337,6 +344,17 @@ fn trade_decision_batch_prompt(
         })),
         "markets": markets
     }))?)
+}
+
+fn factor_gate_json(config: &AiTradingConfig) -> Value {
+    json!({
+        "minimum_long_score": config.minimum_long_score,
+        "minimum_short_score": config.minimum_short_score,
+        "minimum_factor_score": config.minimum_factor_score,
+        "minimum_trend_quality": config.minimum_trend_quality,
+        "minimum_adx": config.minimum_adx,
+        "minimum_volume_ratio": config.minimum_volume_ratio
+    })
 }
 
 fn parse_batch_trade_decisions(value: &str) -> Result<Vec<RawSymbolTradeDecision>> {

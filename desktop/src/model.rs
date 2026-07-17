@@ -188,6 +188,7 @@ pub struct SimulationAccount {
     pub closed_trades: i64,
     pub winning_trades: i64,
     pub open_trades: Vec<SimulationTrade>,
+    pub trade_history: Vec<PositionHistory>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -200,6 +201,24 @@ pub struct SimulationTrade {
     pub leverage: f64,
     pub open_date: String,
     pub tag: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PositionHistory {
+    pub pair: String,
+    pub status: String,
+    pub side: String,
+    pub amount: f64,
+    pub stake_amount: f64,
+    pub open_rate: f64,
+    pub close_rate: Option<f64>,
+    pub leverage: f64,
+    pub profit_abs: f64,
+    pub profit_percent: f64,
+    pub open_date: String,
+    pub close_date: String,
+    pub tag: String,
+    pub exit_reason: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,6 +250,12 @@ pub struct AiTradingConfig {
     pub risk_reward_ratio: f64,
     pub allow_ai_risk_sizing: bool,
     pub minimum_confidence: f64,
+    pub minimum_long_score: f64,
+    pub minimum_short_score: f64,
+    pub minimum_factor_score: f64,
+    pub minimum_trend_quality: f64,
+    pub minimum_adx: f64,
+    pub minimum_volume_ratio: f64,
     pub model_timeout_seconds: u64,
     pub market_max_age_seconds: i64,
     pub one_signal_per_candle: bool,
@@ -242,7 +267,7 @@ impl Default for AiTradingConfig {
             enabled: false,
             dry_run_only: true,
             symbol_whitelist: default_ai_symbol_whitelist(),
-            timeframe: "1h".into(),
+            timeframe: "4h".into(),
             margin_mode: MarginMode::Cross,
             leverage: 2,
             max_stake_amount: 50.0,
@@ -250,6 +275,12 @@ impl Default for AiTradingConfig {
             risk_reward_ratio: 2.0,
             allow_ai_risk_sizing: false,
             minimum_confidence: 0.75,
+            minimum_long_score: 0.68,
+            minimum_short_score: 0.68,
+            minimum_factor_score: 0.25,
+            minimum_trend_quality: 0.52,
+            minimum_adx: 18.0,
+            minimum_volume_ratio: 0.0,
             model_timeout_seconds: 30,
             market_max_age_seconds: 90,
             one_signal_per_candle: true,
@@ -292,6 +323,31 @@ pub struct AiTradeSignal {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FactorSnapshot {
+    pub score: f64,
+    pub bias: String,
+    pub long_score: f64,
+    pub short_score: f64,
+    pub trend_quality: f64,
+    pub momentum_short: f64,
+    pub momentum_medium: f64,
+    pub trend: f64,
+    pub adx: f64,
+    pub rsi: f64,
+    pub macd_histogram: f64,
+    pub breakout_position: f64,
+    pub realized_volatility: f64,
+    pub atr_percent: f64,
+    pub volume_ratio: f64,
+    pub volume_confirmation: f64,
+    pub close_location: f64,
+    pub ema_fast: f64,
+    pub ema_mid: f64,
+    pub ema_slow: f64,
+    pub data_points: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiTradingInput {
     pub symbol: String,
@@ -299,6 +355,7 @@ pub struct AiTradingInput {
     pub candle_open_time: i64,
     pub candles: Vec<Candle>,
     pub snapshot: MarketSnapshot,
+    pub factor: FactorSnapshot,
     pub account: FuturesAccount,
     pub current_position: Option<FuturesPosition>,
     pub configured_leverage: u8,

@@ -12,7 +12,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::model::{
-    AiTradingConfig, MarginMode, SimulationAccount, SimulationTrade, default_ai_symbol_whitelist,
+    AiTradingConfig, MarginMode, PositionHistory, SimulationAccount, SimulationTrade,
+    default_ai_symbol_whitelist,
 };
 
 const DEFAULT_CONFIG: &str = include_str!("../../trading/user_data/config.json");
@@ -230,11 +231,36 @@ impl TradingWorkspace {
         (true, status)
     }
 
-    pub fn bot_action(&self, start: bool, api_key: &str, api_secret: &str) -> Result<String> {
-        let args: &[&str] = if start {
-            &["compose", "up", "-d"]
+    pub fn runtime_uses_strategy_override(&self) -> bool {
+        background_command("docker")
+            .args([
+                "inspect",
+                "--format",
+                "{{json .Config.Cmd}}",
+                "binance-futures-factor",
+            ])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).contains("\"--strategy\""))
+            .unwrap_or(false)
+    }
+
+    pub fn bot_action(
+        &self,
+        start: bool,
+        force_recreate: bool,
+        api_key: &str,
+        api_secret: &str,
+    ) -> Result<String> {
+        let args: Vec<&str> = if start {
+            let mut args = vec!["compose", "up", "-d"];
+            if force_recreate {
+                args.push("--force-recreate");
+            }
+            args
         } else {
-            &["compose", "stop", "freqtrade"]
+            vec!["compose", "stop", "--timeout", "30", "freqtrade"]
         };
         let database_url = if self.dry_run()? {
             "sqlite:////freqtrade/user_data/tradesv3.dryrun.sqlite"
@@ -242,7 +268,7 @@ impl TradingWorkspace {
             "sqlite:////freqtrade/user_data/tradesv3.live.sqlite"
         };
         let output = background_command("docker")
-            .args(args)
+            .args(&args)
             .current_dir(&self.root)
             .env("BINANCE_API_KEY", api_key)
             .env("BINANCE_API_SECRET", api_secret)
@@ -306,6 +332,7 @@ impl TradingWorkspace {
             .iter()
             .map(|trade| trade.stake_amount)
             .sum::<f64>();
+        let trade_history = recent_position_history(&connection, 80)?;
         let wallet_balance = initial_wallet + realized_profit;
         Ok(SimulationAccount {
             wallet_balance,
@@ -315,6 +342,7 @@ impl TradingWorkspace {
             closed_trades,
             winning_trades,
             open_trades,
+            trade_history,
         })
     }
 
@@ -448,6 +476,41 @@ impl TradingWorkspace {
     }
 }
 
+fn recent_position_history(connection: &Connection, limit: usize) -> Result<Vec<PositionHistory>> {
+    let mut statement = connection.prepare(
+        "SELECT pair, is_open, is_short, amount, stake_amount, open_rate,
+                close_rate, leverage, open_date, COALESCE(close_date, ''),
+                COALESCE(enter_tag, ''), COALESCE(exit_reason, ''),
+                COALESCE(close_profit_abs, realized_profit, 0),
+                COALESCE(close_profit, 0)
+         FROM trades
+         ORDER BY COALESCE(close_date, open_date) DESC
+         LIMIT ?1",
+    )?;
+    let rows = statement.query_map([limit as i64], |row| {
+        let is_open = row.get::<_, bool>(1)?;
+        let is_short = row.get::<_, bool>(2)?;
+        Ok(PositionHistory {
+            pair: row.get(0)?,
+            status: if is_open { "持仓中" } else { "已平仓" }.into(),
+            side: if is_short { "空" } else { "多" }.into(),
+            amount: row.get::<_, Option<f64>>(3)?.unwrap_or_default(),
+            stake_amount: row.get::<_, Option<f64>>(4)?.unwrap_or_default(),
+            open_rate: row.get::<_, Option<f64>>(5)?.unwrap_or_default(),
+            close_rate: row.get(6)?,
+            leverage: row.get::<_, Option<f64>>(7)?.unwrap_or(1.0),
+            open_date: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
+            close_date: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+            tag: row.get(10)?,
+            exit_reason: row.get(11)?,
+            profit_abs: row.get::<_, Option<f64>>(12)?.unwrap_or_default(),
+            profit_percent: row.get::<_, Option<f64>>(13)?.unwrap_or_default() * 100.0,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("无法读取仓位历史")
+}
+
 fn normalized_pairs(symbols: &[String]) -> Result<Vec<String>> {
     if symbols.is_empty() {
         bail!("请至少选择一个交易对");
@@ -479,11 +542,25 @@ fn write_if_missing(path: &Path, value: &str) -> Result<()> {
 
 fn migrate_ai_config(path: &Path) -> Result<()> {
     let source = fs::read_to_string(path).context("无法读取 AI 自动交易配置")?;
+    let source_value: Value = serde_json::from_str(&source).context("AI 自动交易配置 JSON 无效")?;
     let mut config: AiTradingConfig =
         serde_json::from_str(&source).context("AI 自动交易配置 JSON 无效")?;
+    let mut should_write = [
+        "minimum_long_score",
+        "minimum_short_score",
+        "minimum_factor_score",
+        "minimum_trend_quality",
+        "minimum_adx",
+        "minimum_volume_ratio",
+    ]
+    .iter()
+    .any(|key| source_value.get(*key).is_none());
     if config.symbol_whitelist == ["BTCUSDT".to_string(), "ETHUSDT".to_string()] {
         config.symbol_whitelist = default_ai_symbol_whitelist();
-        write_json_atomic(path, &config).context("无法迁移 AI 默认白名单")?;
+        should_write = true;
+    }
+    if should_write {
+        write_json_atomic(path, &config).context("无法迁移 AI 默认配置")?;
     }
     Ok(())
 }
@@ -569,10 +646,12 @@ fn ensure_order_book_pricing(config: &mut Value) -> Result<()> {
 
 fn migrate_compose(path: &Path) -> Result<()> {
     let source = fs::read_to_string(path).context("无法读取 Docker Compose 配置")?;
-    let updated = source.replace(
-        "sqlite:////freqtrade/user_data/tradesv3.sqlite",
-        "${FREQTRADE_DB_URL:-sqlite:////freqtrade/user_data/tradesv3.dryrun.sqlite}",
-    );
+    let updated = source
+        .replace(
+            "sqlite:////freqtrade/user_data/tradesv3.sqlite",
+            "${FREQTRADE_DB_URL:-sqlite:////freqtrade/user_data/tradesv3.dryrun.sqlite}",
+        )
+        .replace("\n      --strategy FuturesFactorStrategy", "");
     if updated != source {
         fs::write(path, updated).context("无法迁移 Docker Compose 配置")?;
     }
@@ -642,6 +721,28 @@ mod tests {
                 >= 32
         );
         assert_eq!(config["initial_state"], "running");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn migrates_compose_strategy_override() {
+        let path = std::env::temp_dir().join(format!("gqt-compose-{}.yml", rand::random::<u64>()));
+        fs::write(
+            &path,
+            r#"services:
+  freqtrade:
+    command: >
+      trade
+      --db-url sqlite:////freqtrade/user_data/tradesv3.sqlite
+      --config /freqtrade/user_data/config.json
+      --strategy FuturesFactorStrategy
+"#,
+        )
+        .unwrap();
+        migrate_compose(&path).unwrap();
+        let migrated = fs::read_to_string(&path).unwrap();
+        assert!(!migrated.contains("--strategy FuturesFactorStrategy"));
+        assert!(migrated.contains("FREQTRADE_DB_URL"));
         let _ = fs::remove_file(path);
     }
 
@@ -752,11 +853,12 @@ mod tests {
                 "CREATE TABLE trades (
                     pair TEXT, is_open INTEGER, is_short INTEGER, amount REAL,
                     stake_amount REAL, open_rate REAL, leverage REAL, open_date TEXT,
-                    enter_tag TEXT, close_profit_abs REAL, realized_profit REAL
+                    enter_tag TEXT, close_profit_abs REAL, realized_profit REAL,
+                    close_rate REAL, close_profit REAL, close_date TEXT, exit_reason TEXT
                  );
                  INSERT INTO trades VALUES
-                    ('BTC/USDT:USDT', 0, 0, 0.01, 100, 60000, 2, '2026-01-01', 'factor_long', 25, 25),
-                    ('ETH/USDT:USDT', 1, 1, 0.1, 50, 3000, 2, '2026-02-01', 'factor_short', NULL, 0);",
+                    ('BTC/USDT:USDT', 0, 0, 0.01, 100, 60000, 2, '2026-01-01', 'factor_long', 25, 25, 62500, 0.25, '2026-01-02', 'roi'),
+                    ('ETH/USDT:USDT', 1, 1, 0.1, 50, 3000, 2, '2026-02-01', 'factor_short', NULL, 0, NULL, NULL, NULL, NULL);",
             )
             .unwrap();
         drop(connection);
@@ -765,6 +867,9 @@ mod tests {
         assert_eq!(account.available_balance, 975.0);
         assert_eq!(account.closed_trades, 1);
         assert_eq!(account.open_trades[0].side, "空");
+        assert_eq!(account.trade_history.len(), 2);
+        assert_eq!(account.trade_history[0].status, "持仓中");
+        assert_eq!(account.trade_history[1].exit_reason, "roi");
         let _ = fs::remove_dir_all(root);
     }
 }

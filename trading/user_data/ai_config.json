@@ -13,7 +13,7 @@
     "AVAXUSDT",
     "LTCUSDT"
   ],
-  "timeframe": "1h",
+  "timeframe": "4h",
   "margin_mode": "cross",
   "leverage": 2,
   "max_stake_amount": 50.0,
@@ -21,6 +21,12 @@
   "risk_reward_ratio": 2.0,
   "allow_ai_risk_sizing": false,
   "minimum_confidence": 0.75,
+  "minimum_long_score": 0.68,
+  "minimum_short_score": 0.68,
+  "minimum_factor_score": 0.25,
+  "minimum_trend_quality": 0.52,
+  "minimum_adx": 18.0,
+  "minimum_volume_ratio": 0.0,
   "model_timeout_seconds": 30,
   "market_max_age_seconds": 90,
   "one_signal_per_candle": true

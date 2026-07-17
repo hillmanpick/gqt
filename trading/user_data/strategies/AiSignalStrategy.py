@@ -2,19 +2,21 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pandas import DataFrame
+import numpy as np
+import talib.abstract as ta
+from pandas import DataFrame, Series
 
 from freqtrade.strategy import IStrategy
 
 
 class AiSignalStrategy(IStrategy):
-    """Executes pre-validated AI signals written by the native GQT client."""
+    """Executes AI signals only when the local multi-factor gate agrees."""
 
     INTERFACE_VERSION = 3
     can_short = True
-    timeframe = "1h"
+    timeframe = "4h"
     process_only_new_candles = True
-    startup_candle_count = 2
+    startup_candle_count = 180
     position_adjustment_enable = False
 
     minimal_roi = {"0": 100.0}
@@ -42,6 +44,32 @@ class AiSignalStrategy(IStrategy):
         except (TypeError, ValueError):
             return fallback
 
+    @staticmethod
+    def bounded(series: Series, low: float, high: float) -> Series:
+        if high <= low:
+            return series * 0.0
+        return ((series - low) / (high - low)).clip(lower=0.0, upper=1.0).fillna(0.0)
+
+    @staticmethod
+    def center_score(series: Series, center: float, half_width: float) -> Series:
+        if half_width <= 0:
+            return series * 0.0
+        return (1.0 - (series - center).abs() / half_width).clip(lower=0.0, upper=1.0).fillna(0.0)
+
+    @staticmethod
+    def rolling_zscore(series: Series, window: int) -> Series:
+        mean = series.rolling(window, min_periods=max(20, window // 3)).mean()
+        std = series.rolling(window, min_periods=max(20, window // 3)).std().replace(0, np.nan)
+        return ((series - mean) / std).clip(lower=-4.0, upper=4.0).fillna(0.0)
+
+    @staticmethod
+    def weighted_score(parts: list[tuple[Series, float]]) -> Series:
+        total_weight = sum(weight for _, weight in parts)
+        if total_weight <= 0:
+            return parts[0][0] * 0.0
+        score = sum(part.clip(lower=0.0, upper=1.0).fillna(0.0) * weight for part, weight in parts)
+        return (score / total_weight).clip(lower=0.0, upper=1.0).fillna(0.0)
+
     def _signal(self, pair: str) -> dict | None:
         signal = self._read_json("ai_signals.json").get(pair)
         return signal if isinstance(signal, dict) else None
@@ -68,7 +96,162 @@ class AiSignalStrategy(IStrategy):
         return signal
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        return dataframe
+        close = dataframe["close"]
+
+        dataframe["mom_6"] = close.pct_change(6)
+        dataframe["mom_42"] = close.pct_change(42)
+        dataframe["ema_fast"] = ta.EMA(dataframe, timeperiod=20)
+        dataframe["ema_mid"] = ta.EMA(dataframe, timeperiod=50)
+        dataframe["ema_slow"] = ta.EMA(dataframe, timeperiod=100)
+        dataframe["trend"] = dataframe["ema_fast"] / dataframe["ema_mid"] - 1.0
+        dataframe["adx"] = ta.ADX(dataframe, timeperiod=14)
+        dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)
+        macd = ta.MACD(dataframe, fastperiod=12, slowperiod=26, signalperiod=9)
+        dataframe["macd_hist"] = macd["macdhist"]
+        dataframe["atr_pct"] = ta.ATR(dataframe, timeperiod=14) / close
+        dataframe["volume_ratio"] = dataframe["volume"] / dataframe["volume"].rolling(42).mean() - 1.0
+
+        dataframe["donchian_high"] = dataframe["high"].rolling(55, min_periods=55).max().shift(1)
+        dataframe["donchian_low"] = dataframe["low"].rolling(55, min_periods=55).min().shift(1)
+        donchian_range = (dataframe["donchian_high"] - dataframe["donchian_low"]).replace(0, np.nan)
+        dataframe["breakout_position"] = (
+            (close - (dataframe["donchian_high"] + dataframe["donchian_low"]) * 0.5)
+            / donchian_range
+            * 2.0
+        ).clip(lower=-1.5, upper=1.5)
+        candle_range = (dataframe["high"] - dataframe["low"]).replace(0, np.nan)
+        dataframe["close_location"] = ((close - dataframe["low"]) / candle_range * 2.0 - 1.0).clip(
+            lower=-1.0,
+            upper=1.0,
+        )
+
+        trend_scale = dataframe["atr_pct"].clip(lower=0.003) * 4.0
+        trend_long = self.weighted_score(
+            [
+                ((close > dataframe["ema_fast"]).astype(float), 0.18),
+                ((dataframe["ema_fast"] > dataframe["ema_mid"]).astype(float), 0.24),
+                ((dataframe["ema_mid"] > dataframe["ema_slow"]).astype(float), 0.18),
+                (self.bounded(dataframe["adx"], 16.0, 35.0), 0.25),
+                ((dataframe["trend"] / trend_scale).clip(lower=0.0, upper=1.0), 0.15),
+            ]
+        )
+        trend_short = self.weighted_score(
+            [
+                ((close < dataframe["ema_fast"]).astype(float), 0.18),
+                ((dataframe["ema_fast"] < dataframe["ema_mid"]).astype(float), 0.24),
+                ((dataframe["ema_mid"] < dataframe["ema_slow"]).astype(float), 0.18),
+                (self.bounded(dataframe["adx"], 16.0, 35.0), 0.25),
+                ((-dataframe["trend"] / trend_scale).clip(lower=0.0, upper=1.0), 0.15),
+            ]
+        )
+
+        macd_zscore = self.rolling_zscore(dataframe["macd_hist"], 126)
+        momentum_long = self.weighted_score(
+            [
+                (self.bounded(dataframe["mom_6"], 0.0, 0.018), 0.30),
+                (self.bounded(dataframe["mom_42"], 0.0, 0.060), 0.30),
+                (self.bounded(macd_zscore, 0.0, 2.0), 0.25),
+                ((dataframe["macd_hist"] > 0).astype(float), 0.15),
+            ]
+        )
+        momentum_short = self.weighted_score(
+            [
+                (self.bounded(-dataframe["mom_6"], 0.0, 0.018), 0.30),
+                (self.bounded(-dataframe["mom_42"], 0.0, 0.060), 0.30),
+                (self.bounded(-macd_zscore, 0.0, 2.0), 0.25),
+                ((dataframe["macd_hist"] < 0).astype(float), 0.15),
+            ]
+        )
+
+        dataframe["rsi_long"] = self.center_score(dataframe["rsi"], 60.0, 18.0) * self.bounded(
+            dataframe["rsi"],
+            46.0,
+            53.0,
+        )
+        dataframe["rsi_short"] = self.center_score(dataframe["rsi"], 40.0, 18.0) * self.bounded(
+            54.0 - dataframe["rsi"],
+            0.0,
+            8.0,
+        )
+        dataframe["volume_confirmation"] = self.bounded(dataframe["volume_ratio"], -0.10, 0.85)
+
+        dataframe["volatility_quality"] = 0.0
+        low_vol = (dataframe["atr_pct"] >= 0.0004) & (dataframe["atr_pct"] < 0.0010)
+        good_vol = (dataframe["atr_pct"] >= 0.0010) & (dataframe["atr_pct"] <= 0.0350)
+        high_vol = (dataframe["atr_pct"] > 0.0350) & (dataframe["atr_pct"] <= 0.0900)
+        dataframe.loc[low_vol, "volatility_quality"] = self.bounded(
+            dataframe.loc[low_vol, "atr_pct"],
+            0.0004,
+            0.0010,
+        )
+        dataframe.loc[good_vol, "volatility_quality"] = 1.0
+        dataframe.loc[high_vol, "volatility_quality"] = (
+            1.0 - self.bounded(dataframe.loc[high_vol, "atr_pct"], 0.0350, 0.0900) * 0.85
+        )
+
+        dataframe["long_score"] = self.weighted_score(
+            [
+                (trend_long, 0.25),
+                (momentum_long, 0.20),
+                (dataframe["rsi_long"], 0.14),
+                (self.bounded(dataframe["breakout_position"], 0.20, 0.85), 0.16),
+                (dataframe["volume_confirmation"], 0.12),
+                (dataframe["volatility_quality"], 0.08),
+                (self.bounded(dataframe["close_location"], 0.10, 0.85), 0.05),
+            ]
+        )
+        dataframe["short_score"] = self.weighted_score(
+            [
+                (trend_short, 0.25),
+                (momentum_short, 0.20),
+                (dataframe["rsi_short"], 0.14),
+                (self.bounded(-dataframe["breakout_position"], 0.20, 0.85), 0.16),
+                (dataframe["volume_confirmation"], 0.12),
+                (dataframe["volatility_quality"], 0.08),
+                (self.bounded(-dataframe["close_location"], 0.10, 0.85), 0.05),
+            ]
+        )
+        dataframe["factor_score"] = dataframe["long_score"] - dataframe["short_score"]
+        dataframe["trend_quality"] = np.maximum(trend_long, trend_short)
+
+        return dataframe.replace([np.inf, -np.inf], np.nan)
+
+    @staticmethod
+    def _threshold(config: dict, name: str, fallback: float) -> float:
+        try:
+            value = float(config.get(name, fallback))
+            return value if np.isfinite(value) else fallback
+        except (TypeError, ValueError):
+            return fallback
+
+    def _factor_allows(self, dataframe: DataFrame, side: str) -> bool:
+        if dataframe.empty:
+            return False
+        config = self._config()
+        minimum_factor_score = self._threshold(config, "minimum_factor_score", 0.25)
+        minimum_trend_quality = self._threshold(config, "minimum_trend_quality", 0.52)
+        minimum_adx = self._threshold(config, "minimum_adx", 18.0)
+        minimum_volume_ratio = self._threshold(config, "minimum_volume_ratio", 0.0)
+        row = dataframe.iloc[-1]
+        if side == "long":
+            minimum_long_score = self._threshold(config, "minimum_long_score", 0.68)
+            return bool(
+                row.get("long_score", 0) >= minimum_long_score
+                and row.get("factor_score", 0) >= minimum_factor_score
+                and row.get("trend_quality", 0) >= minimum_trend_quality
+                and row.get("adx", 0) >= minimum_adx
+                and 46.0 <= row.get("rsi", 0) <= 76.0
+                and row.get("volume_ratio", -1) >= minimum_volume_ratio
+            )
+        minimum_short_score = self._threshold(config, "minimum_short_score", 0.68)
+        return bool(
+            row.get("short_score", 0) >= minimum_short_score
+            and row.get("factor_score", 0) <= -minimum_factor_score
+            and row.get("trend_quality", 0) >= minimum_trend_quality
+            and row.get("adx", 0) >= minimum_adx
+            and 24.0 <= row.get("rsi", 100) <= 54.0
+            and row.get("volume_ratio", -1) >= minimum_volume_ratio
+        )
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         dataframe["enter_long"] = 0
@@ -77,9 +260,9 @@ class AiSignalStrategy(IStrategy):
         if signal is None or dataframe.empty:
             return dataframe
         tag = f'ai:{signal["decision_id"]}'
-        if signal["action"] == "long":
+        if signal["action"] == "long" and self._factor_allows(dataframe, "long"):
             dataframe.loc[dataframe.index[-1], ["enter_long", "enter_tag"]] = (1, tag)
-        elif signal["action"] == "short":
+        elif signal["action"] == "short" and self._factor_allows(dataframe, "short"):
             dataframe.loc[dataframe.index[-1], ["enter_short", "enter_tag"]] = (1, tag)
         return dataframe
 
@@ -90,6 +273,24 @@ class AiSignalStrategy(IStrategy):
         if signal is not None and signal["action"] == "close" and not dataframe.empty:
             dataframe.loc[dataframe.index[-1], ["exit_long", "exit_tag"]] = (1, "ai_close")
             dataframe.loc[dataframe.index[-1], ["exit_short", "exit_tag"]] = (1, "ai_close")
+
+        if not dataframe.empty:
+            last_index = dataframe.index[-1]
+            row = dataframe.iloc[-1]
+            if (
+                row.get("factor_score", 0) < -0.10
+                or row.get("short_score", 0) > 0.60
+                or row.get("close", 0) < row.get("ema_mid", 0)
+                or row.get("rsi", 0) > 82
+            ):
+                dataframe.loc[last_index, ["exit_long", "exit_tag"]] = (1, "factor_flip_long_exit")
+            if (
+                row.get("factor_score", 0) > 0.10
+                or row.get("long_score", 0) > 0.60
+                or row.get("close", 0) > row.get("ema_mid", 0)
+                or row.get("rsi", 100) < 18
+            ):
+                dataframe.loc[last_index, ["exit_short", "exit_tag"]] = (1, "factor_flip_short_exit")
         return dataframe
 
     def confirm_trade_entry(
