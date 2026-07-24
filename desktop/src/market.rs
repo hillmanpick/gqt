@@ -47,7 +47,13 @@ pub fn start_worker(commands: Receiver<MarketCommand>, events: Sender<MarketEven
                 }
             }
 
-            if refresh_candles || ticks.is_multiple_of(8) {
+            if interval == Interval::OneSecond {
+                if refresh_candles {
+                    let _ = events.send(MarketEvent::Candles(Vec::new()));
+                    let _ = events.send(MarketEvent::Connection(true));
+                    refresh_candles = false;
+                }
+            } else if refresh_candles || ticks.is_multiple_of(8) {
                 match fetch_candles(&client, &symbol, interval, 300) {
                     Ok(candles) => {
                         let _ = events.send(MarketEvent::Candles(candles));
@@ -72,7 +78,12 @@ pub fn start_worker(commands: Receiver<MarketCommand>, events: Sender<MarketEven
             }
             ticks = ticks.wrapping_add(1);
 
-            match commands.recv_timeout(Duration::from_secs(2)) {
+            let poll_delay = if interval == Interval::OneSecond {
+                Duration::from_secs(1)
+            } else {
+                Duration::from_secs(2)
+            };
+            match commands.recv_timeout(poll_delay) {
                 Ok(MarketCommand::Select {
                     symbol: next,
                     interval: next_interval,
@@ -97,6 +108,9 @@ pub fn fetch_candles(
     limit: usize,
 ) -> Result<Vec<Candle>> {
     validate_symbol(symbol)?;
+    if interval == Interval::OneSecond {
+        return Ok(Vec::new());
+    }
     let rows: Vec<Vec<Value>> = read_binance_json(
         client
             .get(format!("{BINANCE_BASE}/fapi/v1/klines"))

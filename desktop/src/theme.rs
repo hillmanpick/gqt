@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{env, path::PathBuf, sync::Arc};
 
 use eframe::egui::{
     self, Color32, FontData, FontDefinitions, FontFamily, FontId, RichText, Stroke, Theme,
@@ -122,12 +122,12 @@ fn install_fonts(ctx: &egui::Context) {
             .families
             .entry(FontFamily::Proportional)
             .or_default()
-            .push(name.clone());
+            .insert(0, name.clone());
         definitions
             .families
             .entry(FontFamily::Monospace)
             .or_default()
-            .push(name);
+            .insert(0, name);
     }
     let fallback_fonts: Vec<String> = definitions.font_data.keys().cloned().collect();
     for font in fonts() {
@@ -150,9 +150,26 @@ fn install_fonts(ctx: &egui::Context) {
 }
 
 fn chinese_font_path() -> Option<PathBuf> {
-    let windows = std::env::var_os("WINDIR")?;
-    ["msyh.ttc", "msyh.ttf", "simhei.ttf"]
-        .iter()
-        .map(|name| PathBuf::from(&windows).join("Fonts").join(name))
-        .find(|path| path.exists())
+    let font_dirs = [
+        env::var_os("WINDIR").map(|value| PathBuf::from(value).join("Fonts")),
+        env::var_os("SystemRoot").map(|value| PathBuf::from(value).join("Fonts")),
+        Some(PathBuf::from(r"C:\Windows\Fonts")),
+    ];
+    [
+        "NotoSansSC-VF.ttf",
+        "Noto Sans SC (TrueType).otf",
+        "Deng.ttf",
+        "simhei.ttf",
+        "simsunb.ttf",
+        "simkai.ttf",
+        "msyh.ttc",
+        "simsun.ttc",
+    ]
+    .iter()
+    .flat_map(|name| {
+        font_dirs
+            .iter()
+            .filter_map(move |dir| dir.as_ref().map(|dir| dir.join(name)))
+    })
+    .find(|path| path.exists())
 }

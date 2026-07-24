@@ -35,19 +35,19 @@ pub fn calculate_factor_snapshot(candles: &[Candle]) -> FactorSnapshot {
         .iter()
         .map(|candle| candle.volume)
         .collect::<Vec<_>>();
-    let ema_fast_series = ema_series(&closes, 20);
-    let ema_slow_series = ema_series(&closes, 50);
-    let ema_major_series = ema_series(&closes, 100);
-    let momentum_short = pct_change_series(&closes, 6);
-    let momentum_medium = pct_change_series(&closes, 42);
-    let realized_volatility = realized_volatility_series(&closes, 20);
+    let ema_fast_series = ema_series(&closes, 8);
+    let ema_slow_series = ema_series(&closes, 21);
+    let ema_major_series = ema_series(&closes, 55);
+    let momentum_short = pct_change_series(&closes, 3);
+    let momentum_medium = pct_change_series(&closes, 12);
+    let realized_volatility = realized_volatility_series(&closes, 32);
     let atr_percent = atr_percent_series(candles, 14);
     let adx = adx_series(candles, 14);
     let rsi = rsi_series(&closes, 14);
     let macd_histogram = macd_histogram_series(&closes, 12, 26, 9);
-    let breakout_position = donchian_position_series(candles, 55);
+    let breakout_position = donchian_position_series(candles, 96);
     let close_location = close_location_series(candles);
-    let volume_ratio = volume_ratio_series(&volumes, 42);
+    let volume_ratio = volume_ratio_series(&volumes, 48);
     let trend = ema_fast_series
         .iter()
         .zip(ema_slow_series.iter())
@@ -75,23 +75,23 @@ pub fn calculate_factor_snapshot(candles: &[Candle]) -> FactorSnapshot {
     let latest_close_location = last_finite(&close_location).unwrap_or_default();
 
     let trend_long = weighted_score(&[
-        (flag(latest_close > latest_ema_fast), 0.18),
-        (flag(latest_ema_fast > latest_ema_mid), 0.24),
+        (flag(latest_close > latest_ema_fast), 0.14),
+        (flag(latest_ema_fast > latest_ema_mid), 0.22),
         (flag(latest_ema_mid > latest_ema_slow), 0.18),
-        (bounded(latest_adx, 16.0, 35.0), 0.25),
+        (bounded(latest_adx, 10.0, 32.0), 0.28),
         (
-            bounded(latest_trend, 0.0, latest_atr.max(0.003) * 4.0),
-            0.15,
+            bounded(latest_trend, 0.0, latest_atr.max(0.002) * 3.5),
+            0.18,
         ),
     ]);
     let trend_short = weighted_score(&[
-        (flag(latest_close < latest_ema_fast), 0.18),
-        (flag(latest_ema_fast < latest_ema_mid), 0.24),
+        (flag(latest_close < latest_ema_fast), 0.14),
+        (flag(latest_ema_fast < latest_ema_mid), 0.22),
         (flag(latest_ema_mid < latest_ema_slow), 0.18),
-        (bounded(latest_adx, 16.0, 35.0), 0.25),
+        (bounded(latest_adx, 10.0, 32.0), 0.28),
         (
-            bounded(-latest_trend, 0.0, latest_atr.max(0.003) * 4.0),
-            0.15,
+            bounded(-latest_trend, 0.0, latest_atr.max(0.002) * 3.5),
+            0.18,
         ),
     ]);
     let momentum_long = weighted_score(&[
@@ -103,7 +103,7 @@ pub fn calculate_factor_snapshot(candles: &[Candle]) -> FactorSnapshot {
             bounded(
                 last_finite(&momentum_medium).unwrap_or_default(),
                 0.0,
-                0.060,
+                0.035,
             ),
             0.30,
         ),
@@ -123,18 +123,18 @@ pub fn calculate_factor_snapshot(candles: &[Candle]) -> FactorSnapshot {
             bounded(
                 -last_finite(&momentum_medium).unwrap_or_default(),
                 0.0,
-                0.060,
+                0.035,
             ),
             0.30,
         ),
         (bounded(-macd_zscore, 0.0, 2.0), 0.25),
         (flag(latest_macd < 0.0), 0.15),
     ]);
-    let rsi_long = center_score(latest_rsi, 60.0, 18.0) * bounded(latest_rsi, 46.0, 53.0);
-    let rsi_short = center_score(latest_rsi, 40.0, 18.0) * bounded(54.0 - latest_rsi, 0.0, 8.0);
-    let breakout_long = bounded(latest_breakout, 0.20, 0.85);
-    let breakout_short = bounded(-latest_breakout, 0.20, 0.85);
-    let volume_confirmation = bounded(latest_volume_ratio, -0.10, 0.85);
+    let rsi_long = center_score(latest_rsi, 58.0, 22.0) * bounded(latest_rsi, 34.0, 52.0);
+    let rsi_short = center_score(latest_rsi, 42.0, 22.0) * bounded(66.0 - latest_rsi, 0.0, 18.0);
+    let breakout_long = bounded(latest_breakout, 0.12, 0.85);
+    let breakout_short = bounded(-latest_breakout, 0.12, 0.85);
+    let volume_confirmation = bounded(latest_volume_ratio, -0.35, 1.25);
     let volatility_quality = volatility_environment_score(latest_atr);
     let candle_long = bounded(latest_close_location, 0.10, 0.85);
     let candle_short = bounded(-latest_close_location, 0.10, 0.85);
@@ -179,7 +179,7 @@ pub fn calculate_factor_snapshot(candles: &[Candle]) -> FactorSnapshot {
         long_score,
         short_score,
         trend_quality,
-        momentum_short: round4(last_finite(&pct_change_series(&closes, 6)).unwrap_or_default()),
+        momentum_short: round4(last_finite(&pct_change_series(&closes, 3)).unwrap_or_default()),
         momentum_medium: round4(last_finite(&momentum_medium).unwrap_or_default()),
         trend: round4(latest_trend),
         adx: round4(latest_adx),

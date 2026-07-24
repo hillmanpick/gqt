@@ -14,9 +14,9 @@ class AiSignalStrategy(IStrategy):
 
     INTERFACE_VERSION = 3
     can_short = True
-    timeframe = "4h"
+    timeframe = "15m"
     process_only_new_candles = True
-    startup_candle_count = 180
+    startup_candle_count = 240
     position_adjustment_enable = False
 
     minimal_roi = {"0": 100.0}
@@ -228,13 +228,13 @@ class AiSignalStrategy(IStrategy):
         if dataframe.empty:
             return False
         config = self._config()
-        minimum_factor_score = self._threshold(config, "minimum_factor_score", 0.25)
-        minimum_trend_quality = self._threshold(config, "minimum_trend_quality", 0.52)
-        minimum_adx = self._threshold(config, "minimum_adx", 18.0)
-        minimum_volume_ratio = self._threshold(config, "minimum_volume_ratio", 0.0)
+        minimum_factor_score = self._threshold(config, "minimum_factor_score", 0.12)
+        minimum_trend_quality = self._threshold(config, "minimum_trend_quality", 0.42)
+        minimum_adx = self._threshold(config, "minimum_adx", 10.0)
+        minimum_volume_ratio = self._threshold(config, "minimum_volume_ratio", -0.35)
         row = dataframe.iloc[-1]
         if side == "long":
-            minimum_long_score = self._threshold(config, "minimum_long_score", 0.68)
+            minimum_long_score = self._threshold(config, "minimum_long_score", 0.62)
             return bool(
                 row.get("long_score", 0) >= minimum_long_score
                 and row.get("factor_score", 0) >= minimum_factor_score
@@ -243,7 +243,7 @@ class AiSignalStrategy(IStrategy):
                 and 46.0 <= row.get("rsi", 0) <= 76.0
                 and row.get("volume_ratio", -1) >= minimum_volume_ratio
             )
-        minimum_short_score = self._threshold(config, "minimum_short_score", 0.68)
+        minimum_short_score = self._threshold(config, "minimum_short_score", 0.62)
         return bool(
             row.get("short_score", 0) >= minimum_short_score
             and row.get("factor_score", 0) <= -minimum_factor_score
@@ -326,7 +326,7 @@ class AiSignalStrategy(IStrategy):
             signal.get("stop_loss_percent") if signal else None,
             1.5,
         ) / 100.0
-        reward = stop_loss * self._float(self._config().get("risk_reward_ratio"), 2.0)
+        reward = stop_loss * self._float(self._config().get("risk_reward_ratio"), 1.4)
         if current_profit >= reward:
             return "ai_risk_reward_take_profit"
         if current_profit <= -stop_loss:

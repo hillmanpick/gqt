@@ -1,10 +1,12 @@
 use std::{
     collections::BTreeMap,
+    path::PathBuf,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
 
+use chrono::{Datelike, Local, TimeZone};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use directories::ProjectDirs;
 use eframe::egui::{
@@ -20,7 +22,7 @@ use crate::{
     model::{
         AiProvider, AiTradingConfig, AiTradingInput, Candle, CredentialDraft, FuturesAccount,
         FuturesPosition, Interval, MarginMode, MarketCommand, MarketEvent, MarketSnapshot, Page,
-        SecretStatus, SimulationAccount,
+        SecretStatus, SimulationAccount, StrategyProfile,
     },
     store::SecretStore,
     theme,
@@ -30,6 +32,58 @@ use crate::{
 const AI_TIMEFRAMES: [&str; 6] = ["1m", "5m", "15m", "1h", "4h", "1d"];
 const BUILD_LABEL: &str = "0.4.0-factor-tuning";
 const RELAY_DEFAULT_MODEL: &str = "gpt-5.6-luna";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EquityRange {
+    Today,
+    Month,
+    NinetyDays,
+    Year,
+}
+
+impl EquityRange {
+    const ALL: [EquityRange; 4] = [
+        EquityRange::Today,
+        EquityRange::Month,
+        EquityRange::NinetyDays,
+        EquityRange::Year,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            EquityRange::Today => "当天",
+            EquityRange::Month => "当月",
+            EquityRange::NinetyDays => "90天",
+            EquityRange::Year => "一年",
+        }
+    }
+
+    fn cutoff(self) -> i64 {
+        let now = Local::now();
+        match self {
+            EquityRange::Today => Local
+                .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
+                .single()
+                .map(|time| time.timestamp())
+                .unwrap_or_else(|| now.timestamp() - 24 * 60 * 60),
+            EquityRange::Month => Local
+                .with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
+                .single()
+                .map(|time| time.timestamp())
+                .unwrap_or_else(|| now.timestamp() - 31 * 24 * 60 * 60),
+            EquityRange::NinetyDays => now.timestamp() - 90 * 24 * 60 * 60,
+            EquityRange::Year => now.timestamp() - 365 * 24 * 60 * 60,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct EquityPoint {
+    time: i64,
+    equity: f64,
+    available: f64,
+    unrealized_profit: f64,
+}
 
 pub struct GqtApp {
     store: SecretStore,
@@ -42,6 +96,9 @@ pub struct GqtApp {
     account_error: String,
     account_check_running: bool,
     last_account_check: Instant,
+    equity_history_path: PathBuf,
+    equity_history: Vec<EquityPoint>,
+    equity_range: EquityRange,
     simulation_account: SimulationAccount,
     simulation_error: String,
     simulation_check_running: bool,
@@ -136,6 +193,8 @@ impl GqtApp {
             .expect("Windows application data directory");
         let data_root = project_dirs.data_local_dir().to_path_buf();
         std::fs::create_dir_all(&data_root).expect("create GQT data directory");
+        let equity_history_path = data_root.join("equity-history.json");
+        let equity_history = load_equity_history(&equity_history_path);
         let store = SecretStore::open(&data_root.join("key.db")).expect("open GQT key.db");
         let unlocked_key = if store.is_setup().unwrap_or(false) {
             store.unlock().ok()
@@ -147,7 +206,7 @@ impl GqtApp {
             TradingWorkspace::ensure(&data_root.join("trading")).expect("create trading workspace");
         let strategy_source = workspace.strategy_source().unwrap_or_default();
         let (stake_amount, max_open_trades, risk_reward_ratio, allow_ai_risk_sizing) =
-            workspace.risk().unwrap_or((50.0, 3, 2.0, false));
+            workspace.risk().unwrap_or((120.0, 5, 1.4, false));
         let ai_config = workspace.ai_trading_config().unwrap_or_default();
         let initial_symbol = ai_config
             .symbol_whitelist
@@ -165,7 +224,7 @@ impl GqtApp {
         market::start_worker(command_receiver, event_sender);
         let _ = market_commands.send(MarketCommand::Select {
             symbol: initial_symbol.clone(),
-            interval: Interval::FourHours,
+            interval: Interval::FifteenMinutes,
         });
         let (task_sender, task_receiver) = mpsc::channel();
         let (docker_available, bot_state) = workspace.docker_state();
@@ -197,6 +256,9 @@ impl GqtApp {
             account_error: String::new(),
             account_check_running: false,
             last_account_check: Instant::now() - Duration::from_secs(30),
+            equity_history_path,
+            equity_history,
+            equity_range: EquityRange::Today,
             simulation_account: SimulationAccount::default(),
             simulation_error: String::new(),
             simulation_check_running: false,
@@ -204,7 +266,7 @@ impl GqtApp {
             show_simulation_account: false,
             page: Page::Overview,
             symbol: initial_symbol,
-            interval: Interval::FourHours,
+            interval: Interval::FifteenMinutes,
             candles: Vec::new(),
             snapshot: MarketSnapshot::default(),
             market_connected: false,
@@ -260,7 +322,9 @@ impl GqtApp {
             match event {
                 MarketEvent::Candles(candles) => self.candles = candles,
                 MarketEvent::Snapshot(snapshot) => {
-                    if let Some(last) = self.candles.last_mut() {
+                    if self.interval == Interval::OneSecond {
+                        self.push_second_candle(snapshot.updated_at, snapshot.price);
+                    } else if let Some(last) = self.candles.last_mut() {
                         last.close = snapshot.price;
                         last.high = last.high.max(snapshot.price);
                         last.low = last.low.min(snapshot.price);
@@ -360,6 +424,7 @@ impl GqtApp {
                     self.account_check_running = false;
                     match result {
                         Ok(account) => {
+                            self.record_equity_snapshot(&account);
                             self.account = account;
                             self.account_error.clear();
                         }
@@ -566,78 +631,53 @@ impl GqtApp {
                     });
                 });
                 ui.add_space(26.0);
-                for page in Page::ALL {
-                    let active = self.page == page;
-                    let fill = if active {
-                        theme::SURFACE_2
-                    } else {
-                        Color32::TRANSPARENT
-                    };
-                    let stroke = if active {
-                        Stroke::new(1.0, theme::YELLOW)
-                    } else {
-                        Stroke::NONE
-                    };
-                    let response = Frame::NONE
-                        .fill(fill)
-                        .stroke(stroke)
-                        .corner_radius(4)
-                        .inner_margin(Margin::symmetric(10, 9))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(theme::icon(
-                                    page.icon(),
-                                    17.0,
-                                    if active { theme::YELLOW } else { theme::MUTED },
-                                ));
-                                ui.label(RichText::new(page.label()).color(if active {
-                                    theme::TEXT
-                                } else {
-                                    theme::MUTED
-                                }));
-                            });
-                        })
-                        .response
-                        .interact(Sense::click());
-                    if response.clicked() {
-                        self.page = page;
-                        if page == Page::Execution {
-                            self.refresh_logs();
-                        }
-                    }
-                    ui.add_space(3.0);
-                }
-                ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        let color = if self.docker_available {
-                            theme::GREEN
+                let status_height = 66.0;
+                let navigation_height = (ui.available_height() - status_height).max(0.0);
+                ui.allocate_ui(Vec2::new(ui.available_width(), navigation_height), |ui| {
+                    for page in Page::ALL {
+                        let active = self.page == page;
+                        let fill = if active {
+                            theme::SURFACE_2
                         } else {
-                            theme::MUTED
+                            Color32::TRANSPARENT
                         };
-                        ui.colored_label(color, "●");
-                        ui.vertical(|ui| {
-                            ui.label(
-                                RichText::new(if self.docker_available {
-                                    "交易内核就绪"
-                                } else {
-                                    "Docker 离线"
-                                })
-                                .size(12.0),
-                            );
-                            ui.label(
-                                RichText::new(if self.dry_run { "DRY-RUN" } else { "LIVE" })
-                                    .size(10.0)
-                                    .color(if self.dry_run {
-                                        theme::MUTED
+                        let stroke = if active {
+                            Stroke::new(1.0, theme::YELLOW)
+                        } else {
+                            Stroke::NONE
+                        };
+                        let response = Frame::NONE
+                            .fill(fill)
+                            .stroke(stroke)
+                            .corner_radius(4)
+                            .inner_margin(Margin::symmetric(10, 9))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(theme::icon(
+                                        page.icon(),
+                                        17.0,
+                                        if active { theme::YELLOW } else { theme::MUTED },
+                                    ));
+                                    ui.label(RichText::new(page.label()).color(if active {
+                                        theme::TEXT
                                     } else {
-                                        theme::RED
-                                    }),
-                            );
-                            ui.label(RichText::new(BUILD_LABEL).size(9.0).color(theme::MUTED));
-                        });
-                    });
+                                        theme::MUTED
+                                    }));
+                                });
+                            })
+                            .response
+                            .interact(Sense::click());
+                        if response.clicked() {
+                            self.page = page;
+                            if page == Page::Execution {
+                                self.refresh_logs();
+                            }
+                        }
+                        ui.add_space(3.0);
+                    }
                 });
+                ui.separator();
+                self.render_sidebar_status(ui);
             });
 
         egui::Panel::top("header")
@@ -715,6 +755,7 @@ impl GqtApp {
             .show(root, |ui| match self.page {
                 Page::Overview => self.render_overview(ui),
                 Page::Account => self.render_account(ui),
+                Page::PositionHistory => self.render_position_history(ui),
                 Page::Market => self.render_market(ui),
                 Page::Strategy => self.render_strategy(ui),
                 Page::Backtest => self.render_backtest(ui),
@@ -722,6 +763,40 @@ impl GqtApp {
                 Page::Execution => self.render_execution(ui),
                 Page::Settings => self.render_settings(ui),
             });
+    }
+
+    fn render_sidebar_status(&self, ui: &mut Ui) {
+        let color = if self.docker_available {
+            theme::GREEN
+        } else {
+            theme::MUTED
+        };
+        let status = if self.docker_available {
+            "交易内核就绪"
+        } else {
+            "Docker 离线"
+        };
+        let mode = if self.dry_run { "DRY-RUN" } else { "LIVE" };
+        ui.allocate_ui(Vec2::new(ui.available_width(), 56.0), |ui| {
+            ui.horizontal(|ui| {
+                ui.add_space(2.0);
+                ui.colored_label(color, "●");
+                ui.vertical(|ui| {
+                    ui.set_max_width(132.0);
+                    ui.label(RichText::new(status).size(11.0));
+                    ui.label(RichText::new(mode).size(10.0).color(if self.dry_run {
+                        theme::MUTED
+                    } else {
+                        theme::RED
+                    }));
+                    ui.label(
+                        RichText::new(compact_build_label())
+                            .size(9.0)
+                            .color(theme::MUTED),
+                    );
+                });
+            });
+        });
     }
 
     fn render_overview(&mut self, ui: &mut Ui) {
@@ -796,8 +871,31 @@ impl GqtApp {
                 Vec2::new((ui.available_width() - 330.0).max(420.0), 400.0),
                 Layout::top_down(Align::Min),
                 |ui| {
-                    section_title(ui, "市场概览", "BTCUSDT / 实时状态");
-                    self.draw_mini_performance(ui);
+                    section_title(ui, "个人资金曲线", self.equity_range.label());
+                    ui.horizontal_wrapped(|ui| {
+                        for range in EquityRange::ALL {
+                            let selected = self.equity_range == range;
+                            let button = egui::Button::new(RichText::new(range.label()).color(
+                                if selected {
+                                    Color32::BLACK
+                                } else {
+                                    theme::MUTED
+                                },
+                            ))
+                            .fill(if selected {
+                                theme::YELLOW
+                            } else {
+                                theme::SURFACE_2
+                            })
+                            .stroke(Stroke::new(1.0, theme::BORDER))
+                            .corner_radius(3);
+                            if ui.add_sized([58.0, 30.0], button).clicked() {
+                                self.equity_range = range;
+                            }
+                        }
+                    });
+                    ui.add_space(8.0);
+                    self.draw_equity_performance(ui);
                     ui.add_space(18.0);
                     section_title(ui, "账户风险", "策略配置上限");
                     let ratio = (exposure / 1000.0).clamp(0.0, 1.0) as f32;
@@ -1000,12 +1098,85 @@ impl GqtApp {
                         });
                 });
             });
+    }
+
+    fn render_position_history(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new("仓位历史").size(16.0).strong());
+                ui.label(
+                    RichText::new(format!(
+                        "最近 {} 笔 · 模拟交易数据库",
+                        self.simulation_account.trade_history.len()
+                    ))
+                    .size(11.0)
+                    .color(theme::MUTED),
+                );
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        !self.simulation_check_running,
+                        theme::secondary_button(if self.simulation_check_running {
+                            "刷新中..."
+                        } else {
+                            "刷新历史"
+                        }),
+                    )
+                    .clicked()
+                {
+                    self.last_simulation_check = Instant::now() - Duration::from_secs(30);
+                    self.refresh_simulation_account();
+                }
+            });
+        });
+        ui.separator();
+        if !self.simulation_error.is_empty() {
+            ui.colored_label(theme::RED, &self.simulation_error);
+        }
+        ui.add_space(10.0);
+        ui.columns(4, |cols| {
+            metric(
+                &mut cols[0],
+                "累计已实现",
+                &format!("{:+.2} USDT", self.simulation_account.realized_profit),
+                "模拟交易数据库",
+                if self.simulation_account.realized_profit >= 0.0 {
+                    theme::GREEN
+                } else {
+                    theme::RED
+                },
+            );
+            metric(
+                &mut cols[1],
+                "已平仓",
+                &self.simulation_account.closed_trades.to_string(),
+                "历史成交",
+                theme::TEXT,
+            );
+            metric(
+                &mut cols[2],
+                "持仓中",
+                &self.simulation_account.open_trades.len().to_string(),
+                "当前模拟仓位",
+                theme::YELLOW,
+            );
+            let win_rate = if self.simulation_account.closed_trades > 0 {
+                self.simulation_account.winning_trades as f64
+                    / self.simulation_account.closed_trades as f64
+                    * 100.0
+            } else {
+                0.0
+            };
+            metric(
+                &mut cols[3],
+                "胜率",
+                &format!("{win_rate:.1}%"),
+                &format!("{} 笔盈利", self.simulation_account.winning_trades),
+                theme::TEXT,
+            );
+        });
         ui.add_space(18.0);
-        section_title(
-            ui,
-            "仓位历史",
-            &format!("最近 {} 笔", self.simulation_account.trade_history.len()),
-        );
         Frame::NONE
             .fill(theme::SURFACE)
             .stroke(Stroke::new(1.0, theme::BORDER))
@@ -1016,91 +1187,94 @@ impl GqtApp {
                     ui.label(RichText::new("暂无仓位历史").color(theme::MUTED));
                     return;
                 }
-                ScrollArea::both().max_height(300.0).show(ui, |ui| {
-                    egui::Grid::new("simulation-history-grid")
-                        .num_columns(14)
-                        .striped(true)
-                        .spacing([18.0, 12.0])
-                        .show(ui, |ui| {
-                            for heading in [
-                                "合约",
-                                "状态",
-                                "方向",
-                                "数量",
-                                "保证金",
-                                "开仓价",
-                                "平仓价",
-                                "杠杆",
-                                "已实现",
-                                "收益率",
-                                "开仓时间",
-                                "平仓时间",
-                                "信号",
-                                "退出",
-                            ] {
-                                ui.label(RichText::new(heading).color(theme::MUTED).strong());
-                            }
-                            ui.end_row();
-                            for trade in &self.simulation_account.trade_history {
-                                ui.label(RichText::new(&trade.pair).strong());
-                                ui.colored_label(
-                                    if trade.status == "持仓中" {
-                                        theme::YELLOW
-                                    } else {
-                                        theme::MUTED
-                                    },
-                                    &trade.status,
-                                );
-                                ui.colored_label(
-                                    if trade.side == "多" {
-                                        theme::GREEN
-                                    } else {
-                                        theme::RED
-                                    },
-                                    &trade.side,
-                                );
-                                ui.label(format!("{:.4}", trade.amount));
-                                ui.label(format!("{:.2}", trade.stake_amount));
-                                ui.label(format_price(trade.open_rate));
-                                ui.label(
-                                    trade
-                                        .close_rate
-                                        .map(format_price)
-                                        .unwrap_or_else(|| "--".into()),
-                                );
-                                ui.label(format!("{:.1}x", trade.leverage));
-                                ui.colored_label(
-                                    if trade.profit_abs >= 0.0 {
-                                        theme::GREEN
-                                    } else {
-                                        theme::RED
-                                    },
-                                    format!("{:+.2}", trade.profit_abs),
-                                );
-                                ui.colored_label(
-                                    if trade.profit_percent >= 0.0 {
-                                        theme::GREEN
-                                    } else {
-                                        theme::RED
-                                    },
-                                    format!("{:+.2}%", trade.profit_percent),
-                                );
-                                ui.label(&trade.open_date);
-                                ui.label(if trade.close_date.is_empty() {
-                                    "--"
-                                } else {
-                                    &trade.close_date
-                                });
-                                ui.label(&trade.tag);
-                                ui.label(if trade.exit_reason.is_empty() {
-                                    "--"
-                                } else {
-                                    &trade.exit_reason
-                                });
+                ScrollArea::both()
+                    .id_salt("position-history-scroll")
+                    .max_height((ui.available_height() - 12.0).max(360.0))
+                    .show(ui, |ui| {
+                        egui::Grid::new("position-history-grid")
+                            .num_columns(14)
+                            .striped(true)
+                            .spacing([18.0, 12.0])
+                            .show(ui, |ui| {
+                                for heading in [
+                                    "合约",
+                                    "状态",
+                                    "方向",
+                                    "数量",
+                                    "保证金",
+                                    "开仓价",
+                                    "平仓价",
+                                    "杠杆",
+                                    "已实现",
+                                    "收益率",
+                                    "开仓时间",
+                                    "平仓时间",
+                                    "信号",
+                                    "退出",
+                                ] {
+                                    ui.label(RichText::new(heading).color(theme::MUTED).strong());
+                                }
                                 ui.end_row();
-                            }
-                        });
-                });
+                                for trade in &self.simulation_account.trade_history {
+                                    ui.label(RichText::new(&trade.pair).strong());
+                                    ui.colored_label(
+                                        if trade.status == "持仓中" {
+                                            theme::YELLOW
+                                        } else {
+                                            theme::MUTED
+                                        },
+                                        &trade.status,
+                                    );
+                                    ui.colored_label(
+                                        if trade.side == "多" {
+                                            theme::GREEN
+                                        } else {
+                                            theme::RED
+                                        },
+                                        &trade.side,
+                                    );
+                                    ui.label(format!("{:.4}", trade.amount));
+                                    ui.label(format!("{:.2}", trade.stake_amount));
+                                    ui.label(format_price(trade.open_rate));
+                                    ui.label(
+                                        trade
+                                            .close_rate
+                                            .map(format_price)
+                                            .unwrap_or_else(|| "--".into()),
+                                    );
+                                    ui.label(format!("{:.1}x", trade.leverage));
+                                    ui.colored_label(
+                                        if trade.profit_abs >= 0.0 {
+                                            theme::GREEN
+                                        } else {
+                                            theme::RED
+                                        },
+                                        format!("{:+.2}", trade.profit_abs),
+                                    );
+                                    ui.colored_label(
+                                        if trade.profit_percent >= 0.0 {
+                                            theme::GREEN
+                                        } else {
+                                            theme::RED
+                                        },
+                                        format!("{:+.2}%", trade.profit_percent),
+                                    );
+                                    ui.label(&trade.open_date);
+                                    ui.label(if trade.close_date.is_empty() {
+                                        "--"
+                                    } else {
+                                        &trade.close_date
+                                    });
+                                    ui.label(&trade.tag);
+                                    ui.label(if trade.exit_reason.is_empty() {
+                                        "--"
+                                    } else {
+                                        &trade.exit_reason
+                                    });
+                                    ui.end_row();
+                                }
+                            });
+                    });
             });
     }
 
@@ -1224,10 +1398,10 @@ impl GqtApp {
                         }
                     }
                 });
-            for interval in Interval::ALL {
+            for interval in Interval::MARKET {
                 let selected = interval == self.interval;
                 let button =
-                    egui::Button::new(RichText::new(interval.as_str()).color(if selected {
+                    egui::Button::new(RichText::new(interval.label()).color(if selected {
                         Color32::BLACK
                     } else {
                         theme::MUTED
@@ -1239,7 +1413,7 @@ impl GqtApp {
                     })
                     .stroke(Stroke::new(1.0, theme::BORDER))
                     .corner_radius(3);
-                if ui.add_sized([48.0, 34.0], button).clicked() {
+                if ui.add_sized([64.0, 34.0], button).clicked() {
                     self.interval = interval;
                     self.select_market();
                 }
@@ -1260,10 +1434,12 @@ impl GqtApp {
             });
         });
         ui.add_space(12.0);
-        let sidebar_width = 292.0;
-        ui.horizontal_top(|ui| {
-            let chart_width = (ui.available_width() - sidebar_width - 14.0).max(480.0);
-            ui.allocate_ui(Vec2::new(chart_width, 620.0), |ui| {
+        Frame::NONE
+            .fill(Color32::from_rgb(8, 11, 14))
+            .stroke(Stroke::new(1.0, theme::BORDER))
+            .corner_radius(4)
+            .inner_margin(Margin::same(14))
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(RichText::new(&self.symbol).size(13.0).color(theme::MUTED));
@@ -1273,7 +1449,7 @@ impl GqtApp {
                                 .strong(),
                         );
                     });
-                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let positive = self.snapshot.change_percent >= 0.0;
                         ui.label(
                             RichText::new(format!(
@@ -1286,11 +1462,19 @@ impl GqtApp {
                         );
                     });
                 });
-                ui.add_space(6.0);
-                draw_candles(ui, &self.candles);
+                ui.add_space(10.0);
+                draw_candles(
+                    ui,
+                    &self.candles,
+                    self.interval,
+                    &self.market_error,
+                    self.market_connected,
+                    460.0,
+                );
             });
-            ui.add_space(14.0);
-            ui.allocate_ui(Vec2::new(sidebar_width, 620.0), |ui| {
+        ui.add_space(14.0);
+        ui.columns(2, |columns| {
+            columns[0].vertical(|ui| {
                 section_title(ui, "市场情绪", &self.snapshot.sentiment.label);
                 ui.horizontal(|ui| {
                     ui.label(
@@ -1322,7 +1506,8 @@ impl GqtApp {
                     "24h 成交额",
                     &format!("{} USDT", compact_number(self.snapshot.quote_volume)),
                 );
-                ui.add_space(18.0);
+            });
+            columns[1].vertical(|ui| {
                 section_title(ui, "AI 研判", self.ai_provider.label());
                 egui::ComboBox::from_id_salt("ai-provider")
                     .selected_text(self.ai_provider.label())
@@ -1510,7 +1695,7 @@ impl GqtApp {
         }
         self.job_running = true;
         self.bot_log = if backtest {
-            "正在同步所选范围的 4h 历史数据，完成后将自动运行回测...".into()
+            "正在同步所选周期的历史数据，完成后将自动运行回测...".into()
         } else {
             "正在同步 Binance Futures 历史数据...".into()
         };
@@ -1589,6 +1774,7 @@ impl GqtApp {
                 self.page = Page::Backtest;
             }
             ui.separator();
+            status_chip(ui, self.ai_config.strategy_profile.label(), true);
             status_chip(ui, &format!("{} 周期", self.ai_config.timeframe), true);
             status_chip(ui, "多空双向", true);
             status_chip(ui, &format!("最高 {}x", self.ai_config.leverage), true);
@@ -2166,6 +2352,34 @@ impl GqtApp {
                             }),
                     );
                 });
+                ui.add_space(8.0);
+                ui.columns(2, |cols| {
+                    field_label(&mut cols[0], "策略档位");
+                    let previous_profile = self.ai_config.strategy_profile;
+                    egui::ComboBox::from_id_salt("strategy-profile")
+                        .selected_text(self.ai_config.strategy_profile.label())
+                        .show_ui(&mut cols[0], |ui| {
+                            for profile in StrategyProfile::ALL {
+                                ui.selectable_value(
+                                    &mut self.ai_config.strategy_profile,
+                                    profile,
+                                    profile.label(),
+                                );
+                            }
+                        });
+                    if self.ai_config.strategy_profile != previous_profile {
+                        let profile = self.ai_config.strategy_profile;
+                        profile.apply_to(&mut self.ai_config);
+                        self.risk_reward_ratio = self.ai_config.risk_reward_ratio;
+                    }
+                    cols[1].add_space(18.0);
+                    cols[1].label(
+                        RichText::new(self.ai_config.strategy_profile.hint())
+                            .size(12.0)
+                            .color(theme::MUTED),
+                    );
+                });
+                ui.add_space(8.0);
                 field_label(ui, "币种白名单");
                 ui.add_sized(
                     [ui.available_width(), 38.0],
@@ -2509,45 +2723,201 @@ impl GqtApp {
         });
     }
 
-    fn draw_mini_performance(&self, ui: &mut Ui) {
+    fn record_equity_snapshot(&mut self, account: &FuturesAccount) {
+        if account.updated_at <= 0 || !account.margin_balance.is_finite() {
+            return;
+        }
+        let time = if account.updated_at > 10_000_000_000 {
+            account.updated_at / 1000
+        } else {
+            account.updated_at
+        };
+        let point = EquityPoint {
+            time,
+            equity: account.margin_balance,
+            available: account.available_balance,
+            unrealized_profit: account.unrealized_profit,
+        };
+        if let Some(last) = self.equity_history.last_mut()
+            && point.time.saturating_sub(last.time) < 60
+        {
+            *last = point;
+        } else {
+            self.equity_history.push(point);
+        }
+        let cutoff = chrono::Utc::now().timestamp() - 370 * 24 * 60 * 60;
+        self.equity_history
+            .retain(|point| point.time >= cutoff && point.equity.is_finite());
+        let _ = save_equity_history(&self.equity_history_path, &self.equity_history);
+    }
+
+    fn push_second_candle(&mut self, timestamp: i64, price: f64) {
+        if !price.is_finite() || price <= 0.0 {
+            return;
+        }
+        let time = timestamp.max(chrono::Utc::now().timestamp());
+        if let Some(last) = self.candles.last_mut() {
+            if time <= last.time {
+                last.high = last.high.max(price);
+                last.low = last.low.min(price);
+                last.close = price;
+            } else {
+                let open = last.close;
+                self.candles.push(Candle {
+                    time,
+                    open,
+                    high: open.max(price),
+                    low: open.min(price),
+                    close: price,
+                    volume: 0.0,
+                });
+            }
+        } else {
+            self.candles.push(Candle {
+                time,
+                open: price,
+                high: price,
+                low: price,
+                close: price,
+                volume: 0.0,
+            });
+        }
+        if self.candles.len() > 900 {
+            let overflow = self.candles.len() - 900;
+            self.candles.drain(0..overflow);
+        }
+    }
+
+    fn draw_equity_performance(&self, ui: &mut Ui) {
         let (rect, _) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), 190.0), Sense::hover());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 4, theme::SURFACE);
+        let plot = Rect::from_min_max(
+            rect.min + Vec2::new(10.0, 10.0),
+            rect.max - Vec2::new(78.0, 28.0),
+        );
         for index in 0..5 {
-            let y = egui::lerp(rect.top()..=rect.bottom(), index as f32 / 4.0);
+            let y = egui::lerp(plot.top()..=plot.bottom(), index as f32 / 4.0);
             painter.line_segment(
-                [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+                [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
                 Stroke::new(1.0, theme::BORDER),
             );
         }
-        if self.candles.len() > 2 {
-            let visible = &self.candles[self.candles.len().saturating_sub(80)..];
-            let min = visible
-                .iter()
-                .map(|candle| candle.close)
-                .fold(f64::INFINITY, f64::min);
-            let max = visible
-                .iter()
-                .map(|candle| candle.close)
-                .fold(f64::NEG_INFINITY, f64::max);
-            let spread = (max - min).max(1.0);
-            let points: Vec<Pos2> = visible
-                .iter()
-                .enumerate()
-                .map(|(index, candle)| {
-                    Pos2::new(
-                        egui::lerp(
-                            rect.left()..=rect.right(),
-                            index as f32 / (visible.len() - 1) as f32,
-                        ),
-                        rect.bottom() - ((candle.close - min) / spread) as f32 * rect.height(),
-                    )
-                })
-                .collect();
-            painter.add(egui::Shape::line(points, Stroke::new(2.0, theme::YELLOW)));
+        let cutoff = self.equity_range.cutoff();
+        let points = self
+            .equity_history
+            .iter()
+            .filter(|point| point.time >= cutoff && point.equity.is_finite())
+            .collect::<Vec<_>>();
+        if points.is_empty() {
+            painter.text(
+                plot.center(),
+                Align2::CENTER_CENTER,
+                "等待账户刷新后生成个人资金曲线",
+                FontId::new(14.0, FontFamily::Proportional),
+                theme::MUTED,
+            );
+            return;
+        }
+
+        let min = points
+            .iter()
+            .map(|point| point.equity)
+            .fold(f64::INFINITY, f64::min);
+        let max = points
+            .iter()
+            .map(|point| point.equity)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let padding = ((max - min) * 0.08).max(max.abs() * 0.0005).max(1.0);
+        let low = min - padding;
+        let high = max + padding;
+        let spread = (high - low).max(f64::EPSILON);
+        let start = cutoff.min(points.first().map(|point| point.time).unwrap_or(cutoff));
+        let end = chrono::Utc::now()
+            .timestamp()
+            .max(points.last().map(|point| point.time).unwrap_or(start + 1));
+        let duration = (end - start).max(1) as f32;
+        let chart_points = points
+            .iter()
+            .map(|point| {
+                let x_ratio = (point.time - start) as f32 / duration;
+                let y_ratio = ((point.equity - low) / spread) as f32;
+                Pos2::new(
+                    egui::lerp(plot.left()..=plot.right(), x_ratio.clamp(0.0, 1.0)),
+                    plot.bottom() - y_ratio.clamp(0.0, 1.0) * plot.height(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if chart_points.len() == 1 {
+            painter.circle_filled(chart_points[0], 4.0, theme::YELLOW);
+        } else {
+            painter.add(egui::Shape::line(
+                chart_points,
+                Stroke::new(2.0, theme::YELLOW),
+            ));
+        }
+        for index in 0..=4 {
+            let ratio = index as f32 / 4.0;
+            let value = high - spread * ratio as f64;
+            let y = egui::lerp(plot.top()..=plot.bottom(), ratio);
+            painter.text(
+                Pos2::new(plot.right() + 8.0, y),
+                Align2::LEFT_CENTER,
+                format!("{value:.2}"),
+                FontId::new(11.0, FontFamily::Monospace),
+                theme::MUTED,
+            );
+        }
+        if let Some(latest) = points.last() {
+            let positive = latest.unrealized_profit >= 0.0;
+            painter.text(
+                plot.left_top() + Vec2::new(8.0, 8.0),
+                Align2::LEFT_TOP,
+                format!(
+                    "权益 {:.2}  可用 {:.2}  未实现 {:+.2}",
+                    latest.equity, latest.available, latest.unrealized_profit
+                ),
+                FontId::new(12.0, FontFamily::Monospace),
+                if positive { theme::GREEN } else { theme::RED },
+            );
+            painter.text(
+                plot.left_bottom() + Vec2::new(8.0, -4.0),
+                Align2::LEFT_BOTTOM,
+                format!("{} 快照", format_equity_time(latest.time)),
+                FontId::new(11.0, FontFamily::Proportional),
+                theme::MUTED,
+            );
         }
     }
+}
+
+fn load_equity_history(path: &PathBuf) -> Vec<EquityPoint> {
+    let Ok(source) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(mut points) = serde_json::from_str::<Vec<EquityPoint>>(&source) else {
+        return Vec::new();
+    };
+    points.retain(|point| point.time > 0 && point.equity.is_finite());
+    points.sort_by_key(|point| point.time);
+    points
+}
+
+fn save_equity_history(path: &PathBuf, points: &[EquityPoint]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let payload = serde_json::to_string_pretty(points).unwrap_or_else(|_| "[]".into());
+    std::fs::write(path, format!("{payload}\n"))
+}
+
+fn format_equity_time(timestamp: i64) -> String {
+    Local
+        .timestamp_opt(timestamp, 0)
+        .single()
+        .map(|time| time.format("%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "--".into())
 }
 
 impl eframe::App for GqtApp {
@@ -2843,39 +3213,87 @@ fn action_label(action: &crate::model::AiAction) -> &'static str {
     }
 }
 
-fn draw_candles(ui: &mut Ui, candles: &[Candle]) {
-    let desired = Vec2::new(
-        ui.available_width(),
-        (ui.available_height() - 8.0).max(380.0),
-    );
+fn draw_candles(
+    ui: &mut Ui,
+    candles: &[Candle],
+    interval: Interval,
+    market_error: &str,
+    connected: bool,
+    height: f32,
+) {
+    let desired = Vec2::new(ui.available_width(), height.max(320.0));
     let (rect, response) = ui.allocate_exact_size(desired, Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 2, theme::BG);
+    painter.rect_filled(rect, 4, Color32::from_rgb(8, 11, 14));
+    painter.rect_stroke(
+        rect,
+        4,
+        Stroke::new(1.0, theme::BORDER),
+        egui::StrokeKind::Inside,
+    );
     let plot = Rect::from_min_max(
-        rect.min + Vec2::new(8.0, 8.0),
-        rect.max - Vec2::new(68.0, 28.0),
+        rect.min + Vec2::new(12.0, 42.0),
+        rect.max - Vec2::new(76.0, 34.0),
+    );
+    painter.text(
+        rect.min + Vec2::new(14.0, 20.0),
+        Align2::LEFT_CENTER,
+        format!("{} K线", interval.label()),
+        FontId::new(13.0, FontFamily::Proportional),
+        theme::TEXT,
+    );
+    let status_text = if candles.is_empty() {
+        if connected {
+            "等待K线数据".to_string()
+        } else if market_error.is_empty() {
+            "行情连接中".to_string()
+        } else {
+            "K线加载失败".to_string()
+        }
+    } else {
+        format!("已加载 {} 根", candles.len())
+    };
+    painter.text(
+        rect.right_top() + Vec2::new(-14.0, 20.0),
+        Align2::RIGHT_CENTER,
+        status_text,
+        FontId::new(12.0, FontFamily::Proportional),
+        if candles.is_empty() && !connected {
+            theme::RED
+        } else {
+            theme::MUTED
+        },
     );
     for index in 0..=5 {
         let y = egui::lerp(plot.top()..=plot.bottom(), index as f32 / 5.0);
         painter.line_segment(
             [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
-            Stroke::new(1.0, theme::BORDER),
+            Stroke::new(1.0, Color32::from_rgb(30, 36, 43)),
         );
     }
     for index in 0..=6 {
         let x = egui::lerp(plot.left()..=plot.right(), index as f32 / 6.0);
         painter.line_segment(
             [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
-            Stroke::new(1.0, theme::BORDER),
+            Stroke::new(1.0, Color32::from_rgb(30, 36, 43)),
         );
     }
     if candles.is_empty() {
+        let message = if market_error.is_empty() {
+            "正在加载 Binance Futures K线"
+        } else {
+            market_error
+        };
         painter.text(
             plot.center(),
             Align2::CENTER_CENTER,
-            "正在加载 Binance Futures K线",
+            message,
             FontId::new(14.0, FontFamily::Proportional),
-            theme::MUTED,
+            if market_error.is_empty() {
+                theme::MUTED
+            } else {
+                theme::RED
+            },
         );
         return;
     }
@@ -2889,6 +3307,16 @@ fn draw_candles(ui: &mut Ui, candles: &[Candle]) {
         .iter()
         .map(|candle| candle.high)
         .fold(f64::NEG_INFINITY, f64::max);
+    if !low.is_finite() || !high.is_finite() || high <= 0.0 || low <= 0.0 {
+        painter.text(
+            plot.center(),
+            Align2::CENTER_CENTER,
+            "K线数据异常，等待下一次刷新",
+            FontId::new(14.0, FontFamily::Proportional),
+            theme::RED,
+        );
+        return;
+    }
     let padding = ((high - low) * 0.06).max(high.abs() * 0.0005);
     let low = low - padding;
     let high = high + padding;
@@ -2917,6 +3345,35 @@ fn draw_candles(ui: &mut Ui, candles: &[Candle]) {
             Pos2::new(x + body_width / 2.0, bottom.max(top + 1.0)),
         );
         painter.rect_filled(body, 0, color);
+    }
+    if visible.len() > 1 {
+        let close_points = visible
+            .iter()
+            .enumerate()
+            .map(|(index, candle)| {
+                Pos2::new(
+                    plot.left() + step * (index as f32 + 0.5),
+                    y_of(candle.close),
+                )
+            })
+            .collect::<Vec<_>>();
+        painter.add(egui::Shape::line(
+            close_points,
+            Stroke::new(1.6, theme::YELLOW),
+        ));
+    }
+    if let Some(last) = visible.last() {
+        painter.text(
+            rect.left_bottom() + Vec2::new(14.0, -15.0),
+            Align2::LEFT_CENTER,
+            format!(
+                "最后收盘 {}  成交量 {}",
+                format_price(last.close),
+                compact_number(last.volume)
+            ),
+            FontId::new(11.0, FontFamily::Proportional),
+            theme::MUTED,
+        );
     }
     for index in 0..=5 {
         let ratio = index as f32 / 5.0;
@@ -3055,6 +3512,14 @@ fn format_symbol_whitelist(symbols: &[String]) -> String {
     symbols.join(", ")
 }
 
+fn compact_build_label() -> &'static str {
+    BUILD_LABEL
+        .split('-')
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(BUILD_LABEL)
+}
+
 fn parse_symbol_whitelist(value: &str) -> Result<Vec<String>, String> {
     let mut symbols = Vec::new();
     for raw in value.split(|character: char| {
@@ -3095,18 +3560,21 @@ fn parse_symbol_whitelist(value: &str) -> Result<Vec<String>, String> {
 fn ai_timeframe_guidance(timeframe: &str) -> (&'static str, Color32) {
     match timeframe {
         "4h" => (
-            "推荐：4h 多因子回测胜率更稳，当前默认用于 AI 闭环。",
-            theme::GREEN,
+            "稳健确认：4h 信号更少，适合过滤大方向或做慢速回测。",
+            theme::MUTED,
         ),
         "1m" => (
             "高风险：1m 直接跑多因子回测表现很差，不建议自动交易。",
             theme::RED,
         ),
         "5m" | "15m" => (
-            "偏高频：建议只做观察或小资金模拟，最好叠加 1h/4h 确认。",
+            "默认滚仓试验档：适合 dry-run、小资金模拟和短周期因子筛选。",
+            theme::GREEN,
+        ),
+        "1h" => (
+            "中频确认：交易频率和噪音介于 15m 与 4h 之间。",
             theme::YELLOW,
         ),
-        "1h" => ("中频：可模拟测试，稳定性通常弱于 4h。", theme::YELLOW),
         "1d" => ("低频：信号更少，适合观察大趋势。", theme::MUTED),
         _ => ("周期未识别，请保存前检查配置。", theme::RED),
     }

@@ -47,6 +47,7 @@ impl TradingWorkspace {
         write_if_missing(&config, DEFAULT_CONFIG)?;
         migrate_config(&config)?;
         write_if_missing(&strategy, DEFAULT_STRATEGY)?;
+        migrate_default_strategy(&strategy)?;
         write_if_missing(&ai_strategy, DEFAULT_AI_STRATEGY)?;
         write_if_missing(&ai_config, DEFAULT_AI_CONFIG)?;
         migrate_ai_config(&ai_config)?;
@@ -90,6 +91,18 @@ impl TradingWorkspace {
         let exchange = exchange.as_object_mut().context("exchange 配置无效")?;
         exchange.insert("pair_whitelist".into(), json!(pairs));
         ensure_order_book_pricing(&mut config)?;
+        ensure_compound_defaults(&mut config)?;
+        let profile_preset = ai_config.strategy_profile.preset();
+        config["gqt_strategy_profile"] = json!(ai_config.strategy_profile.as_str());
+        config["gqt_compound_capital_usage_percent"] = json!(ai_config.capital_usage_percent);
+        config["gqt_compound_take_profit"] = json!(profile_preset.take_profit);
+        config["gqt_compound_stop_loss"] = json!(profile_preset.stop_loss);
+        config["gqt_compound_pyramid_profit"] = json!(profile_preset.pyramid_profit);
+        config["gqt_compound_pyramid_stake_ratio"] = json!(profile_preset.pyramid_stake_ratio);
+        config["gqt_compound_leverage"] = json!(ai_config.leverage);
+        config["minimal_roi"] = json!({"0": 0.99});
+        config["stoploss"] = json!(-0.045);
+        config["trailing_stop"] = json!(false);
         config["stake_amount"] = json!(ai_config.max_stake_amount);
         config["gqt_max_stake_amount"] = json!(ai_config.max_stake_amount);
         config["gqt_risk_reward_ratio"] = json!(ai_config.risk_reward_ratio);
@@ -103,7 +116,7 @@ impl TradingWorkspace {
             });
         } else if config["strategy"].as_str() == Some("AiSignalStrategy") {
             config["strategy"] = json!("FuturesFactorStrategy");
-            config["timeframe"] = json!("4h");
+            config["timeframe"] = json!("15m");
             config["margin_mode"] = json!("isolated");
         }
         write_json_atomic(&self.config, &config).context("无法同步 Freqtrade 交易白名单")?;
@@ -364,6 +377,7 @@ impl TradingWorkspace {
             bail!("回测费率超出允许范围");
         }
         let pairs = normalized_pairs(symbols)?;
+        let timeframe = self.configured_timeframe()?;
         let data_start = start - ChronoDuration::days(90);
         let mut download_command = vec![
             "download-data".into(),
@@ -374,7 +388,7 @@ impl TradingWorkspace {
             "--trading-mode".into(),
             "futures".into(),
             "--timeframes".into(),
-            "4h".into(),
+            timeframe,
             "--prepend".into(),
             "--timerange".into(),
             format!("{}-{}", data_start.format("%Y%m%d"), end.format("%Y%m%d")),
@@ -410,6 +424,7 @@ impl TradingWorkspace {
             bail!("历史数据天数超出允许范围");
         }
         let pairs = normalized_pairs(symbols)?;
+        let timeframe = self.configured_timeframe()?;
         let mut command = vec![
             "download-data".into(),
             "--config".into(),
@@ -419,7 +434,7 @@ impl TradingWorkspace {
             "--trading-mode".into(),
             "futures".into(),
             "--timeframes".into(),
-            "4h".into(),
+            timeframe,
             "--prepend".into(),
             "--days".into(),
             days.to_string(),
@@ -473,6 +488,15 @@ impl TradingWorkspace {
             bail!("{}", log.trim());
         }
         Ok(log.trim().to_string())
+    }
+
+    fn configured_timeframe(&self) -> Result<String> {
+        let config: Value = serde_json::from_str(&fs::read_to_string(&self.config)?)?;
+        let timeframe = config["timeframe"].as_str().unwrap_or("15m");
+        if !matches!(timeframe, "1m" | "5m" | "15m" | "1h" | "4h" | "1d") {
+            bail!("Freqtrade timeframe is invalid: {timeframe}");
+        }
+        Ok(timeframe.to_string())
     }
 }
 
@@ -540,12 +564,29 @@ fn write_if_missing(path: &Path, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn migrate_default_strategy(path: &Path) -> Result<()> {
+    let source = fs::read_to_string(path).context("无法读取 Freqtrade 策略")?;
+    let legacy_default = source
+        .contains("Multi-factor Binance futures baseline for research and dry-run.")
+        || (source.contains("timeframe = \"4h\"")
+            && !source.contains("alpha_compound_long")
+            && source.contains("FuturesFactorStrategy"))
+        || (source.contains("class FuturesFactorStrategy")
+            && source.contains("alpha_compound_long")
+            && !source.contains("PROFILE_DEFAULTS"));
+    if legacy_default {
+        fs::write(path, DEFAULT_STRATEGY).context("无法迁移默认 Freqtrade 策略")?;
+    }
+    Ok(())
+}
+
 fn migrate_ai_config(path: &Path) -> Result<()> {
     let source = fs::read_to_string(path).context("无法读取 AI 自动交易配置")?;
     let source_value: Value = serde_json::from_str(&source).context("AI 自动交易配置 JSON 无效")?;
     let mut config: AiTradingConfig =
         serde_json::from_str(&source).context("AI 自动交易配置 JSON 无效")?;
     let mut should_write = [
+        "strategy_profile",
         "minimum_long_score",
         "minimum_short_score",
         "minimum_factor_score",
@@ -559,10 +600,37 @@ fn migrate_ai_config(path: &Path) -> Result<()> {
         config.symbol_whitelist = default_ai_symbol_whitelist();
         should_write = true;
     }
+    if is_legacy_ai_default(&config) {
+        config.timeframe = "15m".into();
+        config.margin_mode = MarginMode::Isolated;
+        config.max_stake_amount = 120.0;
+        config.capital_usage_percent = 12.0;
+        config.risk_reward_ratio = 1.4;
+        config.minimum_long_score = 0.62;
+        config.minimum_short_score = 0.62;
+        config.minimum_factor_score = 0.12;
+        config.minimum_trend_quality = 0.42;
+        config.minimum_adx = 10.0;
+        config.minimum_volume_ratio = -0.35;
+        should_write = true;
+    }
     if should_write {
         write_json_atomic(path, &config).context("无法迁移 AI 默认配置")?;
     }
     Ok(())
+}
+
+fn is_legacy_ai_default(config: &AiTradingConfig) -> bool {
+    !config.enabled
+        && config.timeframe == "4h"
+        && config.margin_mode == MarginMode::Cross
+        && nearly(config.max_stake_amount, 50.0)
+        && nearly(config.capital_usage_percent, 10.0)
+        && nearly(config.risk_reward_ratio, 2.0)
+}
+
+fn nearly(left: f64, right: f64) -> bool {
+    (left - right).abs() < 1e-9
 }
 
 fn write_json_atomic<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
@@ -603,7 +671,17 @@ fn unique_temporary_path(path: &Path) -> PathBuf {
 fn migrate_config(path: &Path) -> Result<()> {
     let source = fs::read_to_string(path).context("无法读取 Freqtrade 配置")?;
     let mut config: Value = serde_json::from_str(&source).context("Freqtrade 配置 JSON 无效")?;
+    let legacy_factor_default = config["strategy"].as_str() == Some("FuturesFactorStrategy")
+        && config["timeframe"].as_str() == Some("4h")
+        && nearly(config["stake_amount"].as_f64().unwrap_or(50.0), 50.0)
+        && nearly(
+            config["gqt_max_stake_amount"].as_f64().unwrap_or(50.0),
+            50.0,
+        )
+        && nearly(config["gqt_risk_reward_ratio"].as_f64().unwrap_or(2.0), 2.0)
+        && config["max_open_trades"].as_i64().unwrap_or(3) == 3;
     ensure_order_book_pricing(&mut config)?;
+    ensure_compound_defaults(&mut config)?;
     let api = config
         .as_object_mut()
         .context("Freqtrade 配置根节点无效")?
@@ -624,10 +702,55 @@ fn migrate_config(path: &Path) -> Result<()> {
     api.entry("verbosity").or_insert(json!("error"));
 
     config["initial_state"] = json!("running");
+    if legacy_factor_default {
+        config["max_open_trades"] = json!(5);
+        config["stake_amount"] = json!(120.0);
+        config["gqt_max_stake_amount"] = json!(120.0);
+        config["gqt_risk_reward_ratio"] = json!(1.4);
+        config["liquidation_buffer"] = json!(0.20);
+        if let Some(timeout) = config["unfilledtimeout"].as_object_mut() {
+            timeout.insert("entry".into(), json!(4));
+            timeout.insert("exit".into(), json!(4));
+        }
+    }
+    if config["strategy"].as_str() == Some("FuturesFactorStrategy")
+        && config["timeframe"].as_str() == Some("4h")
+    {
+        config["timeframe"] = json!("15m");
+    }
     let updated = format!("{}\n", serde_json::to_string_pretty(&config)?);
     if updated != source {
         fs::write(path, updated).context("无法更新 Freqtrade 配置")?;
     }
+    Ok(())
+}
+
+fn ensure_compound_defaults(config: &mut Value) -> Result<()> {
+    let root = config.as_object_mut().context("Freqtrade 配置根节点无效")?;
+    let profile = root
+        .entry("gqt_strategy_profile")
+        .or_insert(json!("balanced"));
+    if !matches!(
+        profile.as_str(),
+        Some("conservative" | "balanced" | "aggressive")
+    ) {
+        *profile = json!("balanced");
+    }
+    root.entry("gqt_compound_enabled").or_insert(json!(true));
+    root.entry("gqt_compound_capital_usage_percent")
+        .or_insert(json!(12.0));
+    root.entry("gqt_compound_take_profit")
+        .or_insert(json!(0.018));
+    root.entry("gqt_compound_stop_loss").or_insert(json!(0.014));
+    root.entry("gqt_compound_pyramid_profit")
+        .or_insert(json!(0.006));
+    root.entry("gqt_compound_pyramid_stake_ratio")
+        .or_insert(json!(0.45));
+    root.entry("gqt_compound_leverage").or_insert(json!(2));
+    root.insert("minimal_roi".into(), json!({"0": 0.99}));
+    root.insert("stoploss".into(), json!(-0.045));
+    root.insert("trailing_stop".into(), json!(false));
+    root.entry("liquidation_buffer").or_insert(json!(0.20));
     Ok(())
 }
 

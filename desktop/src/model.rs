@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub enum Page {
     Overview,
     Account,
+    PositionHistory,
     Market,
     Strategy,
     Backtest,
@@ -13,9 +14,10 @@ pub enum Page {
 }
 
 impl Page {
-    pub const ALL: [Page; 8] = [
+    pub const ALL: [Page; 9] = [
         Page::Overview,
         Page::Account,
+        Page::PositionHistory,
         Page::Market,
         Page::Strategy,
         Page::Backtest,
@@ -28,6 +30,7 @@ impl Page {
         match self {
             Page::Overview => "总览",
             Page::Account => "账户",
+            Page::PositionHistory => "仓位历史",
             Page::Market => "行情",
             Page::Strategy => "策略",
             Page::Backtest => "回测",
@@ -41,6 +44,7 @@ impl Page {
         match self {
             Page::Overview => "layout-dashboard",
             Page::Account => "wallet-cards",
+            Page::PositionHistory => "history",
             Page::Market => "candlestick-chart",
             Page::Strategy => "braces",
             Page::Backtest => "chart-no-axes-combined",
@@ -54,6 +58,7 @@ impl Page {
         match self {
             Page::Overview => "Binance U 本位永续",
             Page::Account => "真实账户资金与合约持仓",
+            Page::PositionHistory => "模拟盘成交与仓位记录",
             Page::Market => "实时 K 线与市场情绪",
             Page::Strategy => "Rust 客户端 / Freqtrade Interface v3",
             Page::Backtest => "历史验证与成本压力测试",
@@ -66,6 +71,7 @@ impl Page {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Interval {
+    OneSecond,
     OneMinute,
     FiveMinutes,
     FifteenMinutes,
@@ -75,17 +81,30 @@ pub enum Interval {
 }
 
 impl Interval {
-    pub const ALL: [Interval; 6] = [
+    pub const MARKET: [Interval; 6] = [
+        Interval::OneSecond,
         Interval::OneMinute,
-        Interval::FiveMinutes,
         Interval::FifteenMinutes,
         Interval::OneHour,
         Interval::FourHours,
         Interval::OneDay,
     ];
 
+    pub fn label(self) -> &'static str {
+        match self {
+            Interval::OneSecond => "秒",
+            Interval::OneMinute => "分",
+            Interval::FiveMinutes => "5分",
+            Interval::FifteenMinutes => "15分",
+            Interval::OneHour => "1小时",
+            Interval::FourHours => "4小时",
+            Interval::OneDay => "一天",
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
+            Interval::OneSecond => "1s",
             Interval::OneMinute => "1m",
             Interval::FiveMinutes => "5m",
             Interval::FifteenMinutes => "15m",
@@ -97,6 +116,7 @@ impl Interval {
 
     pub fn from_timeframe(value: &str) -> Option<Self> {
         match value {
+            "1s" => Some(Interval::OneSecond),
             "1m" => Some(Interval::OneMinute),
             "5m" => Some(Interval::FiveMinutes),
             "15m" => Some(Interval::FifteenMinutes),
@@ -109,6 +129,7 @@ impl Interval {
 
     pub fn seconds(self) -> i64 {
         match self {
+            Interval::OneSecond => 1,
             Interval::OneMinute => 60,
             Interval::FiveMinutes => 5 * 60,
             Interval::FifteenMinutes => 15 * 60,
@@ -236,12 +257,140 @@ pub enum MarginMode {
     Isolated,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyProfile {
+    Conservative,
+    Balanced,
+    Aggressive,
+}
+
+impl Default for StrategyProfile {
+    fn default() -> Self {
+        Self::Balanced
+    }
+}
+
+impl StrategyProfile {
+    pub const ALL: [StrategyProfile; 3] = [
+        StrategyProfile::Conservative,
+        StrategyProfile::Balanced,
+        StrategyProfile::Aggressive,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StrategyProfile::Conservative => "conservative",
+            StrategyProfile::Balanced => "balanced",
+            StrategyProfile::Aggressive => "aggressive",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            StrategyProfile::Conservative => "保守",
+            StrategyProfile::Balanced => "均衡",
+            StrategyProfile::Aggressive => "激进",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            StrategyProfile::Conservative => "少交易、严过滤、轻滚仓，优先控制回撤。",
+            StrategyProfile::Balanced => "默认档，兼顾信号质量、复利速度和模拟盘验证。",
+            StrategyProfile::Aggressive => "更频繁、更快止盈、更积极滚仓，只建议先跑模拟盘和回测。",
+        }
+    }
+
+    pub fn preset(self) -> StrategyProfilePreset {
+        match self {
+            StrategyProfile::Conservative => StrategyProfilePreset {
+                leverage: 2,
+                capital_usage_percent: 8.0,
+                risk_reward_ratio: 1.4,
+                minimum_long_score: 0.68,
+                minimum_short_score: 0.68,
+                minimum_factor_score: 0.18,
+                minimum_trend_quality: 0.50,
+                minimum_adx: 14.0,
+                minimum_volume_ratio: -0.10,
+                take_profit: 0.014,
+                stop_loss: 0.010,
+                pyramid_profit: 0.008,
+                pyramid_stake_ratio: 0.30,
+            },
+            StrategyProfile::Balanced => StrategyProfilePreset {
+                leverage: 2,
+                capital_usage_percent: 12.0,
+                risk_reward_ratio: 1.4,
+                minimum_long_score: 0.62,
+                minimum_short_score: 0.62,
+                minimum_factor_score: 0.12,
+                minimum_trend_quality: 0.42,
+                minimum_adx: 10.0,
+                minimum_volume_ratio: -0.35,
+                take_profit: 0.018,
+                stop_loss: 0.014,
+                pyramid_profit: 0.006,
+                pyramid_stake_ratio: 0.45,
+            },
+            StrategyProfile::Aggressive => StrategyProfilePreset {
+                leverage: 3,
+                capital_usage_percent: 18.0,
+                risk_reward_ratio: 1.0,
+                minimum_long_score: 0.58,
+                minimum_short_score: 0.58,
+                minimum_factor_score: 0.08,
+                minimum_trend_quality: 0.35,
+                minimum_adx: 8.0,
+                minimum_volume_ratio: -0.50,
+                take_profit: 0.012,
+                stop_loss: 0.012,
+                pyramid_profit: 0.004,
+                pyramid_stake_ratio: 0.60,
+            },
+        }
+    }
+
+    pub fn apply_to(self, config: &mut AiTradingConfig) {
+        let preset = self.preset();
+        config.strategy_profile = self;
+        config.leverage = preset.leverage;
+        config.capital_usage_percent = preset.capital_usage_percent;
+        config.risk_reward_ratio = preset.risk_reward_ratio;
+        config.minimum_long_score = preset.minimum_long_score;
+        config.minimum_short_score = preset.minimum_short_score;
+        config.minimum_factor_score = preset.minimum_factor_score;
+        config.minimum_trend_quality = preset.minimum_trend_quality;
+        config.minimum_adx = preset.minimum_adx;
+        config.minimum_volume_ratio = preset.minimum_volume_ratio;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StrategyProfilePreset {
+    pub leverage: u8,
+    pub capital_usage_percent: f64,
+    pub risk_reward_ratio: f64,
+    pub minimum_long_score: f64,
+    pub minimum_short_score: f64,
+    pub minimum_factor_score: f64,
+    pub minimum_trend_quality: f64,
+    pub minimum_adx: f64,
+    pub minimum_volume_ratio: f64,
+    pub take_profit: f64,
+    pub stop_loss: f64,
+    pub pyramid_profit: f64,
+    pub pyramid_stake_ratio: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AiTradingConfig {
     pub enabled: bool,
     pub dry_run_only: bool,
     pub symbol_whitelist: Vec<String>,
+    pub strategy_profile: StrategyProfile,
     pub timeframe: String,
     pub margin_mode: MarginMode,
     pub leverage: u8,
@@ -267,20 +416,21 @@ impl Default for AiTradingConfig {
             enabled: false,
             dry_run_only: true,
             symbol_whitelist: default_ai_symbol_whitelist(),
-            timeframe: "4h".into(),
-            margin_mode: MarginMode::Cross,
+            strategy_profile: StrategyProfile::Balanced,
+            timeframe: "15m".into(),
+            margin_mode: MarginMode::Isolated,
             leverage: 2,
-            max_stake_amount: 50.0,
-            capital_usage_percent: 10.0,
-            risk_reward_ratio: 2.0,
+            max_stake_amount: 120.0,
+            capital_usage_percent: 12.0,
+            risk_reward_ratio: 1.4,
             allow_ai_risk_sizing: false,
             minimum_confidence: 0.75,
-            minimum_long_score: 0.68,
-            minimum_short_score: 0.68,
-            minimum_factor_score: 0.25,
-            minimum_trend_quality: 0.52,
-            minimum_adx: 18.0,
-            minimum_volume_ratio: 0.0,
+            minimum_long_score: 0.62,
+            minimum_short_score: 0.62,
+            minimum_factor_score: 0.12,
+            minimum_trend_quality: 0.42,
+            minimum_adx: 10.0,
+            minimum_volume_ratio: -0.35,
             model_timeout_seconds: 30,
             market_max_age_seconds: 90,
             one_signal_per_candle: true,

@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -9,53 +9,200 @@ from pandas import DataFrame, Series
 from freqtrade.strategy import IStrategy
 
 
+PROFILE_ALIASES = {
+    "compound_alpha_scalp": "balanced",
+    "factor_alpha": "balanced",
+    "default": "balanced",
+}
+
+PROFILE_DEFAULTS = {
+    "conservative": {
+        "minimum_long_score": 0.68,
+        "minimum_short_score": 0.68,
+        "minimum_factor_score": 0.18,
+        "minimum_trend_quality": 0.50,
+        "minimum_adx": 14.0,
+        "minimum_volume_ratio": -0.10,
+        "long_rsi_min": 38.0,
+        "long_rsi_max": 74.0,
+        "short_rsi_min": 26.0,
+        "short_rsi_max": 62.0,
+        "atr_min": 0.00060,
+        "atr_max": 0.045,
+        "long_vwap_factor": 0.998,
+        "short_vwap_factor": 1.002,
+        "gqt_compound_capital_usage_percent": 8.0,
+        "gqt_compound_take_profit": 0.014,
+        "gqt_compound_stop_loss": 0.010,
+        "gqt_compound_pyramid_profit": 0.008,
+        "gqt_compound_pyramid_stake_ratio": 0.30,
+        "gqt_compound_leverage": 2.0,
+        "gqt_compound_add_window": 0.78,
+        "factor_flip_threshold": 0.10,
+        "opposite_score_exit": 0.62,
+        "time_roll_hours": 8.0,
+        "time_roll_profit": 0.002,
+        "cooldown_candles": 2,
+        "stoploss_guard_trade_limit": 3,
+        "stoploss_guard_stop_candles": 24,
+        "max_drawdown_allowed": 0.10,
+        "max_drawdown_stop_candles": 36,
+    },
+    "balanced": {
+        "minimum_long_score": 0.62,
+        "minimum_short_score": 0.62,
+        "minimum_factor_score": 0.12,
+        "minimum_trend_quality": 0.42,
+        "minimum_adx": 10.0,
+        "minimum_volume_ratio": -0.35,
+        "long_rsi_min": 34.0,
+        "long_rsi_max": 78.0,
+        "short_rsi_min": 22.0,
+        "short_rsi_max": 66.0,
+        "atr_min": 0.00045,
+        "atr_max": 0.060,
+        "long_vwap_factor": 0.995,
+        "short_vwap_factor": 1.005,
+        "gqt_compound_capital_usage_percent": 12.0,
+        "gqt_compound_take_profit": 0.018,
+        "gqt_compound_stop_loss": 0.014,
+        "gqt_compound_pyramid_profit": 0.006,
+        "gqt_compound_pyramid_stake_ratio": 0.45,
+        "gqt_compound_leverage": 2.0,
+        "gqt_compound_add_window": 0.85,
+        "factor_flip_threshold": 0.12,
+        "opposite_score_exit": 0.64,
+        "time_roll_hours": 12.0,
+        "time_roll_profit": 0.002,
+        "cooldown_candles": 1,
+        "stoploss_guard_trade_limit": 4,
+        "stoploss_guard_stop_candles": 16,
+        "max_drawdown_allowed": 0.16,
+        "max_drawdown_stop_candles": 24,
+    },
+    "aggressive": {
+        "minimum_long_score": 0.58,
+        "minimum_short_score": 0.58,
+        "minimum_factor_score": 0.08,
+        "minimum_trend_quality": 0.35,
+        "minimum_adx": 8.0,
+        "minimum_volume_ratio": -0.50,
+        "long_rsi_min": 30.0,
+        "long_rsi_max": 82.0,
+        "short_rsi_min": 18.0,
+        "short_rsi_max": 70.0,
+        "atr_min": 0.00035,
+        "atr_max": 0.075,
+        "long_vwap_factor": 0.992,
+        "short_vwap_factor": 1.008,
+        "gqt_compound_capital_usage_percent": 18.0,
+        "gqt_compound_take_profit": 0.012,
+        "gqt_compound_stop_loss": 0.012,
+        "gqt_compound_pyramid_profit": 0.004,
+        "gqt_compound_pyramid_stake_ratio": 0.60,
+        "gqt_compound_leverage": 3.0,
+        "gqt_compound_add_window": 0.92,
+        "factor_flip_threshold": 0.08,
+        "opposite_score_exit": 0.58,
+        "time_roll_hours": 6.0,
+        "time_roll_profit": 0.001,
+        "cooldown_candles": 1,
+        "stoploss_guard_trade_limit": 5,
+        "stoploss_guard_stop_candles": 12,
+        "max_drawdown_allowed": 0.20,
+        "max_drawdown_stop_candles": 18,
+    },
+}
+
+
 class FuturesFactorStrategy(IStrategy):
-    """Multi-factor Binance futures baseline for research and dry-run."""
+    """profiled_compound_alpha_scalp: factor futures scalp with controlled roll-in sizing."""
 
     INTERFACE_VERSION = 3
-
     can_short = True
-    timeframe = "4h"
+    timeframe = "15m"
     process_only_new_candles = True
-    startup_candle_count = 180
-    position_adjustment_enable = False
-    _user_data = Path("/freqtrade/user_data")
+    startup_candle_count = 320
 
-    minimal_roi = {
-        "0": 0.10,
-        "360": 0.05,
-        "1440": 0.0,
-    }
-    stoploss = -0.08
+    position_adjustment_enable = True
+    max_entry_position_adjustment = 2
 
-    trailing_stop = True
-    trailing_stop_positive = 0.025
-    trailing_stop_positive_offset = 0.055
-    trailing_only_offset_is_reached = True
+    # ROI is intentionally high so custom_exit owns normal exits.
+    minimal_roi = {"0": 0.99}
+    stoploss = -0.045
+    trailing_stop = False
+    trailing_stop_positive = 0.0
+    trailing_stop_positive_offset = 0.0
+    trailing_only_offset_is_reached = False
 
     use_exit_signal = True
     exit_profit_only = False
     ignore_roi_if_entry_signal = False
 
+    _user_data = Path("/freqtrade/user_data")
+
     @property
     def protections(self) -> list[dict]:
         return [
-            {"method": "CooldownPeriod", "stop_duration_candles": 2},
+            {
+                "method": "CooldownPeriod",
+                "stop_duration_candles": self._profile_int("cooldown_candles", 1),
+            },
             {
                 "method": "StoplossGuard",
-                "lookback_period_candles": 36,
-                "trade_limit": 3,
-                "stop_duration_candles": 18,
+                "lookback_period_candles": 48,
+                "trade_limit": self._profile_int("stoploss_guard_trade_limit", 4),
+                "stop_duration_candles": self._profile_int("stoploss_guard_stop_candles", 16),
                 "only_per_pair": False,
             },
             {
                 "method": "MaxDrawdown",
-                "lookback_period_candles": 72,
-                "trade_limit": 8,
-                "stop_duration_candles": 24,
-                "max_allowed_drawdown": 0.12,
+                "lookback_period_candles": 96,
+                "trade_limit": 10,
+                "stop_duration_candles": self._profile_int("max_drawdown_stop_candles", 24),
+                "max_allowed_drawdown": self._profile_float("max_drawdown_allowed", 0.16),
             },
         ]
+
+    def _read_json(self, name: str) -> dict:
+        try:
+            value = json.loads((self._user_data / name).read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def _settings(self) -> dict:
+        settings = self._read_json("ai_config.json")
+        runtime_config = getattr(self, "config", {})
+        if isinstance(runtime_config, dict):
+            settings.update(runtime_config)
+        return settings
+
+    @staticmethod
+    def _float(value, fallback: float) -> float:
+        try:
+            parsed = float(value)
+            return parsed if np.isfinite(parsed) else fallback
+        except (TypeError, ValueError):
+            return fallback
+
+    def _profile_name(self) -> str:
+        value = str(self._settings().get("gqt_strategy_profile", "balanced")).strip().lower()
+        value = PROFILE_ALIASES.get(value, value)
+        return value if value in PROFILE_DEFAULTS else "balanced"
+
+    def _profile(self) -> dict:
+        return PROFILE_DEFAULTS[self._profile_name()]
+
+    def _float_setting(self, name: str, fallback: float) -> float:
+        return self._float(self._settings().get(name), fallback)
+
+    def _profile_float(self, name: str, fallback: float) -> float:
+        profile_value = self._profile().get(name, fallback)
+        return self._float(self._settings().get(name), self._float(profile_value, fallback))
+
+    def _profile_int(self, name: str, fallback: int) -> int:
+        return int(round(self._profile_float(name, float(fallback))))
 
     @staticmethod
     def bounded(series: Series, low: float, high: float) -> Series:
@@ -69,25 +216,11 @@ class FuturesFactorStrategy(IStrategy):
             return series * 0.0
         return (1.0 - (series - center).abs() / half_width).clip(lower=0.0, upper=1.0).fillna(0.0)
 
-    def _config(self) -> dict:
-        try:
-            value = json.loads((self._user_data / "ai_config.json").read_text(encoding="utf-8"))
-            return value if isinstance(value, dict) else {}
-        except (OSError, ValueError, TypeError):
-            return {}
-
-    @staticmethod
-    def _threshold(config: dict, name: str, fallback: float) -> float:
-        try:
-            value = float(config.get(name, fallback))
-            return value if np.isfinite(value) else fallback
-        except (TypeError, ValueError):
-            return fallback
-
     @staticmethod
     def rolling_zscore(series: Series, window: int) -> Series:
-        mean = series.rolling(window, min_periods=max(20, window // 3)).mean()
-        std = series.rolling(window, min_periods=max(20, window // 3)).std().replace(0, np.nan)
+        minimum = max(20, window // 3)
+        mean = series.rolling(window, min_periods=minimum).mean()
+        std = series.rolling(window, min_periods=minimum).std().replace(0, np.nan)
         return ((series - mean) / std).clip(lower=-4.0, upper=4.0).fillna(0.0)
 
     @staticmethod
@@ -98,204 +231,435 @@ class FuturesFactorStrategy(IStrategy):
         score = sum(part.clip(lower=0.0, upper=1.0).fillna(0.0) * weight for part, weight in parts)
         return (score / total_weight).clip(lower=0.0, upper=1.0).fillna(0.0)
 
+    @staticmethod
+    def signed_score(positive: Series, negative: Series) -> Series:
+        return (positive.fillna(0.0) - negative.fillna(0.0)).clip(lower=-1.0, upper=1.0)
+
+    @staticmethod
+    def rolling_aroon(series: Series, window: int, high: bool) -> Series:
+        def score(values: np.ndarray) -> float:
+            index = int(np.argmax(values) if high else np.argmin(values))
+            return index / max(len(values) - 1, 1) * 100.0
+
+        return series.rolling(window + 1, min_periods=window).apply(score, raw=True).fillna(50.0)
+
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         close = dataframe["close"]
+        high = dataframe["high"]
+        low = dataframe["low"]
+        volume = dataframe["volume"]
+        typical = (high + low + close) / 3.0
 
-        dataframe["mom_6"] = close.pct_change(6)
-        dataframe["mom_42"] = close.pct_change(42)
-        dataframe["ret_1"] = np.log(close / close.shift(1))
-        dataframe["realized_vol"] = dataframe["ret_1"].rolling(20, min_periods=20).std()
+        dataframe["ema_8"] = ta.EMA(dataframe, timeperiod=8)
+        dataframe["ema_21"] = ta.EMA(dataframe, timeperiod=21)
+        dataframe["ema_55"] = ta.EMA(dataframe, timeperiod=55)
+        dataframe["ema_144"] = ta.EMA(dataframe, timeperiod=144)
+        dataframe["trend_fast"] = dataframe["ema_8"] / dataframe["ema_21"] - 1.0
+        dataframe["trend_slow"] = dataframe["ema_55"] / dataframe["ema_144"] - 1.0
 
-        dataframe["ema_fast"] = ta.EMA(dataframe, timeperiod=20)
-        dataframe["ema_mid"] = ta.EMA(dataframe, timeperiod=50)
-        dataframe["ema_slow"] = ta.EMA(dataframe, timeperiod=100)
-        dataframe["trend"] = dataframe["ema_fast"] / dataframe["ema_mid"] - 1.0
+        dataframe["ret_1"] = close.pct_change(1)
+        dataframe["ret_3"] = close.pct_change(3)
+        dataframe["ret_12"] = close.pct_change(12)
+        dataframe["ret_48"] = close.pct_change(48)
+        dataframe["realized_vol"] = dataframe["ret_1"].rolling(32, min_periods=16).std() * np.sqrt(96)
 
         dataframe["adx"] = ta.ADX(dataframe, timeperiod=14)
         dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)
+        dataframe["cci"] = ta.CCI(dataframe, timeperiod=20)
         macd = ta.MACD(dataframe, fastperiod=12, slowperiod=26, signalperiod=9)
         dataframe["macd_hist"] = macd["macdhist"]
+        dataframe["atr_pct"] = (ta.ATR(dataframe, timeperiod=14) / close).replace([np.inf, -np.inf], np.nan)
+        dataframe["volume_ratio"] = volume / volume.rolling(48, min_periods=24).mean() - 1.0
 
-        dataframe["atr_pct"] = ta.ATR(dataframe, timeperiod=14) / close
-        dataframe["volume_ratio"] = dataframe["volume"] / dataframe["volume"].rolling(42).mean() - 1.0
+        cumulative_volume = volume.rolling(96, min_periods=24).sum().replace(0, np.nan)
+        dataframe["rolling_vwap"] = (typical * volume).rolling(96, min_periods=24).sum() / cumulative_volume
+        dataframe["vwap_distance"] = close / dataframe["rolling_vwap"] - 1.0
 
-        dataframe["donchian_high"] = dataframe["high"].rolling(55, min_periods=55).max().shift(1)
-        dataframe["donchian_low"] = dataframe["low"].rolling(55, min_periods=55).min().shift(1)
-        donchian_range = (dataframe["donchian_high"] - dataframe["donchian_low"]).replace(0, np.nan)
+        dataframe["donchian_high_32"] = high.rolling(32, min_periods=32).max().shift(1)
+        dataframe["donchian_low_32"] = low.rolling(32, min_periods=32).min().shift(1)
+        dataframe["donchian_high_96"] = high.rolling(96, min_periods=48).max().shift(1)
+        dataframe["donchian_low_96"] = low.rolling(96, min_periods=48).min().shift(1)
+        donchian_range = (dataframe["donchian_high_96"] - dataframe["donchian_low_96"]).replace(0, np.nan)
         dataframe["breakout_position"] = (
-            (close - (dataframe["donchian_high"] + dataframe["donchian_low"]) * 0.5)
+            (close - (dataframe["donchian_high_96"] + dataframe["donchian_low_96"]) * 0.5)
             / donchian_range
             * 2.0
         ).clip(lower=-1.5, upper=1.5)
-        candle_range = (dataframe["high"] - dataframe["low"]).replace(0, np.nan)
-        dataframe["close_location"] = ((close - dataframe["low"]) / candle_range * 2.0 - 1.0).clip(
+        candle_range = (high - low).replace(0, np.nan)
+        dataframe["close_location"] = ((close - low) / candle_range * 2.0 - 1.0).clip(
             lower=-1.0,
             upper=1.0,
         )
 
-        trend_scale = dataframe["atr_pct"].clip(lower=0.003) * 4.0
+        bands = ta.BBANDS(dataframe, timeperiod=20, nbdevup=2.0, nbdevdn=2.0)
+        dataframe["bb_width"] = (bands["upperband"] - bands["lowerband"]) / bands["middleband"]
+        dataframe["bb_z"] = ((close - bands["middleband"]) / (bands["upperband"] - bands["lowerband"])).clip(
+            lower=-2.0,
+            upper=2.0,
+        )
+        rsi_low = dataframe["rsi"].rolling(14, min_periods=8).min()
+        rsi_high = dataframe["rsi"].rolling(14, min_periods=8).max()
+        dataframe["stoch_rsi"] = ((dataframe["rsi"] - rsi_low) / (rsi_high - rsi_low).replace(0, np.nan)).fillna(0.5)
+        dataframe["aroon_up"] = self.rolling_aroon(high, 25, True)
+        dataframe["aroon_down"] = self.rolling_aroon(low, 25, False)
+        dataframe["aroon_osc"] = (dataframe["aroon_up"] - dataframe["aroon_down"]) / 100.0
+
+        dataframe["price_volume_corr"] = dataframe["ret_3"].rolling(24, min_periods=12).corr(
+            dataframe["volume_ratio"]
+        )
+        dataframe["liquidity_impulse"] = self.rolling_zscore(volume * candle_range / close, 96)
+        dataframe["volatility_squeeze"] = -self.rolling_zscore(dataframe["bb_width"], 96)
+        dataframe["range_absorption"] = (
+            dataframe["volume_ratio"].clip(lower=-1.0, upper=3.0)
+            * (1.0 - dataframe["close_location"].abs()).clip(lower=0.0, upper=1.0)
+        )
+
+        trend_scale = dataframe["atr_pct"].clip(lower=0.002) * 3.5
         trend_long = self.weighted_score(
             [
-                ((close > dataframe["ema_fast"]).astype(float), 0.18),
-                ((dataframe["ema_fast"] > dataframe["ema_mid"]).astype(float), 0.24),
-                ((dataframe["ema_mid"] > dataframe["ema_slow"]).astype(float), 0.18),
-                (self.bounded(dataframe["adx"], 16.0, 35.0), 0.25),
-                ((dataframe["trend"] / trend_scale).clip(lower=0.0, upper=1.0), 0.15),
+                ((close > dataframe["ema_8"]).astype(float), 0.10),
+                ((dataframe["ema_8"] > dataframe["ema_21"]).astype(float), 0.16),
+                ((dataframe["ema_21"] > dataframe["ema_55"]).astype(float), 0.16),
+                ((dataframe["ema_55"] > dataframe["ema_144"]).astype(float), 0.10),
+                (self.bounded(dataframe["adx"], 10.0, 32.0), 0.22),
+                ((dataframe["trend_fast"] / trend_scale).clip(lower=0.0, upper=1.0), 0.14),
+                (self.bounded(dataframe["aroon_osc"], 0.0, 0.65), 0.12),
             ]
         )
         trend_short = self.weighted_score(
             [
-                ((close < dataframe["ema_fast"]).astype(float), 0.18),
-                ((dataframe["ema_fast"] < dataframe["ema_mid"]).astype(float), 0.24),
-                ((dataframe["ema_mid"] < dataframe["ema_slow"]).astype(float), 0.18),
-                (self.bounded(dataframe["adx"], 16.0, 35.0), 0.25),
-                ((-dataframe["trend"] / trend_scale).clip(lower=0.0, upper=1.0), 0.15),
+                ((close < dataframe["ema_8"]).astype(float), 0.10),
+                ((dataframe["ema_8"] < dataframe["ema_21"]).astype(float), 0.16),
+                ((dataframe["ema_21"] < dataframe["ema_55"]).astype(float), 0.16),
+                ((dataframe["ema_55"] < dataframe["ema_144"]).astype(float), 0.10),
+                (self.bounded(dataframe["adx"], 10.0, 32.0), 0.22),
+                ((-dataframe["trend_fast"] / trend_scale).clip(lower=0.0, upper=1.0), 0.14),
+                (self.bounded(-dataframe["aroon_osc"], 0.0, 0.65), 0.12),
             ]
         )
 
-        macd_zscore = self.rolling_zscore(dataframe["macd_hist"], 126)
+        macd_zscore = self.rolling_zscore(dataframe["macd_hist"], 96)
         momentum_long = self.weighted_score(
             [
-                (self.bounded(dataframe["mom_6"], 0.0, 0.018), 0.30),
-                (self.bounded(dataframe["mom_42"], 0.0, 0.060), 0.30),
-                (self.bounded(macd_zscore, 0.0, 2.0), 0.25),
-                ((dataframe["macd_hist"] > 0).astype(float), 0.15),
+                (self.bounded(dataframe["ret_3"], 0.0, 0.012), 0.22),
+                (self.bounded(dataframe["ret_12"], 0.0, 0.035), 0.24),
+                (self.bounded(dataframe["ret_48"], 0.0, 0.080), 0.16),
+                (self.bounded(macd_zscore, 0.0, 2.0), 0.18),
+                (self.bounded(dataframe["stoch_rsi"], 0.35, 0.85), 0.10),
+                (self.bounded(dataframe["cci"], -40.0, 120.0), 0.10),
             ]
         )
         momentum_short = self.weighted_score(
             [
-                (self.bounded(-dataframe["mom_6"], 0.0, 0.018), 0.30),
-                (self.bounded(-dataframe["mom_42"], 0.0, 0.060), 0.30),
-                (self.bounded(-macd_zscore, 0.0, 2.0), 0.25),
-                ((dataframe["macd_hist"] < 0).astype(float), 0.15),
+                (self.bounded(-dataframe["ret_3"], 0.0, 0.012), 0.22),
+                (self.bounded(-dataframe["ret_12"], 0.0, 0.035), 0.24),
+                (self.bounded(-dataframe["ret_48"], 0.0, 0.080), 0.16),
+                (self.bounded(-macd_zscore, 0.0, 2.0), 0.18),
+                (self.bounded(1.0 - dataframe["stoch_rsi"], 0.35, 0.85), 0.10),
+                (self.bounded(-dataframe["cci"], -40.0, 120.0), 0.10),
             ]
         )
 
-        dataframe["rsi_long"] = self.center_score(dataframe["rsi"], 60.0, 18.0) * self.bounded(
-            dataframe["rsi"],
-            46.0,
-            53.0,
+        dataframe["alpha_liquidity_long"] = self.weighted_score(
+            [
+                (self.bounded(dataframe["liquidity_impulse"], 0.0, 2.2), 0.28),
+                (self.bounded(dataframe["volume_ratio"], -0.35, 1.4), 0.26),
+                (self.bounded(dataframe["close_location"], 0.0, 0.85), 0.20),
+                (self.bounded(dataframe["vwap_distance"], -0.002, 0.014), 0.16),
+                (self.bounded(dataframe["price_volume_corr"], 0.0, 0.75), 0.10),
+            ]
         )
-        dataframe["rsi_short"] = self.center_score(dataframe["rsi"], 40.0, 18.0) * self.bounded(
-            54.0 - dataframe["rsi"],
-            0.0,
-            8.0,
+        dataframe["alpha_liquidity_short"] = self.weighted_score(
+            [
+                (self.bounded(dataframe["liquidity_impulse"], 0.0, 2.2), 0.28),
+                (self.bounded(dataframe["volume_ratio"], -0.35, 1.4), 0.26),
+                (self.bounded(-dataframe["close_location"], 0.0, 0.85), 0.20),
+                (self.bounded(-dataframe["vwap_distance"], -0.002, 0.014), 0.16),
+                (self.bounded(-dataframe["price_volume_corr"], 0.0, 0.75), 0.10),
+            ]
         )
-        dataframe["volume_confirmation"] = self.bounded(dataframe["volume_ratio"], -0.10, 0.85)
+        dataframe["alpha_breakout_long"] = self.weighted_score(
+            [
+                ((close > dataframe["donchian_high_32"]).astype(float), 0.24),
+                (self.bounded(dataframe["breakout_position"], 0.12, 0.85), 0.24),
+                (self.bounded(dataframe["volatility_squeeze"], -0.4, 1.8), 0.18),
+                (self.bounded(dataframe["close_location"], 0.15, 0.95), 0.18),
+                (trend_long, 0.16),
+            ]
+        )
+        dataframe["alpha_breakout_short"] = self.weighted_score(
+            [
+                ((close < dataframe["donchian_low_32"]).astype(float), 0.24),
+                (self.bounded(-dataframe["breakout_position"], 0.12, 0.85), 0.24),
+                (self.bounded(dataframe["volatility_squeeze"], -0.4, 1.8), 0.18),
+                (self.bounded(-dataframe["close_location"], 0.15, 0.95), 0.18),
+                (trend_short, 0.16),
+            ]
+        )
+        dataframe["alpha_reversion_long"] = self.weighted_score(
+            [
+                (self.bounded(-dataframe["bb_z"], 0.18, 1.15), 0.26),
+                (self.center_score(dataframe["rsi"], 43.0, 15.0), 0.22),
+                (self.bounded(dataframe["range_absorption"], 0.10, 1.20), 0.18),
+                (self.bounded(-(close / dataframe["ema_21"] - 1.0), 0.002, 0.025), 0.18),
+                (self.bounded(dataframe["stoch_rsi"], 0.05, 0.35), 0.16),
+            ]
+        )
+        dataframe["alpha_reversion_short"] = self.weighted_score(
+            [
+                (self.bounded(dataframe["bb_z"], 0.18, 1.15), 0.26),
+                (self.center_score(dataframe["rsi"], 57.0, 15.0), 0.22),
+                (self.bounded(dataframe["range_absorption"], 0.10, 1.20), 0.18),
+                (self.bounded(close / dataframe["ema_21"] - 1.0, 0.002, 0.025), 0.18),
+                (self.bounded(1.0 - dataframe["stoch_rsi"], 0.05, 0.35), 0.16),
+            ]
+        )
 
+        dataframe["volume_confirmation"] = self.bounded(dataframe["volume_ratio"], -0.35, 1.25)
         dataframe["volatility_quality"] = 0.0
-        low_vol = (dataframe["atr_pct"] >= 0.0004) & (dataframe["atr_pct"] < 0.0010)
+        low_vol = (dataframe["atr_pct"] >= 0.00045) & (dataframe["atr_pct"] < 0.0010)
         good_vol = (dataframe["atr_pct"] >= 0.0010) & (dataframe["atr_pct"] <= 0.0350)
-        high_vol = (dataframe["atr_pct"] > 0.0350) & (dataframe["atr_pct"] <= 0.0900)
+        high_vol = (dataframe["atr_pct"] > 0.0350) & (dataframe["atr_pct"] <= 0.0800)
         dataframe.loc[low_vol, "volatility_quality"] = self.bounded(
             dataframe.loc[low_vol, "atr_pct"],
-            0.0004,
+            0.00045,
             0.0010,
         )
         dataframe.loc[good_vol, "volatility_quality"] = 1.0
         dataframe.loc[high_vol, "volatility_quality"] = (
-            1.0 - self.bounded(dataframe.loc[high_vol, "atr_pct"], 0.0350, 0.0900) * 0.85
+            1.0 - self.bounded(dataframe.loc[high_vol, "atr_pct"], 0.0350, 0.0800) * 0.80
         )
 
         dataframe["long_score"] = self.weighted_score(
             [
-                (trend_long, 0.25),
-                (momentum_long, 0.20),
-                (dataframe["rsi_long"], 0.14),
-                (self.bounded(dataframe["breakout_position"], 0.20, 0.85), 0.16),
-                (dataframe["volume_confirmation"], 0.12),
-                (dataframe["volatility_quality"], 0.08),
-                (self.bounded(dataframe["close_location"], 0.10, 0.85), 0.05),
+                (trend_long, 0.20),
+                (momentum_long, 0.18),
+                (dataframe["alpha_liquidity_long"], 0.17),
+                (dataframe["alpha_breakout_long"], 0.16),
+                (dataframe["alpha_reversion_long"], 0.09),
+                (dataframe["volume_confirmation"], 0.10),
+                (dataframe["volatility_quality"], 0.07),
+                (self.bounded(dataframe["close_location"], -0.10, 0.90), 0.03),
             ]
         )
         dataframe["short_score"] = self.weighted_score(
             [
-                (trend_short, 0.25),
-                (momentum_short, 0.20),
-                (dataframe["rsi_short"], 0.14),
-                (self.bounded(-dataframe["breakout_position"], 0.20, 0.85), 0.16),
-                (dataframe["volume_confirmation"], 0.12),
-                (dataframe["volatility_quality"], 0.08),
-                (self.bounded(-dataframe["close_location"], 0.10, 0.85), 0.05),
+                (trend_short, 0.20),
+                (momentum_short, 0.18),
+                (dataframe["alpha_liquidity_short"], 0.17),
+                (dataframe["alpha_breakout_short"], 0.16),
+                (dataframe["alpha_reversion_short"], 0.09),
+                (dataframe["volume_confirmation"], 0.10),
+                (dataframe["volatility_quality"], 0.07),
+                (self.bounded(-dataframe["close_location"], -0.10, 0.90), 0.03),
             ]
         )
         dataframe["factor_score"] = dataframe["long_score"] - dataframe["short_score"]
         dataframe["trend_quality"] = np.maximum(trend_long, trend_short)
+        dataframe["regime_score"] = self.signed_score(trend_long, trend_short)
 
         return dataframe.replace([np.inf, -np.inf], np.nan)
 
-    def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        config = self._config()
-        minimum_long_score = self._threshold(config, "minimum_long_score", 0.68)
-        minimum_short_score = self._threshold(config, "minimum_short_score", 0.68)
-        minimum_factor_score = self._threshold(config, "minimum_factor_score", 0.25)
-        minimum_trend_quality = self._threshold(config, "minimum_trend_quality", 0.52)
-        minimum_adx = self._threshold(config, "minimum_adx", 18.0)
-        minimum_volume_ratio = self._threshold(config, "minimum_volume_ratio", 0.0)
-        liquid_market = (
-            (dataframe["volume"] > 0)
-            & (dataframe["atr_pct"] >= 0.0004)
-            & (dataframe["atr_pct"] <= 0.0900)
-            & (dataframe["adx"] >= minimum_adx)
-            & (dataframe["volume_ratio"] >= minimum_volume_ratio)
+    def _threshold(self, name: str, fallback: float) -> float:
+        return self._profile_float(name, fallback)
+
+    def _entry_thresholds(self) -> tuple[float, float, float, float, float, float]:
+        return (
+            self._threshold("minimum_long_score", 0.62),
+            self._threshold("minimum_short_score", 0.62),
+            self._threshold("minimum_factor_score", 0.12),
+            self._threshold("minimum_trend_quality", 0.42),
+            self._threshold("minimum_adx", 10.0),
+            self._threshold("minimum_volume_ratio", -0.35),
         )
 
-        dataframe.loc[
-            liquid_market
-            & (dataframe["long_score"] >= minimum_long_score)
-            & (dataframe["factor_score"] >= minimum_factor_score)
-            & (dataframe["trend_quality"] >= minimum_trend_quality)
-            & (dataframe["rsi"].between(46.0, 76.0))
-            & (dataframe["close"] > dataframe["ema_fast"]),
-            ["enter_long", "enter_tag"],
-        ] = (1, "multi_factor_long")
+    def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        dataframe["enter_long"] = 0
+        dataframe["enter_short"] = 0
+        if dataframe.empty:
+            return dataframe
 
-        dataframe.loc[
-            liquid_market
-            & (dataframe["short_score"] >= minimum_short_score)
-            & (dataframe["factor_score"] <= -minimum_factor_score)
-            & (dataframe["trend_quality"] >= minimum_trend_quality)
-            & (dataframe["rsi"].between(24.0, 54.0))
-            & (dataframe["close"] < dataframe["ema_fast"]),
-            ["enter_short", "enter_tag"],
-        ] = (1, "multi_factor_short")
+        min_long, min_short, min_factor, min_trend, min_adx, min_volume = self._entry_thresholds()
+        long_rsi_min = self._profile_float("long_rsi_min", 34.0)
+        long_rsi_max = self._profile_float("long_rsi_max", 78.0)
+        short_rsi_min = self._profile_float("short_rsi_min", 22.0)
+        short_rsi_max = self._profile_float("short_rsi_max", 66.0)
+        atr_min = self._profile_float("atr_min", 0.00045)
+        atr_max = self._profile_float("atr_max", 0.060)
+        long_vwap_factor = self._profile_float("long_vwap_factor", 0.995)
+        short_vwap_factor = self._profile_float("short_vwap_factor", 1.005)
+        long_conditions = (
+            (dataframe["volume"] > 0)
+            & (dataframe["long_score"] >= min_long)
+            & (dataframe["factor_score"] >= min_factor)
+            & (dataframe["trend_quality"] >= min_trend)
+            & (dataframe["adx"] >= min_adx)
+            & (dataframe["volume_ratio"] >= min_volume)
+            & (dataframe["rsi"].between(long_rsi_min, long_rsi_max))
+            & (dataframe["atr_pct"].between(atr_min, atr_max))
+            & (dataframe["close"] > dataframe["rolling_vwap"] * long_vwap_factor)
+        )
+        short_conditions = (
+            (dataframe["volume"] > 0)
+            & (dataframe["short_score"] >= min_short)
+            & (dataframe["factor_score"] <= -min_factor)
+            & (dataframe["trend_quality"] >= min_trend)
+            & (dataframe["adx"] >= min_adx)
+            & (dataframe["volume_ratio"] >= min_volume)
+            & (dataframe["rsi"].between(short_rsi_min, short_rsi_max))
+            & (dataframe["atr_pct"].between(atr_min, atr_max))
+            & (dataframe["close"] < dataframe["rolling_vwap"] * short_vwap_factor)
+        )
 
+        dataframe.loc[long_conditions, ["enter_long", "enter_tag"]] = (1, "alpha_compound_long")
+        dataframe.loc[short_conditions, ["enter_short", "enter_tag"]] = (1, "alpha_compound_short")
         return dataframe
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        dataframe.loc[
-            (dataframe["volume"] > 0)
-            & (
-                (dataframe["factor_score"] < -0.10)
-                | (dataframe["short_score"] > 0.60)
-                | (dataframe["close"] < dataframe["ema_mid"])
-                | (dataframe["rsi"] > 82)
-            ),
-            ["exit_long", "exit_tag"],
-        ] = (1, "multi_factor_long_exit")
+        dataframe["exit_long"] = 0
+        dataframe["exit_short"] = 0
+        if dataframe.empty:
+            return dataframe
 
-        dataframe.loc[
-            (dataframe["volume"] > 0)
-            & (
-                (dataframe["factor_score"] > 0.10)
-                | (dataframe["long_score"] > 0.60)
-                | (dataframe["close"] > dataframe["ema_mid"])
-                | (dataframe["rsi"] < 18)
-            ),
-            ["exit_short", "exit_tag"],
-        ] = (1, "multi_factor_short_exit")
-
+        flip_threshold = self._profile_float("factor_flip_threshold", 0.12)
+        opposite_exit = self._profile_float("opposite_score_exit", 0.64)
+        long_exit = (
+            (dataframe["factor_score"] < -flip_threshold)
+            | ((dataframe["short_score"] > opposite_exit) & (dataframe["close"] < dataframe["ema_21"]))
+            | ((dataframe["rsi"] > 84.0) & (dataframe["close_location"] < 0.15))
+        )
+        short_exit = (
+            (dataframe["factor_score"] > flip_threshold)
+            | ((dataframe["long_score"] > opposite_exit) & (dataframe["close"] > dataframe["ema_21"]))
+            | ((dataframe["rsi"] < 16.0) & (dataframe["close_location"] > -0.15))
+        )
+        dataframe.loc[long_exit, ["exit_long", "exit_tag"]] = (1, "factor_flip_long_exit")
+        dataframe.loc[short_exit, ["exit_short", "exit_tag"]] = (1, "factor_flip_short_exit")
         return dataframe
 
-    def leverage(
-        self,
-        pair: str,
-        current_time: datetime,
-        current_rate: float,
-        proposed_leverage: float,
-        max_leverage: float,
-        entry_tag: str | None,
-        side: str,
-        **kwargs,
+    def _last_analyzed_row(self, pair: str) -> Series | None:
+        try:
+            dataframe, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
+            if dataframe is None or dataframe.empty:
+                return None
+            return dataframe.iloc[-1]
+        except Exception:
+            return None
+
+    def _side_still_valid(self, row: Series | None, side: str) -> bool:
+        if row is None:
+            return False
+        min_long, min_short, min_factor, min_trend, min_adx, min_volume = self._entry_thresholds()
+        if side == "long":
+            return bool(
+                row.get("long_score", 0.0) >= min_long * 0.92
+                and row.get("factor_score", 0.0) >= min_factor * 0.70
+                and row.get("trend_quality", 0.0) >= min_trend
+                and row.get("adx", 0.0) >= min_adx
+                and row.get("volume_ratio", -1.0) >= min_volume
+            )
+        return bool(
+            row.get("short_score", 0.0) >= min_short * 0.92
+            and row.get("factor_score", 0.0) <= -min_factor * 0.70
+            and row.get("trend_quality", 0.0) >= min_trend
+            and row.get("adx", 0.0) >= min_adx
+            and row.get("volume_ratio", -1.0) >= min_volume
+        )
+
+    def custom_stake_amount(
+        self, pair: str, current_time: datetime, current_rate: float,
+        proposed_stake: float, min_stake: float | None, max_stake: float,
+        leverage: float, entry_tag: str | None, side: str, **kwargs,
     ) -> float:
-        return min(2.0, max_leverage)
+        configured_cap = self._float_setting(
+            "gqt_max_stake_amount",
+            self._float_setting("max_stake_amount", proposed_stake),
+        )
+        usage_percent = self._profile_float("gqt_compound_capital_usage_percent", 12.0)
+        usage_cap = max_stake * usage_percent / 100.0
+        stake = min(configured_cap, usage_cap, max_stake)
+        if min_stake is not None:
+            stake = max(stake, min_stake)
+        return max(0.0, min(stake, max_stake))
+
+    def adjust_trade_position(
+        self, trade, current_time: datetime, current_rate: float, current_profit: float,
+        min_stake: float | None, max_stake: float, current_entry_rate: float,
+        current_exit_rate: float, current_entry_profit: float, current_exit_profit: float,
+        **kwargs,
+    ):
+        if not self._settings().get("gqt_compound_enabled", True):
+            return None
+        add_trigger = self._profile_float("gqt_compound_pyramid_profit", 0.006)
+        take_profit = self._profile_float("gqt_compound_take_profit", 0.018)
+        add_window = self._profile_float("gqt_compound_add_window", 0.85)
+        if current_profit < add_trigger or current_profit > take_profit * add_window:
+            return None
+
+        entries = int(getattr(trade, "nr_of_successful_entries", 1) or 1)
+        if entries >= self.max_entry_position_adjustment + 1:
+            return None
+
+        side = "short" if getattr(trade, "is_short", False) else "long"
+        if not self._side_still_valid(self._last_analyzed_row(trade.pair), side):
+            return None
+
+        ratio = self._profile_float("gqt_compound_pyramid_stake_ratio", 0.45)
+        stake = min(max_stake, float(getattr(trade, "stake_amount", 0.0) or 0.0) * ratio)
+        if min_stake is not None and stake < min_stake:
+            return None
+        if stake <= 0.0:
+            return None
+        return stake, "compound_roll_add"
+
+    def custom_exit(
+        self, pair: str, trade, current_time: datetime, current_rate: float,
+        current_profit: float, **kwargs,
+    ) -> str | None:
+        take_profit = self._profile_float("gqt_compound_take_profit", 0.018)
+        stop_loss = self._profile_float("gqt_compound_stop_loss", 0.014)
+        if current_profit >= take_profit:
+            return "compound_take_profit"
+        if current_profit <= -stop_loss:
+            return "compound_cut_loss"
+
+        row = self._last_analyzed_row(pair)
+        side = "short" if getattr(trade, "is_short", False) else "long"
+        flip_threshold = self._profile_float("factor_flip_threshold", 0.12)
+        opposite_exit = self._profile_float("opposite_score_exit", 0.64)
+        if row is not None:
+            if side == "long" and (
+                row.get("factor_score", 0.0) < -flip_threshold
+                or row.get("short_score", 0.0) > opposite_exit
+                or row.get("close", 0.0) < row.get("ema_55", 0.0)
+            ):
+                return "compound_factor_flip_long"
+            if side == "short" and (
+                row.get("factor_score", 0.0) > flip_threshold
+                or row.get("long_score", 0.0) > opposite_exit
+                or row.get("close", 0.0) > row.get("ema_55", 0.0)
+            ):
+                return "compound_factor_flip_short"
+
+        open_date = getattr(trade, "open_date_utc", None)
+        if open_date is not None and open_date.tzinfo is None:
+            open_date = open_date.replace(tzinfo=timezone.utc)
+        if open_date is not None:
+            age_hours = (current_time - open_date).total_seconds() / 3600.0
+            if (
+                age_hours >= self._profile_float("time_roll_hours", 12.0)
+                and current_profit >= self._profile_float("time_roll_profit", 0.002)
+            ):
+                return "compound_time_roll"
+        return None
+
+    def leverage(
+        self, pair: str, current_time: datetime, current_rate: float,
+        proposed_leverage: float, max_leverage: float, entry_tag: str | None,
+        side: str, **kwargs,
+    ) -> float:
+        requested = self._profile_float(
+            "gqt_compound_leverage",
+            self._float_setting("leverage", 2.0),
+        )
+        return max(1.0, min(requested, max_leverage, 3.0))
