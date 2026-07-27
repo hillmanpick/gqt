@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -34,7 +34,11 @@ class AiSignalStrategy(IStrategy):
             return {}
 
     def _config(self) -> dict:
-        return self._read_json("ai_config.json")
+        config = self._read_json("ai_config.json")
+        runtime_config = getattr(self, "config", {})
+        if isinstance(runtime_config, dict):
+            config.update(runtime_config)
+        return config
 
     @staticmethod
     def _float(value, fallback: float) -> float:
@@ -43,6 +47,191 @@ class AiSignalStrategy(IStrategy):
             return parsed if parsed == parsed else fallback
         except (TypeError, ValueError):
             return fallback
+
+    @staticmethod
+    def _bool(value, fallback: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            value = value.strip().lower()
+            if value in {"1", "true", "yes", "on"}:
+                return True
+            if value in {"0", "false", "no", "off"}:
+                return False
+        return fallback
+
+    def _round_trip_cost_floor(self) -> float:
+        config = self._config()
+        fee_rate = max(0.0, self._float(config.get("gqt_fee_rate"), 0.0005))
+        slippage_rate = max(0.0, self._float(config.get("gqt_slippage_rate"), 0.0002))
+        leverage = max(1.0, self._float(config.get("gqt_compound_leverage", config.get("leverage")), 1.0))
+        return 2.0 * (fee_rate + slippage_rate) * leverage
+
+    def _daily_lock_path(self) -> Path:
+        return self._user_data / "gqt_daily_profit_lock.json"
+
+    @staticmethod
+    def _as_utc(value) -> datetime:
+        if hasattr(value, "to_pydatetime"):
+            value = value.to_pydatetime()
+        if not isinstance(value, datetime):
+            return datetime.now(timezone.utc)
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    def _day_start(self, current_time: datetime) -> datetime:
+        current_time = self._as_utc(current_time)
+        offset = self._daily_timezone_offset()
+        local_time = current_time + offset
+        local_midnight = datetime(
+            local_time.year,
+            local_time.month,
+            local_time.day,
+            tzinfo=timezone.utc,
+        )
+        return local_midnight - offset
+
+    def _daily_day_label(self, current_time: datetime) -> str:
+        current_time = self._as_utc(current_time)
+        return (current_time + self._daily_timezone_offset()).date().isoformat()
+
+    def _daily_timezone_offset(self) -> timedelta:
+        config = self._config()
+        hours = self._float(config.get("gqt_daily_profit_timezone_offset_hours"), 8.0)
+        hours = max(-12.0, min(hours, 14.0))
+        return timedelta(hours=hours)
+
+    def _utc_day_start(self, current_time: datetime) -> datetime:
+        current_time = self._as_utc(current_time)
+        return datetime(
+            current_time.year,
+            current_time.month,
+            current_time.day,
+            tzinfo=timezone.utc,
+        )
+
+    def _account_equity(self) -> float | None:
+        config = self._config()
+        wallets = getattr(self, "wallets", None)
+        stake_currency = str(config.get("stake_currency", "USDT"))
+        if wallets is not None:
+            for method_name, args in (
+                ("get_total", (stake_currency,)),
+                ("get_total_stake_amount", ()),
+            ):
+                method = getattr(wallets, method_name, None)
+                if callable(method):
+                    try:
+                        value = self._float(method(*args), 0.0)
+                        if value > 0.0:
+                            return value
+                    except Exception:
+                        pass
+        wallet = self._float(config.get("dry_run_wallet"), 0.0)
+        if wallet > 0.0:
+            return wallet + self._daily_realized_profit_abs(datetime.now(timezone.utc))
+        return None
+
+    def _daily_realized_profit_abs(self, current_time: datetime) -> float:
+        try:
+            from freqtrade.persistence import Trade
+
+            start = self._day_start(current_time)
+            try:
+                trades = Trade.get_trades_proxy(is_open=False, close_date=start)
+            except TypeError:
+                trades = Trade.get_trades_proxy(
+                    is_open=False,
+                    close_date=start.replace(tzinfo=None),
+                )
+            total = 0.0
+            for trade in trades:
+                total += self._float(
+                    getattr(trade, "close_profit_abs", None),
+                    self._float(getattr(trade, "realized_profit", 0.0), 0.0),
+                )
+            return total
+        except Exception:
+            return 0.0
+
+    def _trade_profit_abs(self, trade, current_profit: float) -> float:
+        stake = self._float(getattr(trade, "stake_amount", 0.0), 0.0)
+        return max(0.0, stake * current_profit)
+
+    def _read_daily_lock_state(self) -> dict:
+        cached = getattr(self, "_daily_lock_cache", None)
+        if isinstance(cached, dict):
+            return cached
+        state = self._read_json("gqt_daily_profit_lock.json")
+        setattr(self, "_daily_lock_cache", state)
+        return state
+
+    def _write_daily_lock_state(self, state: dict) -> None:
+        setattr(self, "_daily_lock_cache", state)
+        try:
+            self._daily_lock_path().write_text(
+                json.dumps(state, ensure_ascii=True, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    def _daily_lock_state(self, current_time: datetime) -> dict:
+        config = self._config()
+        current_time = self._as_utc(current_time)
+        day = self._daily_day_label(current_time)
+        state = self._read_daily_lock_state()
+        if state.get("date") == day and self._float(state.get("start_balance"), 0.0) > 0.0:
+            return state
+
+        equity = self._account_equity()
+        realized = self._daily_realized_profit_abs(current_time)
+        start_balance = (equity - realized) if equity is not None else 0.0
+        if not np.isfinite(start_balance) or start_balance <= 0.0:
+            start_balance = max(equity or 0.0, self._float(config.get("dry_run_wallet"), 1000.0))
+        state = {
+            "date": day,
+            "start_balance": start_balance,
+            "locked": False,
+            "target": self._float(config.get("gqt_daily_profit_target"), 0.10),
+        }
+        self._write_daily_lock_state(state)
+        return state
+
+    def _daily_profit_ratio(self, current_time: datetime, extra_profit_abs: float = 0.0) -> float:
+        state = self._daily_lock_state(current_time)
+        start_balance = self._float(state.get("start_balance"), 0.0)
+        if start_balance <= 0.0:
+            return 0.0
+        equity = self._account_equity()
+        if equity is None:
+            equity = start_balance + self._daily_realized_profit_abs(current_time)
+        return (equity + extra_profit_abs - start_balance) / start_balance
+
+    def _daily_target_reached(self, current_time: datetime, extra_profit_abs: float = 0.0) -> bool:
+        config = self._config()
+        if not self._bool(config.get("gqt_daily_profit_lock_enabled"), True):
+            return False
+        state = self._daily_lock_state(current_time)
+        if state.get("locked") is True:
+            return True
+        target = max(0.0, self._float(config.get("gqt_daily_profit_target"), 0.10))
+        if target <= 0.0:
+            return False
+        ratio = self._daily_profit_ratio(current_time, extra_profit_abs)
+        if ratio >= target:
+            state.update(
+                {
+                    "locked": True,
+                    "locked_at": self._as_utc(current_time).isoformat(),
+                    "profit_ratio": ratio,
+                    "target": target,
+                }
+            )
+            self._write_daily_lock_state(state)
+            return True
+        return False
 
     @staticmethod
     def bounded(series: Series, low: float, high: float) -> Series:
@@ -299,7 +488,11 @@ class AiSignalStrategy(IStrategy):
         side: str, **kwargs,
     ) -> bool:
         signal = self._valid_signal(pair)
-        return signal is not None and entry_tag == f'ai:{signal["decision_id"]}'
+        return (
+            signal is not None
+            and entry_tag == f'ai:{signal["decision_id"]}'
+            and not self._daily_target_reached(current_time)
+        )
 
     def custom_stake_amount(
         self, pair: str, current_time: datetime, current_rate: float,
@@ -321,12 +514,22 @@ class AiSignalStrategy(IStrategy):
         self, pair: str, trade, current_time: datetime, current_rate: float,
         current_profit: float, **kwargs,
     ) -> str | None:
+        config = self._config()
+        force_exit = self._bool(config.get("gqt_daily_profit_force_exit"), True)
+        extra_profit = self._trade_profit_abs(trade, current_profit)
+        if force_exit and self._daily_target_reached(current_time, extra_profit):
+            return "daily_profit_target_lock"
+
         signal = self._signal(pair)
         stop_loss = self._float(
             signal.get("stop_loss_percent") if signal else None,
             1.5,
         ) / 100.0
-        reward = stop_loss * self._float(self._config().get("risk_reward_ratio"), 1.4)
+        min_net_profit = max(0.0, self._float(config.get("gqt_min_net_profit"), 0.006))
+        reward = max(
+            stop_loss * self._float(config.get("risk_reward_ratio"), 1.4),
+            self._round_trip_cost_floor() + min_net_profit,
+        )
         if current_profit >= reward:
             return "ai_risk_reward_take_profit"
         if current_profit <= -stop_loss:
@@ -338,5 +541,6 @@ class AiSignalStrategy(IStrategy):
         proposed_leverage: float, max_leverage: float, entry_tag: str | None,
         side: str, **kwargs,
     ) -> float:
-        requested = float(self._config().get("leverage", 1))
-        return max(1.0, min(requested, max_leverage, 125.0))
+        config = self._config()
+        requested = self._float(config.get("gqt_compound_leverage", config.get("leverage")), 1.0)
+        return max(1.0, min(requested, max_leverage))

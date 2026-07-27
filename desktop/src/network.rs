@@ -6,8 +6,7 @@ use std::{
 use anyhow::{Context, Result};
 use reqwest::blocking::{Client, ClientBuilder};
 
-const LOCAL_PROXY: &str = "http://127.0.0.1:10808";
-const LOCAL_PROXY_ADDRESS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10808);
+const LOCAL_PROXY_PORTS: [u16; 7] = [7890, 7897, 7899, 10808, 10809, 20170, 20171];
 
 pub fn client(timeout: Duration) -> Result<Client> {
     client_builder(timeout)
@@ -41,9 +40,26 @@ pub fn configured_proxy() -> Option<String> {
         }
     }
 
-    TcpStream::connect_timeout(&LOCAL_PROXY_ADDRESS, Duration::from_millis(250))
-        .is_ok()
-        .then(|| LOCAL_PROXY.to_string())
+    detected_local_proxy()
+}
+
+pub fn configured_docker_proxy() -> Option<String> {
+    configured_proxy().map(|proxy| proxy_for_docker(&proxy))
+}
+
+fn detected_local_proxy() -> Option<String> {
+    LOCAL_PROXY_PORTS.iter().find_map(|port| {
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), *port);
+        TcpStream::connect_timeout(&address, Duration::from_millis(250))
+            .is_ok()
+            .then(|| format!("http://127.0.0.1:{port}"))
+    })
+}
+
+fn proxy_for_docker(proxy: &str) -> String {
+    proxy
+        .replace("://127.0.0.1:", "://host.docker.internal:")
+        .replace("://localhost:", "://host.docker.internal:")
 }
 
 #[cfg(test)]
@@ -52,6 +68,24 @@ mod tests {
 
     #[test]
     fn local_proxy_url_is_valid() {
-        assert!(reqwest::Proxy::all(LOCAL_PROXY).is_ok());
+        for port in LOCAL_PROXY_PORTS {
+            assert!(reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).is_ok());
+        }
+    }
+
+    #[test]
+    fn rewrites_loopback_proxy_for_docker() {
+        assert_eq!(
+            proxy_for_docker("http://127.0.0.1:7890"),
+            "http://host.docker.internal:7890"
+        );
+        assert_eq!(
+            proxy_for_docker("http://localhost:10808"),
+            "http://host.docker.internal:10808"
+        );
+        assert_eq!(
+            proxy_for_docker("http://10.0.0.2:7890"),
+            "http://10.0.0.2:7890"
+        );
     }
 }

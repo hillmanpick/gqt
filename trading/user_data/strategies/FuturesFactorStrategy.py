@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +38,15 @@ PROFILE_DEFAULTS = {
         "gqt_compound_pyramid_stake_ratio": 0.30,
         "gqt_compound_leverage": 2.0,
         "gqt_compound_add_window": 0.78,
+        "gqt_fee_rate": 0.0005,
+        "gqt_slippage_rate": 0.0002,
+        "gqt_min_net_profit": 0.0040,
+        "gqt_min_pyramid_net_profit": 0.0025,
+        "gqt_time_roll_net_profit": 0.0025,
+        "gqt_daily_profit_lock_enabled": True,
+        "gqt_daily_profit_force_exit": True,
+        "gqt_daily_profit_target": 0.10,
+        "gqt_daily_profit_timezone_offset_hours": 8.0,
         "factor_flip_threshold": 0.10,
         "opposite_score_exit": 0.62,
         "time_roll_hours": 8.0,
@@ -70,6 +79,15 @@ PROFILE_DEFAULTS = {
         "gqt_compound_pyramid_stake_ratio": 0.45,
         "gqt_compound_leverage": 2.0,
         "gqt_compound_add_window": 0.85,
+        "gqt_fee_rate": 0.0005,
+        "gqt_slippage_rate": 0.0002,
+        "gqt_min_net_profit": 0.0060,
+        "gqt_min_pyramid_net_profit": 0.0025,
+        "gqt_time_roll_net_profit": 0.0025,
+        "gqt_daily_profit_lock_enabled": True,
+        "gqt_daily_profit_force_exit": True,
+        "gqt_daily_profit_target": 0.10,
+        "gqt_daily_profit_timezone_offset_hours": 8.0,
         "factor_flip_threshold": 0.12,
         "opposite_score_exit": 0.64,
         "time_roll_hours": 12.0,
@@ -102,6 +120,15 @@ PROFILE_DEFAULTS = {
         "gqt_compound_pyramid_stake_ratio": 0.60,
         "gqt_compound_leverage": 3.0,
         "gqt_compound_add_window": 0.92,
+        "gqt_fee_rate": 0.0005,
+        "gqt_slippage_rate": 0.0003,
+        "gqt_min_net_profit": 0.0035,
+        "gqt_min_pyramid_net_profit": 0.0015,
+        "gqt_time_roll_net_profit": 0.0015,
+        "gqt_daily_profit_lock_enabled": True,
+        "gqt_daily_profit_force_exit": True,
+        "gqt_daily_profit_target": 0.10,
+        "gqt_daily_profit_timezone_offset_hours": 8.0,
         "factor_flip_threshold": 0.08,
         "opposite_score_exit": 0.58,
         "time_roll_hours": 6.0,
@@ -203,6 +230,236 @@ class FuturesFactorStrategy(IStrategy):
 
     def _profile_int(self, name: str, fallback: int) -> int:
         return int(round(self._profile_float(name, float(fallback))))
+
+    @staticmethod
+    def _bool(value, fallback: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            value = value.strip().lower()
+            if value in {"1", "true", "yes", "on"}:
+                return True
+            if value in {"0", "false", "no", "off"}:
+                return False
+        return fallback
+
+    def _profile_bool(self, name: str, fallback: bool) -> bool:
+        profile_value = self._profile().get(name, fallback)
+        return self._bool(self._settings().get(name), self._bool(profile_value, fallback))
+
+    def _cost_leverage(self) -> float:
+        requested = self._profile_float(
+            "gqt_compound_leverage",
+            self._float_setting("leverage", 2.0),
+        )
+        return max(1.0, requested)
+
+    def _round_trip_cost_floor(self) -> float:
+        fee_rate = max(0.0, self._profile_float("gqt_fee_rate", 0.0005))
+        slippage_rate = max(0.0, self._profile_float("gqt_slippage_rate", 0.0002))
+        return 2.0 * (fee_rate + slippage_rate) * self._cost_leverage()
+
+    def _cost_adjusted_profit_floor(
+        self,
+        profit_name: str,
+        profit_fallback: float,
+        net_name: str,
+        net_fallback: float,
+    ) -> float:
+        raw_target = self._profile_float(profit_name, profit_fallback)
+        net_buffer = max(0.0, self._profile_float(net_name, net_fallback))
+        return max(raw_target, self._round_trip_cost_floor() + net_buffer)
+
+    def _take_profit_target(self) -> float:
+        return self._cost_adjusted_profit_floor(
+            "gqt_compound_take_profit",
+            0.018,
+            "gqt_min_net_profit",
+            0.0060,
+        )
+
+    def _pyramid_profit_trigger(self) -> float:
+        return self._cost_adjusted_profit_floor(
+            "gqt_compound_pyramid_profit",
+            0.006,
+            "gqt_min_pyramid_net_profit",
+            0.0025,
+        )
+
+    def _time_roll_profit_target(self) -> float:
+        return self._cost_adjusted_profit_floor(
+            "time_roll_profit",
+            0.002,
+            "gqt_time_roll_net_profit",
+            0.0025,
+        )
+
+    def _daily_lock_path(self) -> Path:
+        return self._user_data / "gqt_daily_profit_lock.json"
+
+    @staticmethod
+    def _as_utc(value) -> datetime:
+        if hasattr(value, "to_pydatetime"):
+            value = value.to_pydatetime()
+        if not isinstance(value, datetime):
+            return datetime.now(timezone.utc)
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    def _day_start(self, current_time: datetime) -> datetime:
+        current_time = self._as_utc(current_time)
+        offset = self._daily_timezone_offset()
+        local_time = current_time + offset
+        local_midnight = datetime(
+            local_time.year,
+            local_time.month,
+            local_time.day,
+            tzinfo=timezone.utc,
+        )
+        return local_midnight - offset
+
+    def _daily_day_label(self, current_time: datetime) -> str:
+        current_time = self._as_utc(current_time)
+        return (current_time + self._daily_timezone_offset()).date().isoformat()
+
+    def _daily_timezone_offset(self) -> timedelta:
+        hours = self._profile_float("gqt_daily_profit_timezone_offset_hours", 8.0)
+        hours = max(-12.0, min(hours, 14.0))
+        return timedelta(hours=hours)
+
+    def _utc_day_start(self, current_time: datetime) -> datetime:
+        current_time = self._as_utc(current_time)
+        return datetime(
+            current_time.year,
+            current_time.month,
+            current_time.day,
+            tzinfo=timezone.utc,
+        )
+
+    def _dataframe_time(self, dataframe: DataFrame) -> datetime:
+        if "date" in dataframe.columns and not dataframe.empty:
+            return self._as_utc(dataframe["date"].iloc[-1])
+        return datetime.now(timezone.utc)
+
+    def _account_equity(self) -> float | None:
+        wallets = getattr(self, "wallets", None)
+        stake_currency = str(self._settings().get("stake_currency", "USDT"))
+        if wallets is not None:
+            for method_name, args in (
+                ("get_total", (stake_currency,)),
+                ("get_total_stake_amount", ()),
+            ):
+                method = getattr(wallets, method_name, None)
+                if callable(method):
+                    try:
+                        value = self._float(method(*args), 0.0)
+                        if value > 0.0:
+                            return value
+                    except Exception:
+                        pass
+        wallet = self._float_setting("dry_run_wallet", 0.0)
+        if wallet > 0.0:
+            return wallet + self._daily_realized_profit_abs(datetime.now(timezone.utc))
+        return None
+
+    def _daily_realized_profit_abs(self, current_time: datetime) -> float:
+        try:
+            from freqtrade.persistence import Trade
+
+            start = self._day_start(current_time)
+            try:
+                trades = Trade.get_trades_proxy(is_open=False, close_date=start)
+            except TypeError:
+                trades = Trade.get_trades_proxy(
+                    is_open=False,
+                    close_date=start.replace(tzinfo=None),
+                )
+            total = 0.0
+            for trade in trades:
+                total += self._float(
+                    getattr(trade, "close_profit_abs", None),
+                    self._float(getattr(trade, "realized_profit", 0.0), 0.0),
+                )
+            return total
+        except Exception:
+            return 0.0
+
+    def _trade_profit_abs(self, trade, current_profit: float) -> float:
+        stake = self._float(getattr(trade, "stake_amount", 0.0), 0.0)
+        return max(0.0, stake * current_profit)
+
+    def _read_daily_lock_state(self) -> dict:
+        cached = getattr(self, "_daily_lock_cache", None)
+        if isinstance(cached, dict):
+            return cached
+        state = self._read_json("gqt_daily_profit_lock.json")
+        setattr(self, "_daily_lock_cache", state)
+        return state
+
+    def _write_daily_lock_state(self, state: dict) -> None:
+        setattr(self, "_daily_lock_cache", state)
+        try:
+            self._daily_lock_path().write_text(
+                json.dumps(state, ensure_ascii=True, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    def _daily_lock_state(self, current_time: datetime) -> dict:
+        current_time = self._as_utc(current_time)
+        day = self._daily_day_label(current_time)
+        state = self._read_daily_lock_state()
+        if state.get("date") == day and self._float(state.get("start_balance"), 0.0) > 0.0:
+            return state
+
+        equity = self._account_equity()
+        realized = self._daily_realized_profit_abs(current_time)
+        start_balance = (equity - realized) if equity is not None else 0.0
+        if not np.isfinite(start_balance) or start_balance <= 0.0:
+            start_balance = max(equity or 0.0, self._float_setting("dry_run_wallet", 1000.0))
+        state = {
+            "date": day,
+            "start_balance": start_balance,
+            "locked": False,
+            "target": self._profile_float("gqt_daily_profit_target", 0.10),
+        }
+        self._write_daily_lock_state(state)
+        return state
+
+    def _daily_profit_ratio(self, current_time: datetime, extra_profit_abs: float = 0.0) -> float:
+        state = self._daily_lock_state(current_time)
+        start_balance = self._float(state.get("start_balance"), 0.0)
+        if start_balance <= 0.0:
+            return 0.0
+        equity = self._account_equity()
+        if equity is None:
+            equity = start_balance + self._daily_realized_profit_abs(current_time)
+        return (equity + extra_profit_abs - start_balance) / start_balance
+
+    def _daily_target_reached(self, current_time: datetime, extra_profit_abs: float = 0.0) -> bool:
+        if not self._profile_bool("gqt_daily_profit_lock_enabled", True):
+            return False
+        state = self._daily_lock_state(current_time)
+        if state.get("locked") is True:
+            return True
+        target = max(0.0, self._profile_float("gqt_daily_profit_target", 0.10))
+        if target <= 0.0:
+            return False
+        ratio = self._daily_profit_ratio(current_time, extra_profit_abs)
+        if ratio >= target:
+            state.update(
+                {
+                    "locked": True,
+                    "locked_at": self._as_utc(current_time).isoformat(),
+                    "profit_ratio": ratio,
+                    "target": target,
+                }
+            )
+            self._write_daily_lock_state(state)
+            return True
+        return False
 
     @staticmethod
     def bounded(series: Series, low: float, high: float) -> Series:
@@ -478,6 +735,8 @@ class FuturesFactorStrategy(IStrategy):
         dataframe["enter_short"] = 0
         if dataframe.empty:
             return dataframe
+        if self._daily_target_reached(self._dataframe_time(dataframe)):
+            return dataframe
 
         min_long, min_short, min_factor, min_trend, min_adx, min_volume = self._entry_thresholds()
         long_rsi_min = self._profile_float("long_rsi_min", 34.0)
@@ -566,6 +825,13 @@ class FuturesFactorStrategy(IStrategy):
             and row.get("volume_ratio", -1.0) >= min_volume
         )
 
+    def confirm_trade_entry(
+        self, pair: str, order_type: str, amount: float, rate: float,
+        time_in_force: str, current_time: datetime, entry_tag: str | None,
+        side: str, **kwargs,
+    ) -> bool:
+        return not self._daily_target_reached(current_time)
+
     def custom_stake_amount(
         self, pair: str, current_time: datetime, current_rate: float,
         proposed_stake: float, min_stake: float | None, max_stake: float,
@@ -590,8 +856,10 @@ class FuturesFactorStrategy(IStrategy):
     ):
         if not self._settings().get("gqt_compound_enabled", True):
             return None
-        add_trigger = self._profile_float("gqt_compound_pyramid_profit", 0.006)
-        take_profit = self._profile_float("gqt_compound_take_profit", 0.018)
+        if self._daily_target_reached(current_time):
+            return None
+        add_trigger = self._pyramid_profit_trigger()
+        take_profit = self._take_profit_target()
         add_window = self._profile_float("gqt_compound_add_window", 0.85)
         if current_profit < add_trigger or current_profit > take_profit * add_window:
             return None
@@ -616,7 +884,12 @@ class FuturesFactorStrategy(IStrategy):
         self, pair: str, trade, current_time: datetime, current_rate: float,
         current_profit: float, **kwargs,
     ) -> str | None:
-        take_profit = self._profile_float("gqt_compound_take_profit", 0.018)
+        force_exit = self._profile_bool("gqt_daily_profit_force_exit", True)
+        extra_profit = self._trade_profit_abs(trade, current_profit)
+        if force_exit and self._daily_target_reached(current_time, extra_profit):
+            return "daily_profit_target_lock"
+
+        take_profit = self._take_profit_target()
         stop_loss = self._profile_float("gqt_compound_stop_loss", 0.014)
         if current_profit >= take_profit:
             return "compound_take_profit"
@@ -648,7 +921,7 @@ class FuturesFactorStrategy(IStrategy):
             age_hours = (current_time - open_date).total_seconds() / 3600.0
             if (
                 age_hours >= self._profile_float("time_roll_hours", 12.0)
-                and current_profit >= self._profile_float("time_roll_profit", 0.002)
+                and current_profit >= self._time_roll_profit_target()
             ):
                 return "compound_time_roll"
         return None
@@ -662,4 +935,4 @@ class FuturesFactorStrategy(IStrategy):
             "gqt_compound_leverage",
             self._float_setting("leverage", 2.0),
         )
-        return max(1.0, min(requested, max_leverage, 3.0))
+        return max(1.0, min(requested, max_leverage))

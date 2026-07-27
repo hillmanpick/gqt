@@ -49,6 +49,7 @@ impl TradingWorkspace {
         write_if_missing(&strategy, DEFAULT_STRATEGY)?;
         migrate_default_strategy(&strategy)?;
         write_if_missing(&ai_strategy, DEFAULT_AI_STRATEGY)?;
+        migrate_ai_strategy(&ai_strategy)?;
         write_if_missing(&ai_config, DEFAULT_AI_CONFIG)?;
         migrate_ai_config(&ai_config)?;
         write_if_missing(&compose, DEFAULT_COMPOSE)?;
@@ -92,14 +93,27 @@ impl TradingWorkspace {
         exchange.insert("pair_whitelist".into(), json!(pairs));
         ensure_order_book_pricing(&mut config)?;
         ensure_compound_defaults(&mut config)?;
+        let docker_proxy = crate::network::configured_docker_proxy();
+        ensure_ccxt_proxy(&mut config, docker_proxy.as_deref())?;
         let profile_preset = ai_config.strategy_profile.preset();
+        let effective_leverage = ai_config.leverage.max(1);
         config["gqt_strategy_profile"] = json!(ai_config.strategy_profile.as_str());
         config["gqt_compound_capital_usage_percent"] = json!(ai_config.capital_usage_percent);
         config["gqt_compound_take_profit"] = json!(profile_preset.take_profit);
         config["gqt_compound_stop_loss"] = json!(profile_preset.stop_loss);
         config["gqt_compound_pyramid_profit"] = json!(profile_preset.pyramid_profit);
         config["gqt_compound_pyramid_stake_ratio"] = json!(profile_preset.pyramid_stake_ratio);
-        config["gqt_compound_leverage"] = json!(ai_config.leverage);
+        config["gqt_compound_leverage"] = json!(effective_leverage);
+        config["gqt_fee_rate"] = json!(profile_preset.fee_rate);
+        config["gqt_slippage_rate"] = json!(profile_preset.slippage_rate);
+        config["gqt_min_net_profit"] = json!(profile_preset.min_net_profit);
+        config["gqt_min_pyramid_net_profit"] = json!(profile_preset.min_pyramid_net_profit);
+        config["gqt_time_roll_net_profit"] = json!(profile_preset.time_roll_net_profit);
+        config["gqt_daily_profit_lock_enabled"] = json!(true);
+        config["gqt_daily_profit_force_exit"] = json!(true);
+        config["gqt_daily_profit_target"] = json!(profile_preset.daily_profit_target);
+        config["gqt_daily_profit_timezone_offset_hours"] =
+            json!(profile_preset.daily_profit_timezone_offset_hours);
         config["minimal_roi"] = json!({"0": 0.99});
         config["stoploss"] = json!(-0.045);
         config["trailing_stop"] = json!(false);
@@ -280,14 +294,28 @@ impl TradingWorkspace {
         } else {
             "sqlite:////freqtrade/user_data/tradesv3.live.sqlite"
         };
-        let output = background_command("docker")
+        if start {
+            let ai_config = self.ai_trading_config().unwrap_or_default();
+            self.sync_ai_runtime_config(&ai_config)?;
+        }
+        let mut command = background_command("docker");
+        command
             .args(&args)
             .current_dir(&self.root)
             .env("BINANCE_API_KEY", api_key)
             .env("BINANCE_API_SECRET", api_secret)
-            .env("FREQTRADE_DB_URL", database_url)
-            .output()
-            .context("无法启动 Docker")?;
+            .env("FREQTRADE_DB_URL", database_url);
+        if let Some(proxy) = crate::network::configured_docker_proxy() {
+            command
+                .env("GQT_DOCKER_PROXY", &proxy)
+                .env("HTTP_PROXY", &proxy)
+                .env("HTTPS_PROXY", &proxy)
+                .env("ALL_PROXY", &proxy)
+                .env("http_proxy", &proxy)
+                .env("https_proxy", &proxy)
+                .env("all_proxy", &proxy);
+        }
+        let output = command.output().context("无法启动 Docker")?;
         if !output.status.success() {
             bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
         }
@@ -573,9 +601,27 @@ fn migrate_default_strategy(path: &Path) -> Result<()> {
             && source.contains("FuturesFactorStrategy"))
         || (source.contains("class FuturesFactorStrategy")
             && source.contains("alpha_compound_long")
-            && !source.contains("PROFILE_DEFAULTS"));
+            && !source.contains("PROFILE_DEFAULTS"))
+        || (source.contains("class FuturesFactorStrategy")
+            && source.contains("PROFILE_DEFAULTS")
+            && (!source.contains("gqt_fee_rate")
+                || !source.contains("gqt_daily_profit_target")
+                || !source.contains("gqt_daily_profit_timezone_offset_hours")));
     if legacy_default {
         fs::write(path, DEFAULT_STRATEGY).context("无法迁移默认 Freqtrade 策略")?;
+    }
+    Ok(())
+}
+
+fn migrate_ai_strategy(path: &Path) -> Result<()> {
+    let source = fs::read_to_string(path).context("Failed to read AI Freqtrade strategy")?;
+    let legacy_default = source.contains("class AiSignalStrategy")
+        && (!source.contains("gqt_fee_rate")
+            || !source.contains("gqt_daily_profit_target")
+            || !source.contains("gqt_daily_profit_timezone_offset_hours"));
+    if legacy_default {
+        fs::write(path, DEFAULT_AI_STRATEGY)
+            .context("Failed to migrate default AI Freqtrade strategy")?;
     }
     Ok(())
 }
@@ -747,6 +793,20 @@ fn ensure_compound_defaults(config: &mut Value) -> Result<()> {
     root.entry("gqt_compound_pyramid_stake_ratio")
         .or_insert(json!(0.45));
     root.entry("gqt_compound_leverage").or_insert(json!(2));
+    root.entry("gqt_fee_rate").or_insert(json!(0.0005));
+    root.entry("gqt_slippage_rate").or_insert(json!(0.0002));
+    root.entry("gqt_min_net_profit").or_insert(json!(0.006));
+    root.entry("gqt_min_pyramid_net_profit")
+        .or_insert(json!(0.0025));
+    root.entry("gqt_time_roll_net_profit")
+        .or_insert(json!(0.0025));
+    root.entry("gqt_daily_profit_lock_enabled")
+        .or_insert(json!(true));
+    root.entry("gqt_daily_profit_force_exit")
+        .or_insert(json!(true));
+    root.entry("gqt_daily_profit_target").or_insert(json!(0.10));
+    root.entry("gqt_daily_profit_timezone_offset_hours")
+        .or_insert(json!(8.0));
     root.insert("minimal_roi".into(), json!({"0": 0.99}));
     root.insert("stoploss".into(), json!(-0.045));
     root.insert("trailing_stop".into(), json!(false));
@@ -767,14 +827,42 @@ fn ensure_order_book_pricing(config: &mut Value) -> Result<()> {
     Ok(())
 }
 
+fn ensure_ccxt_proxy(config: &mut Value, proxy: Option<&str>) -> Result<()> {
+    let root = config
+        .as_object_mut()
+        .context("Freqtrade config root is invalid")?;
+    for key in ["ccxt_config", "ccxt_async_config"] {
+        let ccxt = root.entry(key).or_insert_with(|| json!({}));
+        let ccxt = ccxt
+            .as_object_mut()
+            .with_context(|| format!("{key} config is invalid"))?;
+        if let Some(proxy) = proxy {
+            ccxt.insert("httpProxy".into(), json!(proxy));
+            ccxt.insert("httpsProxy".into(), json!(proxy));
+            ccxt.insert("aiohttpProxy".into(), json!(proxy));
+        } else {
+            ccxt.remove("httpProxy");
+            ccxt.remove("httpsProxy");
+            ccxt.remove("aiohttpProxy");
+        }
+    }
+    Ok(())
+}
+
 fn migrate_compose(path: &Path) -> Result<()> {
     let source = fs::read_to_string(path).context("无法读取 Docker Compose 配置")?;
-    let updated = source
+    let mut updated = source
         .replace(
             "sqlite:////freqtrade/user_data/tradesv3.sqlite",
             "${FREQTRADE_DB_URL:-sqlite:////freqtrade/user_data/tradesv3.dryrun.sqlite}",
         )
         .replace("\n      --strategy FuturesFactorStrategy", "");
+    if !updated.contains("GQT_DOCKER_PROXY") {
+        updated = updated.replace(
+            "      FREQTRADE__EXCHANGE__SECRET: \"${BINANCE_API_SECRET:-}\"\n",
+            "      FREQTRADE__EXCHANGE__SECRET: \"${BINANCE_API_SECRET:-}\"\n      GQT_DOCKER_PROXY: \"${GQT_DOCKER_PROXY:-}\"\n      HTTP_PROXY: \"${GQT_DOCKER_PROXY:-}\"\n      HTTPS_PROXY: \"${GQT_DOCKER_PROXY:-}\"\n      ALL_PROXY: \"${GQT_DOCKER_PROXY:-}\"\n      http_proxy: \"${GQT_DOCKER_PROXY:-}\"\n      https_proxy: \"${GQT_DOCKER_PROXY:-}\"\n      all_proxy: \"${GQT_DOCKER_PROXY:-}\"\n",
+        );
+    }
     if updated != source {
         fs::write(path, updated).context("无法迁移 Docker Compose 配置")?;
     }
@@ -906,7 +994,7 @@ mod tests {
             symbol_whitelist: vec!["SOLUSDT".into(), "DOGEUSDT".into()],
             timeframe: "1h".into(),
             margin_mode: MarginMode::Cross,
-            leverage: 3,
+            leverage: 50,
             ..Default::default()
         };
         workspace.save_ai_trading_config(&ai_config).unwrap();
@@ -921,6 +1009,7 @@ mod tests {
         assert_eq!(config["strategy"], "AiSignalStrategy");
         assert_eq!(config["timeframe"], "1h");
         assert_eq!(config["margin_mode"], "cross");
+        assert_eq!(config["gqt_compound_leverage"], 50);
         assert_eq!(
             config["exchange"]["pair_whitelist"],
             json!(["SOL/USDT:USDT", "DOGE/USDT:USDT"])

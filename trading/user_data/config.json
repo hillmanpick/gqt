@@ -22,6 +22,15 @@
   "gqt_compound_pyramid_profit": 0.006,
   "gqt_compound_pyramid_stake_ratio": 0.45,
   "gqt_compound_leverage": 2,
+  "gqt_fee_rate": 0.0005,
+  "gqt_slippage_rate": 0.0002,
+  "gqt_min_net_profit": 0.006,
+  "gqt_min_pyramid_net_profit": 0.0025,
+  "gqt_time_roll_net_profit": 0.0025,
+  "gqt_daily_profit_lock_enabled": true,
+  "gqt_daily_profit_force_exit": true,
+  "gqt_daily_profit_target": 0.1,
+  "gqt_daily_profit_timezone_offset_hours": 8.0,
   "liquidation_buffer": 0.2,
   "minimal_roi": {
     "0": 0.99

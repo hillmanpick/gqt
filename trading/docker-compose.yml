@@ -8,6 +8,13 @@ services:
     environment:
       FREQTRADE__EXCHANGE__KEY: "${BINANCE_API_KEY:-}"
       FREQTRADE__EXCHANGE__SECRET: "${BINANCE_API_SECRET:-}"
+      GQT_DOCKER_PROXY: "${GQT_DOCKER_PROXY:-}"
+      HTTP_PROXY: "${GQT_DOCKER_PROXY:-}"
+      HTTPS_PROXY: "${GQT_DOCKER_PROXY:-}"
+      ALL_PROXY: "${GQT_DOCKER_PROXY:-}"
+      http_proxy: "${GQT_DOCKER_PROXY:-}"
+      https_proxy: "${GQT_DOCKER_PROXY:-}"
+      all_proxy: "${GQT_DOCKER_PROXY:-}"
     command: >
       trade
       --logfile /freqtrade/user_data/logs/freqtrade.log

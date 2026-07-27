@@ -318,6 +318,13 @@ impl StrategyProfile {
                 stop_loss: 0.010,
                 pyramid_profit: 0.008,
                 pyramid_stake_ratio: 0.30,
+                fee_rate: 0.0005,
+                slippage_rate: 0.0002,
+                min_net_profit: 0.0040,
+                min_pyramid_net_profit: 0.0025,
+                time_roll_net_profit: 0.0025,
+                daily_profit_target: 0.10,
+                daily_profit_timezone_offset_hours: 8.0,
             },
             StrategyProfile::Balanced => StrategyProfilePreset {
                 leverage: 2,
@@ -333,6 +340,13 @@ impl StrategyProfile {
                 stop_loss: 0.014,
                 pyramid_profit: 0.006,
                 pyramid_stake_ratio: 0.45,
+                fee_rate: 0.0005,
+                slippage_rate: 0.0002,
+                min_net_profit: 0.0060,
+                min_pyramid_net_profit: 0.0025,
+                time_roll_net_profit: 0.0025,
+                daily_profit_target: 0.10,
+                daily_profit_timezone_offset_hours: 8.0,
             },
             StrategyProfile::Aggressive => StrategyProfilePreset {
                 leverage: 3,
@@ -348,6 +362,13 @@ impl StrategyProfile {
                 stop_loss: 0.012,
                 pyramid_profit: 0.004,
                 pyramid_stake_ratio: 0.60,
+                fee_rate: 0.0005,
+                slippage_rate: 0.0003,
+                min_net_profit: 0.0035,
+                min_pyramid_net_profit: 0.0015,
+                time_roll_net_profit: 0.0015,
+                daily_profit_target: 0.10,
+                daily_profit_timezone_offset_hours: 8.0,
             },
         }
     }
@@ -382,6 +403,13 @@ pub struct StrategyProfilePreset {
     pub stop_loss: f64,
     pub pyramid_profit: f64,
     pub pyramid_stake_ratio: f64,
+    pub fee_rate: f64,
+    pub slippage_rate: f64,
+    pub min_net_profit: f64,
+    pub min_pyramid_net_profit: f64,
+    pub time_roll_net_profit: f64,
+    pub daily_profit_target: f64,
+    pub daily_profit_timezone_offset_hours: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
