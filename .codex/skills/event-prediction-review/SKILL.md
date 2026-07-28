@@ -1,0 +1,37 @@
+---
+name: event-prediction-review
+description: Review and improve GQT Trader event-contract virtual predictions. Use when the user asks about Binance event contract prediction, 10m/30m/1h virtual orders, prediction win rate, event prediction data collection, backtesting review, or tuning the local event prediction model.
+---
+
+# Event Prediction Review
+
+Use this skill to review the GQT event prediction virtual-order log and propose measurable tuning changes. The product must remain virtual-only unless the user explicitly asks for real execution and the codebase supports a reviewed exchange API path.
+
+## Workflow
+
+1. Locate the SQLite log.
+   - Desktop runtime: `%LOCALAPPDATA%\HillmanPick\GQT Trader\data\trading\user_data\event_predictions.sqlite`
+   - Repo/dev fallback: `D:\x\gqt\trading\user_data\event_predictions.sqlite`
+   - If neither exists, inspect the code path in `desktop/src/trading.rs` and report that no live data has been collected yet.
+2. Run `scripts/export_event_review.py <sqlite-path>` to summarize results.
+3. Inspect horizon-level performance separately for `10m`, `30m`, and `60m`. Do not blend them into one headline number.
+4. Review recent losses by reading `features_json`, `score`, `confidence`, `direction`, `stake_amount`, `virtual_pnl`, and `move_percent`.
+5. Propose only measurable tuning changes, such as changing weights, adding a confidence floor, excluding low-volatility windows, or separating symbol-specific thresholds.
+6. Append a compact dated entry to `references/review-log.md` after each review. Include sample size, win rate by horizon, likely failure mode, and the next tuning hypothesis.
+
+## Review Rules
+
+- Treat fewer than 50 settled tickets per horizon as exploratory; do not claim stable edge.
+- The current virtual bankroll is 200 USDT and each virtual ticket stakes 5 USDT. If open exposure consumes available balance, new tickets may be skipped until older tickets settle.
+- Prefer settled tickets over open tickets. Open tickets are useful for operational checks only.
+- Separate late settlements from on-time settlements when the review text shows large `settled ...s late` values.
+- Do not delete or rewrite raw SQLite records during review.
+- Do not optimize for one symbol if the same weights are shared across all symbols without stating that tradeoff.
+- Do not use the skill file as a high-frequency data store. Raw tickets belong in SQLite; this skill stores process and compact review notes.
+
+## Code Targets
+
+- Prediction engine: `desktop/src/event_prediction.rs`
+- App loop and dashboard: `desktop/src/app.rs`
+- Workspace database path: `desktop/src/trading.rs`
+- Review ledger: `references/review-log.md`

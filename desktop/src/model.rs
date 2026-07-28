@@ -5,6 +5,7 @@ pub enum Page {
     Overview,
     Account,
     PositionHistory,
+    EventPrediction,
     Market,
     Strategy,
     Backtest,
@@ -14,10 +15,11 @@ pub enum Page {
 }
 
 impl Page {
-    pub const ALL: [Page; 9] = [
+    pub const ALL: [Page; 10] = [
         Page::Overview,
         Page::Account,
         Page::PositionHistory,
+        Page::EventPrediction,
         Page::Market,
         Page::Strategy,
         Page::Backtest,
@@ -31,6 +33,7 @@ impl Page {
             Page::Overview => "总览",
             Page::Account => "账户",
             Page::PositionHistory => "仓位历史",
+            Page::EventPrediction => "事件预测",
             Page::Market => "行情",
             Page::Strategy => "策略",
             Page::Backtest => "回测",
@@ -45,6 +48,7 @@ impl Page {
             Page::Overview => "layout-dashboard",
             Page::Account => "wallet-cards",
             Page::PositionHistory => "history",
+            Page::EventPrediction => "target",
             Page::Market => "candlestick-chart",
             Page::Strategy => "braces",
             Page::Backtest => "chart-no-axes-combined",
@@ -59,6 +63,7 @@ impl Page {
             Page::Overview => "Binance U 本位永续",
             Page::Account => "真实账户资金与合约持仓",
             Page::PositionHistory => "模拟盘成交与仓位记录",
+            Page::EventPrediction => "10m / 30m / 1h 虚拟预测复盘",
             Page::Market => "实时 K 线与市场情绪",
             Page::Strategy => "Rust 客户端 / Freqtrade Interface v3",
             Page::Backtest => "历史验证与成本压力测试",

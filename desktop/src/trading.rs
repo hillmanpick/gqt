@@ -33,6 +33,7 @@ pub struct TradingWorkspace {
     pub ai_config: PathBuf,
     pub ai_signals: PathBuf,
     pub ai_audit: PathBuf,
+    pub event_predictions: PathBuf,
 }
 
 impl TradingWorkspace {
@@ -62,6 +63,7 @@ impl TradingWorkspace {
             ai_config,
             ai_signals: root.join("user_data").join("ai_signals.json"),
             ai_audit: root.join("user_data").join("ai_audit.sqlite"),
+            event_predictions: root.join("user_data").join("event_predictions.sqlite"),
         };
         let ai_config = workspace.ai_trading_config().unwrap_or_default();
         workspace.sync_ai_runtime_config(&ai_config)?;

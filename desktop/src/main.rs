@@ -4,6 +4,7 @@ mod ai;
 mod ai_trader;
 mod app;
 mod audit;
+mod event_prediction;
 mod exchange;
 mod market;
 mod model;

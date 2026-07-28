@@ -1,0 +1,904 @@
+use std::{collections::BTreeMap, path::Path, time::Duration};
+
+use anyhow::{Context, Result, bail};
+use reqwest::blocking::Client;
+use rusqlite::{Connection, params};
+use serde_json::{Value, json};
+
+use crate::{
+    market,
+    model::{Candle, Interval, MarketSnapshot},
+    network,
+};
+
+pub const EVENT_STARTING_BANKROLL_USDT: f64 = 200.0;
+pub const EVENT_STAKE_USDT: f64 = 5.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventHorizon {
+    TenMinutes,
+    ThirtyMinutes,
+    OneHour,
+}
+
+impl EventHorizon {
+    pub const ALL: [EventHorizon; 3] = [
+        EventHorizon::TenMinutes,
+        EventHorizon::ThirtyMinutes,
+        EventHorizon::OneHour,
+    ];
+
+    pub fn minutes(self) -> i64 {
+        match self {
+            EventHorizon::TenMinutes => 10,
+            EventHorizon::ThirtyMinutes => 30,
+            EventHorizon::OneHour => 60,
+        }
+    }
+
+    fn seconds(self) -> i64 {
+        self.minutes() * 60
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventDirection {
+    Up,
+    Down,
+}
+
+impl EventDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            EventDirection::Up => "up",
+            EventDirection::Down => "down",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EventPredictionTicket {
+    pub id: String,
+    pub symbol: String,
+    pub horizon_minutes: i64,
+    pub open_time: i64,
+    pub close_time: i64,
+    pub direction: String,
+    pub confidence: f64,
+    pub score: f64,
+    pub stake_amount: f64,
+    pub entry_price: f64,
+    pub expiry_price: Option<f64>,
+    pub status: String,
+    pub result: String,
+    pub move_percent: Option<f64>,
+    pub virtual_pnl: Option<f64>,
+    pub review: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EventPredictionStats {
+    pub horizon_minutes: i64,
+    pub total: i64,
+    pub wins: i64,
+    pub losses: i64,
+    pub ties: i64,
+    pub win_rate: f64,
+    pub avg_confidence: f64,
+    pub avg_move_percent: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EventPredictionSummary {
+    pub created: usize,
+    pub settled: usize,
+    pub skipped_capital: usize,
+    pub open_count: i64,
+    pub starting_bankroll: f64,
+    pub stake_amount: f64,
+    pub realized_pnl: f64,
+    pub open_exposure: f64,
+    pub equity: f64,
+    pub available_balance: f64,
+    pub stats: Vec<EventPredictionStats>,
+    pub recent: Vec<EventPredictionTicket>,
+    pub message: String,
+}
+
+struct NewEventPrediction {
+    id: String,
+    symbol: String,
+    horizon: EventHorizon,
+    open_time: i64,
+    close_time: i64,
+    direction: EventDirection,
+    confidence: f64,
+    score: f64,
+    stake_amount: f64,
+    entry_price: f64,
+    features_json: String,
+}
+
+#[derive(Debug, Clone)]
+struct DueTicket {
+    id: String,
+    symbol: String,
+    horizon_minutes: i64,
+    close_time: i64,
+    direction: String,
+    entry_price: f64,
+    stake_amount: f64,
+    confidence: f64,
+    score: f64,
+}
+
+struct EventBankroll {
+    realized_pnl: f64,
+    open_exposure: f64,
+    equity: f64,
+    available_balance: f64,
+}
+
+pub struct EventPredictionLog {
+    connection: Connection,
+}
+
+impl EventPredictionLog {
+    pub fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .context("Failed to create event prediction directory")?;
+        }
+        let connection = Connection::open(path).context("Failed to open event prediction log")?;
+        connection.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE IF NOT EXISTS event_prediction_tickets (
+                id TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                horizon_minutes INTEGER NOT NULL,
+                open_time INTEGER NOT NULL,
+                close_time INTEGER NOT NULL,
+                direction TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                score REAL NOT NULL,
+                stake_amount REAL NOT NULL DEFAULT 5.0,
+                entry_price REAL NOT NULL,
+                expiry_price REAL,
+                status TEXT NOT NULL,
+                result TEXT,
+                move_percent REAL,
+                virtual_pnl REAL,
+                features_json TEXT NOT NULL,
+                review TEXT,
+                settled_at INTEGER
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS unique_event_prediction_round
+             ON event_prediction_tickets(symbol, horizon_minutes, open_time);
+             CREATE INDEX IF NOT EXISTS event_prediction_status_close
+             ON event_prediction_tickets(status, close_time);
+             CREATE INDEX IF NOT EXISTS event_prediction_symbol_horizon
+             ON event_prediction_tickets(symbol, horizon_minutes);",
+        )?;
+        migrate_schema(&connection)?;
+        Ok(Self { connection })
+    }
+
+    pub fn dashboard(&self) -> Result<EventPredictionSummary> {
+        let bankroll = self.bankroll()?;
+        Ok(EventPredictionSummary {
+            created: 0,
+            settled: 0,
+            skipped_capital: 0,
+            open_count: self.open_count()?,
+            starting_bankroll: EVENT_STARTING_BANKROLL_USDT,
+            stake_amount: EVENT_STAKE_USDT,
+            realized_pnl: bankroll.realized_pnl,
+            open_exposure: bankroll.open_exposure,
+            equity: bankroll.equity,
+            available_balance: bankroll.available_balance,
+            stats: self.stats()?,
+            recent: self.recent(80)?,
+            message: "event prediction dashboard loaded".into(),
+        })
+    }
+
+    fn record_prediction(&self, prediction: &NewEventPrediction, now: i64) -> Result<bool> {
+        let changed = self.connection.execute(
+            "INSERT OR IGNORE INTO event_prediction_tickets
+             (id, created_at, symbol, horizon_minutes, open_time, close_time, direction,
+              confidence, score, stake_amount, entry_price, status, features_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open', ?12)",
+            params![
+                prediction.id,
+                now,
+                prediction.symbol,
+                prediction.horizon.minutes(),
+                prediction.open_time,
+                prediction.close_time,
+                prediction.direction.as_str(),
+                prediction.confidence,
+                prediction.score,
+                prediction.stake_amount,
+                prediction.entry_price,
+                prediction.features_json,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    fn due_tickets(&self, now: i64) -> Result<Vec<DueTicket>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, symbol, horizon_minutes, close_time, direction, entry_price, stake_amount,
+                    confidence, score
+             FROM event_prediction_tickets
+             WHERE status = 'open' AND close_time <= ?1
+             ORDER BY close_time ASC",
+        )?;
+        let rows = statement.query_map([now], |row| {
+            Ok(DueTicket {
+                id: row.get(0)?,
+                symbol: row.get(1)?,
+                horizon_minutes: row.get(2)?,
+                close_time: row.get(3)?,
+                direction: row.get(4)?,
+                entry_price: row.get(5)?,
+                stake_amount: row.get(6)?,
+                confidence: row.get(7)?,
+                score: row.get(8)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to read due event prediction tickets")
+    }
+
+    fn settle_due_with_prices(&self, now: i64, prices: &BTreeMap<String, f64>) -> Result<usize> {
+        let due = self.due_tickets(now)?;
+        let mut settled = 0;
+        for ticket in due {
+            let Some(price) = prices.get(&ticket.symbol).copied() else {
+                continue;
+            };
+            if !price.is_finite() || price <= 0.0 || ticket.entry_price <= 0.0 {
+                continue;
+            }
+            let move_percent = (price / ticket.entry_price - 1.0) * 100.0;
+            let result = if move_percent.abs() <= 0.000001 {
+                "tie"
+            } else if (move_percent > 0.0 && ticket.direction == "up")
+                || (move_percent < 0.0 && ticket.direction == "down")
+            {
+                "win"
+            } else {
+                "loss"
+            };
+            let virtual_pnl = match result {
+                "win" => ticket.stake_amount,
+                "loss" => -ticket.stake_amount,
+                _ => 0.0,
+            };
+            let review = format!(
+                "{}: {} {}m stake {:.2} USDT, entry {:.8}, expiry {:.8}, move {:+.4}%, confidence {:.1}%, score {:+.3}, settled {}s late",
+                result,
+                ticket.direction,
+                ticket.horizon_minutes,
+                ticket.stake_amount,
+                ticket.entry_price,
+                price,
+                move_percent,
+                ticket.confidence * 100.0,
+                ticket.score,
+                now.saturating_sub(ticket.close_time)
+            );
+            self.connection.execute(
+                "UPDATE event_prediction_tickets
+                 SET status = 'settled', result = ?1, expiry_price = ?2, move_percent = ?3,
+                     virtual_pnl = ?4, review = ?5, settled_at = ?6
+                 WHERE id = ?7 AND status = 'open'",
+                params![
+                    result,
+                    price,
+                    move_percent,
+                    virtual_pnl,
+                    review,
+                    now,
+                    ticket.id,
+                ],
+            )?;
+            settled += 1;
+        }
+        Ok(settled)
+    }
+
+    fn open_count(&self) -> Result<i64> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM event_prediction_tickets WHERE status = 'open'",
+                [],
+                |row| row.get(0),
+            )
+            .context("Failed to count open event predictions")
+    }
+
+    fn bankroll(&self) -> Result<EventBankroll> {
+        let realized_pnl = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(SUM(virtual_pnl), 0.0)
+                 FROM event_prediction_tickets
+                 WHERE status = 'settled'",
+                [],
+                |row| row.get::<_, f64>(0),
+            )
+            .context("Failed to read event prediction realized pnl")?;
+        let open_exposure = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(SUM(stake_amount), 0.0)
+                 FROM event_prediction_tickets
+                 WHERE status = 'open'",
+                [],
+                |row| row.get::<_, f64>(0),
+            )
+            .context("Failed to read event prediction open exposure")?;
+        let equity = EVENT_STARTING_BANKROLL_USDT + realized_pnl;
+        Ok(EventBankroll {
+            realized_pnl,
+            open_exposure,
+            equity,
+            available_balance: equity - open_exposure,
+        })
+    }
+
+    fn stats(&self) -> Result<Vec<EventPredictionStats>> {
+        let mut statement = self.connection.prepare(
+            "SELECT horizon_minutes,
+                    COUNT(*),
+                    SUM(CASE WHEN result = 'win' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN result = 'loss' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN result = 'tie' THEN 1 ELSE 0 END),
+                    AVG(confidence),
+                    AVG(move_percent)
+             FROM event_prediction_tickets
+             WHERE status = 'settled'
+             GROUP BY horizon_minutes
+             ORDER BY horizon_minutes",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let total: i64 = row.get(1)?;
+            let wins: i64 = row.get::<_, Option<i64>>(2)?.unwrap_or(0);
+            let losses: i64 = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
+            let ties: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
+            let decisive = wins + losses;
+            Ok(EventPredictionStats {
+                horizon_minutes: row.get(0)?,
+                total,
+                wins,
+                losses,
+                ties,
+                win_rate: if decisive > 0 {
+                    wins as f64 / decisive as f64 * 100.0
+                } else {
+                    0.0
+                },
+                avg_confidence: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0) * 100.0,
+                avg_move_percent: row.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to read event prediction stats")
+    }
+
+    fn recent(&self, limit: usize) -> Result<Vec<EventPredictionTicket>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, symbol, horizon_minutes, open_time, close_time, direction,
+                    confidence, score, stake_amount, entry_price, expiry_price, status,
+                    COALESCE(result, ''), move_percent, virtual_pnl, COALESCE(review, '')
+             FROM event_prediction_tickets
+             ORDER BY open_time DESC, horizon_minutes ASC
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit as i64], |row| {
+            Ok(EventPredictionTicket {
+                id: row.get(0)?,
+                symbol: row.get(1)?,
+                horizon_minutes: row.get(2)?,
+                open_time: row.get(3)?,
+                close_time: row.get(4)?,
+                direction: row.get(5)?,
+                confidence: row.get(6)?,
+                score: row.get(7)?,
+                stake_amount: row.get(8)?,
+                entry_price: row.get(9)?,
+                expiry_price: row.get(10)?,
+                status: row.get(11)?,
+                result: row.get(12)?,
+                move_percent: row.get(13)?,
+                virtual_pnl: row.get(14)?,
+                review: row.get(15)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to read recent event predictions")
+    }
+}
+
+pub fn run_cycle(path: &Path, symbols: &[String]) -> Result<EventPredictionSummary> {
+    let log = EventPredictionLog::open(path)?;
+    let client = network::client(Duration::from_secs(20))?;
+    let now = chrono::Utc::now().timestamp();
+    let mut failures = Vec::new();
+    let mut settlement_prices = BTreeMap::new();
+    for symbol in due_symbols(&log, now)? {
+        match market::fetch_snapshot(&client, &symbol) {
+            Ok(snapshot) => {
+                settlement_prices.insert(symbol, usable_price(&snapshot));
+            }
+            Err(error) => failures.push(format!("{symbol}: {error}")),
+        }
+    }
+    let settled = log.settle_due_with_prices(now, &settlement_prices)?;
+
+    let open_time = (now / 60) * 60;
+    let mut available_balance = log.bankroll()?.available_balance;
+    let mut created = 0;
+    let mut skipped_capital = 0;
+    for symbol in symbols {
+        let result = create_symbol_predictions(
+            &log,
+            &client,
+            symbol,
+            open_time,
+            now,
+            &mut available_balance,
+        );
+        match result {
+            Ok((count, skipped)) => {
+                created += count;
+                skipped_capital += skipped;
+            }
+            Err(error) => failures.push(format!("{symbol}: {error}")),
+        }
+    }
+
+    let open_count = log.open_count()?;
+    let bankroll = log.bankroll()?;
+    let stats = log.stats()?;
+    let recent = log.recent(80)?;
+    if created == 0 && settled == 0 && !failures.is_empty() {
+        bail!("{}", failures.join("; "));
+    }
+    let mut message = format!(
+        "event predictions: created {created}, settled {settled}, skipped_capital {skipped_capital}, open {open_count}, equity {:.2}, available {:.2}",
+        bankroll.equity, bankroll.available_balance
+    );
+    if !failures.is_empty() {
+        message.push_str(&format!("; failures: {}", failures.join("; ")));
+    }
+    Ok(EventPredictionSummary {
+        created,
+        settled,
+        skipped_capital,
+        open_count,
+        starting_bankroll: EVENT_STARTING_BANKROLL_USDT,
+        stake_amount: EVENT_STAKE_USDT,
+        realized_pnl: bankroll.realized_pnl,
+        open_exposure: bankroll.open_exposure,
+        equity: bankroll.equity,
+        available_balance: bankroll.available_balance,
+        stats,
+        recent,
+        message,
+    })
+}
+
+fn due_symbols(log: &EventPredictionLog, now: i64) -> Result<Vec<String>> {
+    let mut statement = log.connection.prepare(
+        "SELECT DISTINCT symbol FROM event_prediction_tickets
+         WHERE status = 'open' AND close_time <= ?1",
+    )?;
+    let rows = statement.query_map([now], |row| row.get(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("Failed to read due event prediction symbols")
+}
+
+fn migrate_schema(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(event_prediction_tickets)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|column| column == "stake_amount") {
+        connection.execute(
+            "ALTER TABLE event_prediction_tickets
+             ADD COLUMN stake_amount REAL NOT NULL DEFAULT 5.0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn create_symbol_predictions(
+    log: &EventPredictionLog,
+    client: &Client,
+    symbol: &str,
+    open_time: i64,
+    now: i64,
+    available_balance: &mut f64,
+) -> Result<(usize, usize)> {
+    let candles = market::fetch_candles(client, symbol, Interval::OneMinute, 240)?;
+    if candles.len() < 80 {
+        bail!(
+            "not enough 1m candles for event prediction: {}",
+            candles.len()
+        );
+    }
+    let snapshot = market::fetch_snapshot(client, symbol)?;
+    let mut created = 0;
+    let mut skipped = 0;
+    for horizon in EventHorizon::ALL {
+        if *available_balance + f64::EPSILON < EVENT_STAKE_USDT {
+            skipped += 1;
+            continue;
+        }
+        let prediction = make_prediction(symbol, horizon, &candles, &snapshot, open_time)?;
+        if log.record_prediction(&prediction, now)? {
+            created += 1;
+            *available_balance -= prediction.stake_amount;
+        }
+    }
+    Ok((created, skipped))
+}
+
+fn make_prediction(
+    symbol: &str,
+    horizon: EventHorizon,
+    candles: &[Candle],
+    snapshot: &MarketSnapshot,
+    open_time: i64,
+) -> Result<NewEventPrediction> {
+    let entry_price = usable_price(snapshot);
+    if !entry_price.is_finite() || entry_price <= 0.0 {
+        bail!("invalid entry price");
+    }
+    let features = prediction_features(candles, snapshot);
+    let score = horizon_score(horizon, &features).clamp(-1.0, 1.0);
+    let direction = if score > 0.0 {
+        EventDirection::Up
+    } else if score < 0.0 {
+        EventDirection::Down
+    } else if snapshot.change_percent >= 0.0 {
+        EventDirection::Up
+    } else {
+        EventDirection::Down
+    };
+    let confidence = (0.50 + score.abs() * 0.38).clamp(0.51, 0.88);
+    let close_time = open_time + horizon.seconds();
+    let id = format!(
+        "{}-{}m-{}",
+        symbol.to_ascii_uppercase(),
+        horizon.minutes(),
+        open_time
+    );
+    Ok(NewEventPrediction {
+        id,
+        symbol: symbol.to_ascii_uppercase(),
+        horizon,
+        open_time,
+        close_time,
+        direction,
+        confidence,
+        score,
+        stake_amount: EVENT_STAKE_USDT,
+        entry_price,
+        features_json: serde_json::to_string(&features)?,
+    })
+}
+
+fn usable_price(snapshot: &MarketSnapshot) -> f64 {
+    if snapshot.mark_price.is_finite() && snapshot.mark_price > 0.0 {
+        snapshot.mark_price
+    } else {
+        snapshot.price
+    }
+}
+
+fn prediction_features(candles: &[Candle], snapshot: &MarketSnapshot) -> Value {
+    let closes = candles
+        .iter()
+        .map(|candle| candle.close)
+        .collect::<Vec<_>>();
+    let ret3 = pct_change(candles, 3);
+    let ret10 = pct_change(candles, 10);
+    let ret30 = pct_change(candles, 30);
+    let ret60 = pct_change(candles, 60);
+    let volatility = mean_abs_return(&closes, 80).max(0.0005);
+    let momentum3 = normalized_return(candles, 3, volatility);
+    let momentum10 = normalized_return(candles, 10, volatility);
+    let momentum30 = normalized_return(candles, 30, volatility);
+    let momentum60 = normalized_return(candles, 60, volatility);
+    let ema_short = ema_bias(&closes, 8, 21, volatility);
+    let ema_mid = ema_bias(&closes, 13, 34, volatility);
+    let ema_long = ema_bias(&closes, 21, 55, volatility);
+    let rsi = rsi(&closes, 14);
+    let rsi_trend = ((rsi - 50.0) / 25.0).clamp(-1.0, 1.0);
+    let volume_ratio = volume_ratio(candles, 45);
+    let volume_bias = momentum3.signum() * (volume_ratio / 1.5).clamp(0.0, 1.0);
+    let breakout = breakout_bias(candles, 60);
+    let long_short_bias = ((snapshot.long_short_ratio - 1.0) / 0.35).clamp(-1.0, 1.0);
+    let funding_bias = (-snapshot.funding_rate / 0.0008).clamp(-1.0, 1.0);
+    let sentiment = (long_short_bias * 0.75 + funding_bias * 0.25).clamp(-1.0, 1.0);
+    json!({
+        "ret3": ret3,
+        "ret10": ret10,
+        "ret30": ret30,
+        "ret60": ret60,
+        "volatility": volatility,
+        "momentum3": momentum3,
+        "momentum10": momentum10,
+        "momentum30": momentum30,
+        "momentum60": momentum60,
+        "ema_short": ema_short,
+        "ema_mid": ema_mid,
+        "ema_long": ema_long,
+        "rsi": rsi,
+        "rsi_trend": rsi_trend,
+        "volume_ratio": volume_ratio,
+        "volume_bias": volume_bias,
+        "breakout": breakout,
+        "long_short_bias": long_short_bias,
+        "funding_bias": funding_bias,
+        "sentiment": sentiment,
+        "snapshot_change_percent": snapshot.change_percent,
+    })
+}
+
+fn horizon_score(horizon: EventHorizon, features: &Value) -> f64 {
+    let value = |name: &str| {
+        features
+            .get(name)
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite())
+            .unwrap_or_default()
+    };
+    match horizon {
+        EventHorizon::TenMinutes => {
+            0.42 * value("momentum3")
+                + 0.22 * value("momentum10")
+                + 0.18 * value("ema_short")
+                + 0.10 * value("volume_bias")
+                + 0.08 * value("sentiment")
+        }
+        EventHorizon::ThirtyMinutes => {
+            0.20 * value("momentum10")
+                + 0.30 * value("momentum30")
+                + 0.22 * value("ema_mid")
+                + 0.10 * value("breakout")
+                + 0.10 * value("sentiment")
+                + 0.08 * value("rsi_trend")
+        }
+        EventHorizon::OneHour => {
+            0.16 * value("momentum10")
+                + 0.26 * value("momentum60")
+                + 0.28 * value("ema_long")
+                + 0.14 * value("breakout")
+                + 0.10 * value("sentiment")
+                + 0.06 * value("rsi_trend")
+        }
+    }
+}
+
+fn pct_change(candles: &[Candle], periods: usize) -> f64 {
+    if candles.len() <= periods {
+        return 0.0;
+    }
+    let latest = candles
+        .last()
+        .map(|candle| candle.close)
+        .unwrap_or_default();
+    let previous = candles[candles.len() - 1 - periods].close;
+    if latest.is_finite() && previous.is_finite() && previous > 0.0 {
+        latest / previous - 1.0
+    } else {
+        0.0
+    }
+}
+
+fn normalized_return(candles: &[Candle], periods: usize, volatility: f64) -> f64 {
+    let scale = volatility * (periods as f64).sqrt().max(1.0);
+    (pct_change(candles, periods) / scale.max(0.0005)).clamp(-2.0, 2.0) / 2.0
+}
+
+fn mean_abs_return(closes: &[f64], window: usize) -> f64 {
+    let returns = closes
+        .windows(2)
+        .rev()
+        .take(window)
+        .filter_map(|pair| {
+            if pair[0].is_finite() && pair[1].is_finite() && pair[0] > 0.0 {
+                Some((pair[1] / pair[0] - 1.0).abs())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    if returns.is_empty() {
+        return 0.0;
+    }
+    returns.iter().sum::<f64>() / returns.len() as f64
+}
+
+fn ema_bias(closes: &[f64], fast_period: usize, slow_period: usize, volatility: f64) -> f64 {
+    let fast = ema(closes, fast_period);
+    let slow = ema(closes, slow_period);
+    if fast.is_finite() && slow.is_finite() && slow > 0.0 {
+        ((fast / slow - 1.0) / volatility.max(0.0005)).clamp(-2.0, 2.0) / 2.0
+    } else {
+        0.0
+    }
+}
+
+fn ema(values: &[f64], period: usize) -> f64 {
+    let Some(first) = values.first().copied() else {
+        return 0.0;
+    };
+    let alpha = 2.0 / (period as f64 + 1.0);
+    values.iter().skip(1).fold(first, |average, value| {
+        if value.is_finite() {
+            alpha * *value + (1.0 - alpha) * average
+        } else {
+            average
+        }
+    })
+}
+
+fn rsi(closes: &[f64], period: usize) -> f64 {
+    if closes.len() <= period {
+        return 50.0;
+    }
+    let slice = &closes[closes.len() - period - 1..];
+    let mut gain = 0.0;
+    let mut loss = 0.0;
+    for pair in slice.windows(2) {
+        let change = pair[1] - pair[0];
+        if change >= 0.0 {
+            gain += change;
+        } else {
+            loss += change.abs();
+        }
+    }
+    if loss <= f64::EPSILON {
+        100.0
+    } else {
+        let rs = gain / loss;
+        100.0 - 100.0 / (1.0 + rs)
+    }
+}
+
+fn volume_ratio(candles: &[Candle], window: usize) -> f64 {
+    if candles.len() <= window {
+        return 0.0;
+    }
+    let latest = candles
+        .last()
+        .map(|candle| candle.volume)
+        .unwrap_or_default();
+    let start = candles.len() - 1 - window;
+    let average = candles[start..candles.len() - 1]
+        .iter()
+        .map(|candle| candle.volume)
+        .filter(|volume| volume.is_finite())
+        .sum::<f64>()
+        / window as f64;
+    if average > f64::EPSILON && latest.is_finite() {
+        latest / average - 1.0
+    } else {
+        0.0
+    }
+}
+
+fn breakout_bias(candles: &[Candle], window: usize) -> f64 {
+    if candles.len() <= window {
+        return 0.0;
+    }
+    let latest = candles
+        .last()
+        .map(|candle| candle.close)
+        .unwrap_or_default();
+    let start = candles.len() - window;
+    let high = candles[start..]
+        .iter()
+        .map(|candle| candle.high)
+        .filter(|value| value.is_finite())
+        .fold(f64::NEG_INFINITY, f64::max);
+    let low = candles[start..]
+        .iter()
+        .map(|candle| candle.low)
+        .filter(|value| value.is_finite())
+        .fold(f64::INFINITY, f64::min);
+    let spread = high - low;
+    if spread.is_finite() && spread > f64::EPSILON {
+        ((latest - (high + low) * 0.5) / (spread * 0.5)).clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    #[test]
+    fn predicts_all_event_horizons_and_settles() {
+        let root = std::env::temp_dir().join(format!("gqt-event-{}", rand::random::<u64>()));
+        fs::create_dir_all(&root).unwrap();
+        let log = EventPredictionLog::open(&root.join("events.sqlite")).unwrap();
+        let candles = sample_candles();
+        let snapshot = MarketSnapshot {
+            symbol: "BTCUSDT".into(),
+            price: 103.0,
+            mark_price: 103.0,
+            long_short_ratio: 1.12,
+            funding_rate: 0.0001,
+            change_percent: 2.0,
+            ..Default::default()
+        };
+
+        let open_time = 1_700_000_000;
+        let mut created = 0;
+        for horizon in EventHorizon::ALL {
+            let prediction =
+                make_prediction("BTCUSDT", horizon, &candles, &snapshot, open_time).unwrap();
+            assert!(matches!(
+                prediction.direction,
+                EventDirection::Up | EventDirection::Down
+            ));
+            if log.record_prediction(&prediction, open_time).unwrap() {
+                created += 1;
+            }
+        }
+        assert_eq!(created, 3);
+        assert_eq!(log.open_count().unwrap(), 3);
+        let open_dashboard = log.dashboard().unwrap();
+        assert_eq!(open_dashboard.stake_amount, 5.0);
+        assert_eq!(open_dashboard.starting_bankroll, 200.0);
+        assert_eq!(open_dashboard.open_exposure, 15.0);
+        assert_eq!(open_dashboard.available_balance, 185.0);
+
+        let mut prices = BTreeMap::new();
+        prices.insert("BTCUSDT".into(), 105.0);
+        assert_eq!(
+            log.settle_due_with_prices(open_time + 60 * 60 + 1, &prices)
+                .unwrap(),
+            3
+        );
+        let dashboard = log.dashboard().unwrap();
+        assert_eq!(dashboard.open_count, 0);
+        assert_eq!(dashboard.open_exposure, 0.0);
+        assert_eq!(dashboard.realized_pnl, 15.0);
+        assert_eq!(dashboard.equity, 215.0);
+        assert_eq!(dashboard.recent.len(), 3);
+        assert_eq!(
+            dashboard.stats.iter().map(|stat| stat.total).sum::<i64>(),
+            3
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn sample_candles() -> Vec<Candle> {
+        (0..160)
+            .map(|index| {
+                let close = 100.0 + index as f64 * 0.02;
+                Candle {
+                    time: 1_700_000_000 + index * 60,
+                    open: close - 0.03,
+                    high: close + 0.06,
+                    low: close - 0.08,
+                    close,
+                    volume: 1000.0 + index as f64,
+                }
+            })
+            .collect()
+    }
+}
