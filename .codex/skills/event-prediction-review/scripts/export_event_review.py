@@ -58,6 +58,7 @@ def main():
     )[0]["value"]
 
     print(f"open tickets: {open_count}")
+    print("payout: loss=0 return / -stake pnl; 10m win=principal+80%; 30m/60m win=principal+85%")
     print(f"bankroll: start=200.00 stake=5.00 realized_pnl={realized_pnl:+.2f} equity={200.0 + realized_pnl:.2f} open_exposure={open_exposure:.2f} available={200.0 + realized_pnl - open_exposure:.2f}")
     print("settled stats:")
     if not totals:

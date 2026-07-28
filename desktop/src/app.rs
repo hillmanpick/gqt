@@ -1465,7 +1465,9 @@ impl GqtApp {
             ui.vertical(|ui| {
                 ui.label(RichText::new("事件预测虚拟盘").size(16.0).strong());
                 ui.label(
-                    RichText::new("每分钟为 10m / 30m / 1h 生成虚拟方向票据，到期后自动复盘")
+                    RichText::new(
+                        "每分钟为 10m / 30m / 1h 生成虚拟方向票据；输单归零，10m 赢返本金+80%，30m/1h 赢返本金+85%",
+                    )
                         .size(11.0)
                         .color(theme::MUTED),
                 );
@@ -1522,7 +1524,7 @@ impl GqtApp {
                 &mut cols[1],
                 "每单金额",
                 &format!("{:.2} USDT", self.event_prediction_stake_amount),
-                "每张虚拟票据固定下注",
+                "每张虚拟票据固定下注；表中盈亏为净盈亏",
                 theme::TEXT,
             );
             metric(

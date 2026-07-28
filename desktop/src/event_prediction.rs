@@ -13,6 +13,8 @@ use crate::{
 
 pub const EVENT_STARTING_BANKROLL_USDT: f64 = 200.0;
 pub const EVENT_STAKE_USDT: f64 = 5.0;
+pub const EVENT_TEN_MINUTE_PROFIT_RATE: f64 = 0.80;
+pub const EVENT_DEFAULT_PROFIT_RATE: f64 = 0.85;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventHorizon {
@@ -276,17 +278,17 @@ impl EventPredictionLog {
             } else {
                 "loss"
             };
-            let virtual_pnl = match result {
-                "win" => ticket.stake_amount,
-                "loss" => -ticket.stake_amount,
-                _ => 0.0,
-            };
+            let settlement_return =
+                event_settlement_return(result, ticket.horizon_minutes, ticket.stake_amount);
+            let virtual_pnl = settlement_return - ticket.stake_amount;
             let review = format!(
-                "{}: {} {}m stake {:.2} USDT, entry {:.8}, expiry {:.8}, move {:+.4}%, confidence {:.1}%, score {:+.3}, settled {}s late",
+                "{}: {} {}m stake {:.2} USDT, return {:.2} USDT, pnl {:+.2} USDT, entry {:.8}, expiry {:.8}, move {:+.4}%, confidence {:.1}%, score {:+.3}, settled {}s late",
                 result,
                 ticket.direction,
                 ticket.horizon_minutes,
                 ticket.stake_amount,
+                settlement_return,
+                virtual_pnl,
                 ticket.entry_price,
                 price,
                 move_percent,
@@ -538,7 +540,42 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
             [],
         )?;
     }
+    migrate_payout_model(connection)?;
     Ok(())
+}
+
+fn migrate_payout_model(connection: &Connection) -> Result<()> {
+    connection
+        .execute(
+            "UPDATE event_prediction_tickets
+             SET virtual_pnl = CASE
+                WHEN result = 'win' AND horizon_minutes = 10 THEN stake_amount * ?1
+                WHEN result = 'win' THEN stake_amount * ?2
+                WHEN result = 'loss' THEN -stake_amount
+                WHEN result = 'tie' THEN 0.0
+                ELSE virtual_pnl
+             END
+             WHERE status = 'settled'",
+            params![EVENT_TEN_MINUTE_PROFIT_RATE, EVENT_DEFAULT_PROFIT_RATE],
+        )
+        .context("Failed to migrate event prediction payout model")?;
+    Ok(())
+}
+
+fn event_profit_rate(horizon_minutes: i64) -> f64 {
+    if horizon_minutes == 10 {
+        EVENT_TEN_MINUTE_PROFIT_RATE
+    } else {
+        EVENT_DEFAULT_PROFIT_RATE
+    }
+}
+
+fn event_settlement_return(result: &str, horizon_minutes: i64, stake_amount: f64) -> f64 {
+    match result {
+        "win" => stake_amount * (1.0 + event_profit_rate(horizon_minutes)),
+        "loss" => 0.0,
+        _ => stake_amount,
+    }
 }
 
 fn create_symbol_predictions(
@@ -900,10 +937,18 @@ mod tests {
         let dashboard = log.dashboard().unwrap();
         assert_eq!(dashboard.open_count, 0);
         assert_eq!(dashboard.open_exposure, 0.0);
-        assert_eq!(dashboard.realized_pnl, 15.0);
-        assert_eq!(dashboard.equity, 215.0);
+        assert_close(dashboard.realized_pnl, 12.5);
+        assert_close(dashboard.equity, 212.5);
         assert_eq!(dashboard.open_recent.len(), 0);
         assert_eq!(dashboard.settled_recent.len(), 3);
+        let pnl_by_horizon = dashboard
+            .settled_recent
+            .iter()
+            .map(|ticket| (ticket.horizon_minutes, ticket.virtual_pnl.unwrap()))
+            .collect::<BTreeMap<_, _>>();
+        assert_close(*pnl_by_horizon.get(&10).unwrap(), 4.0);
+        assert_close(*pnl_by_horizon.get(&30).unwrap(), 4.25);
+        assert_close(*pnl_by_horizon.get(&60).unwrap(), 4.25);
         assert_eq!(
             dashboard.stats.iter().map(|stat| stat.total).sum::<i64>(),
             3
@@ -925,5 +970,12 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 0.000001,
+            "expected {expected}, got {actual}"
+        );
     }
 }
