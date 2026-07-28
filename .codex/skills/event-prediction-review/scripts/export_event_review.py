@@ -4,6 +4,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+SUPPORTED_SYMBOLS = ("BTCUSDT", "ETHUSDT")
+
 
 def pct(value):
     return f"{value:.2f}%"
@@ -20,6 +22,10 @@ def rows(connection, sql, params=()):
     return connection.execute(sql, params).fetchall()
 
 
+def supported_symbol_placeholders():
+    return ",".join("?" for _ in SUPPORTED_SYMBOLS)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Export GQT event prediction review stats.")
     parser.add_argument("database", type=Path)
@@ -27,9 +33,10 @@ def main():
     args = parser.parse_args()
 
     connection = connect(args.database)
+    symbol_filter = supported_symbol_placeholders()
     totals = rows(
         connection,
-        """
+        f"""
         SELECT horizon_minutes,
                COUNT(*) AS total,
                SUM(CASE WHEN result = 'win' THEN 1 ELSE 0 END) AS wins,
@@ -40,23 +47,29 @@ def main():
                SUM(COALESCE(virtual_pnl, 0.0)) AS virtual_pnl
         FROM event_prediction_tickets
         WHERE status = 'settled'
+          AND symbol IN ({symbol_filter})
         GROUP BY horizon_minutes
         ORDER BY horizon_minutes
         """,
+        SUPPORTED_SYMBOLS,
     )
     open_count = rows(
         connection,
-        "SELECT COUNT(*) AS count FROM event_prediction_tickets WHERE status = 'open'",
+        f"SELECT COUNT(*) AS count FROM event_prediction_tickets WHERE status = 'open' AND symbol IN ({symbol_filter})",
+        SUPPORTED_SYMBOLS,
     )[0]["count"]
     open_exposure = rows(
         connection,
-        "SELECT COALESCE(SUM(stake_amount), 0.0) AS value FROM event_prediction_tickets WHERE status = 'open'",
+        f"SELECT COALESCE(SUM(stake_amount), 0.0) AS value FROM event_prediction_tickets WHERE status = 'open' AND symbol IN ({symbol_filter})",
+        SUPPORTED_SYMBOLS,
     )[0]["value"]
     realized_pnl = rows(
         connection,
-        "SELECT COALESCE(SUM(virtual_pnl), 0.0) AS value FROM event_prediction_tickets WHERE status = 'settled'",
+        f"SELECT COALESCE(SUM(virtual_pnl), 0.0) AS value FROM event_prediction_tickets WHERE status = 'settled' AND symbol IN ({symbol_filter})",
+        SUPPORTED_SYMBOLS,
     )[0]["value"]
 
+    print(f"symbols: {', '.join(SUPPORTED_SYMBOLS)}")
     print(f"open tickets: {open_count}")
     print("payout: loss=0 return / -stake pnl; 10m win=principal+80%; 30m/60m win=principal+85%")
     print(f"bankroll: start=200.00 stake=5.00 realized_pnl={realized_pnl:+.2f} equity={200.0 + realized_pnl:.2f} open_exposure={open_exposure:.2f} available={200.0 + realized_pnl - open_exposure:.2f}")
@@ -75,16 +88,17 @@ def main():
 
     losses = rows(
         connection,
-        """
+        f"""
         SELECT symbol, horizon_minutes, direction, confidence, score, stake_amount,
                move_percent, virtual_pnl,
                features_json, review
         FROM event_prediction_tickets
         WHERE status = 'settled' AND result = 'loss'
+          AND symbol IN ({symbol_filter})
         ORDER BY close_time DESC
         LIMIT ?
         """,
-        (args.loss_limit,),
+        (*SUPPORTED_SYMBOLS, args.loss_limit),
     )
     print("recent losses:")
     if not losses:

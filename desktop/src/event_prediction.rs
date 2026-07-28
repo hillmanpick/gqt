@@ -15,6 +15,7 @@ pub const EVENT_STARTING_BANKROLL_USDT: f64 = 200.0;
 pub const EVENT_STAKE_USDT: f64 = 5.0;
 pub const EVENT_TEN_MINUTE_PROFIT_RATE: f64 = 0.80;
 pub const EVENT_DEFAULT_PROFIT_RATE: f64 = 0.85;
+pub const EVENT_SUPPORTED_SYMBOLS: [&str; 2] = ["BTCUSDT", "ETHUSDT"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventHorizon {
@@ -40,6 +41,34 @@ impl EventHorizon {
 
     fn seconds(self) -> i64 {
         self.minutes() * 60
+    }
+}
+
+pub fn supported_symbols() -> Vec<String> {
+    EVENT_SUPPORTED_SYMBOLS
+        .iter()
+        .map(|symbol| symbol.to_string())
+        .collect()
+}
+
+fn is_supported_symbol(symbol: &str) -> bool {
+    EVENT_SUPPORTED_SYMBOLS
+        .iter()
+        .any(|supported| supported.eq_ignore_ascii_case(symbol.trim()))
+}
+
+fn supported_cycle_symbols(symbols: &[String]) -> Vec<String> {
+    let mut filtered = symbols
+        .iter()
+        .map(|symbol| symbol.trim().to_ascii_uppercase())
+        .filter(|symbol| is_supported_symbol(symbol))
+        .collect::<Vec<_>>();
+    filtered.sort();
+    filtered.dedup();
+    if filtered.is_empty() {
+        supported_symbols()
+    } else {
+        filtered
     }
 }
 
@@ -210,6 +239,9 @@ impl EventPredictionLog {
     }
 
     fn record_prediction(&self, prediction: &NewEventPrediction, now: i64) -> Result<bool> {
+        if !is_supported_symbol(&prediction.symbol) {
+            return Ok(false);
+        }
         let changed = self.connection.execute(
             "INSERT OR IGNORE INTO event_prediction_tickets
              (id, created_at, symbol, horizon_minutes, open_time, close_time, direction,
@@ -238,7 +270,9 @@ impl EventPredictionLog {
             "SELECT id, symbol, horizon_minutes, close_time, direction, entry_price, stake_amount,
                     confidence, score
              FROM event_prediction_tickets
-             WHERE status = 'open' AND close_time <= ?1
+             WHERE status = 'open'
+               AND close_time <= ?1
+               AND symbol IN ('BTCUSDT', 'ETHUSDT')
              ORDER BY close_time ASC",
         )?;
         let rows = statement.query_map([now], |row| {
@@ -319,7 +353,9 @@ impl EventPredictionLog {
     fn open_count(&self) -> Result<i64> {
         self.connection
             .query_row(
-                "SELECT COUNT(*) FROM event_prediction_tickets WHERE status = 'open'",
+                "SELECT COUNT(*) FROM event_prediction_tickets
+                 WHERE status = 'open'
+                   AND symbol IN ('BTCUSDT', 'ETHUSDT')",
                 [],
                 |row| row.get(0),
             )
@@ -332,7 +368,8 @@ impl EventPredictionLog {
             .query_row(
                 "SELECT COALESCE(SUM(virtual_pnl), 0.0)
                  FROM event_prediction_tickets
-                 WHERE status = 'settled'",
+                 WHERE status = 'settled'
+                   AND symbol IN ('BTCUSDT', 'ETHUSDT')",
                 [],
                 |row| row.get::<_, f64>(0),
             )
@@ -342,7 +379,8 @@ impl EventPredictionLog {
             .query_row(
                 "SELECT COALESCE(SUM(stake_amount), 0.0)
                  FROM event_prediction_tickets
-                 WHERE status = 'open'",
+                 WHERE status = 'open'
+                   AND symbol IN ('BTCUSDT', 'ETHUSDT')",
                 [],
                 |row| row.get::<_, f64>(0),
             )
@@ -367,6 +405,7 @@ impl EventPredictionLog {
                     AVG(move_percent)
              FROM event_prediction_tickets
              WHERE status = 'settled'
+               AND symbol IN ('BTCUSDT', 'ETHUSDT')
              GROUP BY horizon_minutes
              ORDER BY horizon_minutes",
         )?;
@@ -402,6 +441,7 @@ impl EventPredictionLog {
                     COALESCE(result, ''), move_percent, virtual_pnl, COALESCE(review, '')
              FROM event_prediction_tickets
              WHERE status = 'open'
+               AND symbol IN ('BTCUSDT', 'ETHUSDT')
              ORDER BY close_time ASC, open_time DESC, horizon_minutes ASC
              LIMIT ?1",
         )?;
@@ -417,6 +457,7 @@ impl EventPredictionLog {
                     COALESCE(result, ''), move_percent, virtual_pnl, COALESCE(review, '')
              FROM event_prediction_tickets
              WHERE status = 'settled'
+               AND symbol IN ('BTCUSDT', 'ETHUSDT')
              ORDER BY COALESCE(settled_at, close_time) DESC, close_time DESC, open_time DESC
              LIMIT ?1",
         )?;
@@ -449,6 +490,7 @@ fn ticket_from_row(row: &Row<'_>) -> rusqlite::Result<EventPredictionTicket> {
 
 pub fn run_cycle(path: &Path, symbols: &[String]) -> Result<EventPredictionSummary> {
     let log = EventPredictionLog::open(path)?;
+    let symbols = supported_cycle_symbols(symbols);
     let client = network::client(Duration::from_secs(20))?;
     let now = chrono::Utc::now().timestamp();
     let mut failures = Vec::new();
@@ -467,7 +509,7 @@ pub fn run_cycle(path: &Path, symbols: &[String]) -> Result<EventPredictionSumma
     let mut available_balance = log.bankroll()?.available_balance;
     let mut created = 0;
     let mut skipped_capital = 0;
-    for symbol in symbols {
+    for symbol in &symbols {
         let result = create_symbol_predictions(
             &log,
             &client,
@@ -521,7 +563,9 @@ pub fn run_cycle(path: &Path, symbols: &[String]) -> Result<EventPredictionSumma
 fn due_symbols(log: &EventPredictionLog, now: i64) -> Result<Vec<String>> {
     let mut statement = log.connection.prepare(
         "SELECT DISTINCT symbol FROM event_prediction_tickets
-         WHERE status = 'open' AND close_time <= ?1",
+         WHERE status = 'open'
+           AND close_time <= ?1
+           AND symbol IN ('BTCUSDT', 'ETHUSDT')",
     )?;
     let rows = statement.query_map([now], |row| row.get(0))?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -953,6 +997,40 @@ mod tests {
             dashboard.stats.iter().map(|stat| stat.total).sum::<i64>(),
             3
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ignores_unsupported_event_symbols() {
+        let root = std::env::temp_dir().join(format!("gqt-event-{}", rand::random::<u64>()));
+        fs::create_dir_all(&root).unwrap();
+        let log = EventPredictionLog::open(&root.join("events.sqlite")).unwrap();
+        let candles = sample_candles();
+        let snapshot = MarketSnapshot {
+            symbol: "XRPUSDT".into(),
+            price: 1.0,
+            mark_price: 1.0,
+            long_short_ratio: 1.0,
+            funding_rate: 0.0,
+            change_percent: 0.0,
+            ..Default::default()
+        };
+        let prediction = make_prediction(
+            "XRPUSDT",
+            EventHorizon::TenMinutes,
+            &candles,
+            &snapshot,
+            1_700_000_000,
+        )
+        .unwrap();
+
+        assert!(!log.record_prediction(&prediction, 1_700_000_000).unwrap());
+        assert_eq!(log.dashboard().unwrap().open_count, 0);
+        assert_eq!(
+            supported_cycle_symbols(&["SOLUSDT".into(), "DOGEUSDT".into()]),
+            supported_symbols()
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 

@@ -1466,7 +1466,7 @@ impl GqtApp {
                 ui.label(RichText::new("事件预测虚拟盘").size(16.0).strong());
                 ui.label(
                     RichText::new(
-                        "每分钟为 10m / 30m / 1h 生成虚拟方向票据；输单归零，10m 赢返本金+80%，30m/1h 赢返本金+85%",
+                        "仅 BTC/ETH；每分钟为 10m / 30m / 1h 生成虚拟方向票据；输单归零，10m 赢返本金+80%，30m/1h 赢返本金+85%",
                     )
                         .size(11.0)
                         .color(theme::MUTED),
@@ -2454,7 +2454,7 @@ impl GqtApp {
         if !force && self.last_event_prediction_check.elapsed() < Duration::from_secs(60) {
             return;
         }
-        let symbols = self.visible_symbols();
+        let symbols = event_prediction::supported_symbols();
         if symbols.is_empty() {
             self.event_prediction_status = "事件预测没有可用交易对".into();
             return;

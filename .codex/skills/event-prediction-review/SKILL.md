@@ -14,7 +14,7 @@ Use this skill to review the GQT event prediction virtual-order log and propose 
    - Repo/dev fallback: `D:\x\gqt\trading\user_data\event_predictions.sqlite`
    - If neither exists, inspect the code path in `desktop/src/trading.rs` and report that no live data has been collected yet.
 2. Run `scripts/export_event_review.py <sqlite-path>` to summarize results.
-3. Inspect horizon-level performance separately for `10m`, `30m`, and `60m`. Do not blend them into one headline number.
+3. Inspect only `BTCUSDT` and `ETHUSDT`; ignore older records for unsupported symbols. Inspect horizon-level performance separately for `10m`, `30m`, and `60m`. Do not blend them into one headline number.
 4. Review recent losses by reading `features_json`, `score`, `confidence`, `direction`, `stake_amount`, `virtual_pnl`, and `move_percent`.
 5. Propose only measurable tuning changes, such as changing weights, adding a confidence floor, excluding low-volatility windows, or separating symbol-specific thresholds.
 6. Append a compact dated entry to `references/review-log.md` after each review. Include sample size, win rate by horizon, likely failure mode, and the next tuning hypothesis.
@@ -22,6 +22,7 @@ Use this skill to review the GQT event prediction virtual-order log and propose 
 ## Review Rules
 
 - Treat fewer than 50 settled tickets per horizon as exploratory; do not claim stable edge.
+- Binance-style event prediction in this project is scoped to `BTCUSDT` and `ETHUSDT` only.
 - The current virtual bankroll is 200 USDT and each virtual ticket stakes 5 USDT. Losing tickets return 0 and realize `-stake`. Winning `10m` tickets return principal plus 80% profit (`+4.00` on 5 USDT stake). Winning `30m` and `60m` tickets return principal plus 85% profit (`+4.25` on 5 USDT stake). If open exposure consumes available balance, new tickets may be skipped until older tickets settle.
 - Prefer settled tickets over open tickets. Open tickets are useful for operational checks only.
 - Separate late settlements from on-time settlements when the review text shows large `settled ...s late` values.
