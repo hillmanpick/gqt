@@ -6,7 +6,7 @@ Append one compact entry after each event prediction review. Keep raw ticket dat
 
 - Status: event prediction virtual-order logging implemented.
 - Horizons: 10m, 30m, 60m.
-- Bankroll: 200 USDT.
+- Bankroll: unlimited virtual capital.
 - Stake: 5 USDT per virtual ticket.
 - Data source: Binance USD-M futures public market data as a proxy settlement feed.
 - Current model: deterministic factor mix of short momentum, EMA trend, breakout position, volume confirmation, funding, and long/short ratio.

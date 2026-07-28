@@ -500,11 +500,8 @@ impl GqtApp {
                     match result {
                         Ok(summary) => {
                             self.event_prediction_status = format!(
-                                "{}；本轮新增 {}，结算 {}，资金不足跳过 {}",
-                                summary.message,
-                                summary.created,
-                                summary.settled,
-                                summary.skipped_capital
+                                "{}；本轮新增 {}，结算 {}，无限资金不跳过",
+                                summary.message, summary.created, summary.settled
                             );
                             self.event_prediction_open_count = summary.open_count;
                             self.event_prediction_starting_bankroll = summary.starting_bankroll;
@@ -1466,7 +1463,7 @@ impl GqtApp {
                 ui.label(RichText::new("事件预测虚拟盘").size(16.0).strong());
                 ui.label(
                     RichText::new(
-                        "仅 BTC/ETH；每分钟为 10m / 30m / 1h 生成虚拟方向票据；输单归零，10m 赢返本金+80%，30m/1h 赢返本金+85%",
+                        "仅 BTC/ETH；无限虚拟资金；每分钟为 10m / 30m / 1h 生成虚拟方向票据；输单归零，10m 赢返本金+80%，30m/1h 赢返本金+85%",
                     )
                         .size(11.0)
                         .color(theme::MUTED),
@@ -1516,8 +1513,8 @@ impl GqtApp {
             metric(
                 &mut cols[0],
                 "虚拟本金",
-                &format!("{:.2} USDT", self.event_prediction_starting_bankroll),
-                "事件预测专用资金",
+                &format_event_money(self.event_prediction_starting_bankroll),
+                "事件预测虚拟资金无限",
                 theme::YELLOW,
             );
             metric(
@@ -1530,7 +1527,7 @@ impl GqtApp {
             metric(
                 &mut cols[2],
                 "虚拟权益",
-                &format!("{:.2} USDT", self.event_prediction_equity),
+                &format_event_money(self.event_prediction_equity),
                 &format!("已结算 {:+.2}", self.event_prediction_realized_pnl),
                 if self.event_prediction_realized_pnl >= 0.0 {
                     theme::GREEN
@@ -1542,8 +1539,9 @@ impl GqtApp {
                 &mut cols[3],
                 "可用 / 占用",
                 &format!(
-                    "{:.2} / {:.2}",
-                    self.event_prediction_available_balance, self.event_prediction_open_exposure
+                    "{} / {:.2}",
+                    format_event_money(self.event_prediction_available_balance),
+                    self.event_prediction_open_exposure
                 ),
                 "USDT",
                 if self.event_prediction_available_balance >= 0.0 {
@@ -3723,6 +3721,14 @@ fn event_metric(ui: &mut Ui, label: &str, stat: &EventPredictionStats) {
             theme::TEXT
         },
     );
+}
+
+fn format_event_money(value: f64) -> String {
+    if value.is_finite() {
+        format!("{value:.2} USDT")
+    } else {
+        "无限".into()
+    }
 }
 
 fn event_ticket_table(

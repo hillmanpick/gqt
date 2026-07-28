@@ -11,7 +11,7 @@ use crate::{
     network,
 };
 
-pub const EVENT_STARTING_BANKROLL_USDT: f64 = 200.0;
+pub const EVENT_STARTING_BANKROLL_USDT: f64 = f64::INFINITY;
 pub const EVENT_STAKE_USDT: f64 = 5.0;
 pub const EVENT_TEN_MINUTE_PROFIT_RATE: f64 = 0.80;
 pub const EVENT_DEFAULT_PROFIT_RATE: f64 = 0.85;
@@ -123,7 +123,6 @@ pub struct EventPredictionStats {
 pub struct EventPredictionSummary {
     pub created: usize,
     pub settled: usize,
-    pub skipped_capital: usize,
     pub open_count: i64,
     pub starting_bankroll: f64,
     pub stake_amount: f64,
@@ -223,7 +222,6 @@ impl EventPredictionLog {
         Ok(EventPredictionSummary {
             created: 0,
             settled: 0,
-            skipped_capital: 0,
             open_count: self.open_count()?,
             starting_bankroll: EVENT_STARTING_BANKROLL_USDT,
             stake_amount: EVENT_STAKE_USDT,
@@ -385,12 +383,21 @@ impl EventPredictionLog {
                 |row| row.get::<_, f64>(0),
             )
             .context("Failed to read event prediction open exposure")?;
-        let equity = EVENT_STARTING_BANKROLL_USDT + realized_pnl;
+        let equity = if EVENT_STARTING_BANKROLL_USDT.is_finite() {
+            EVENT_STARTING_BANKROLL_USDT + realized_pnl
+        } else {
+            f64::INFINITY
+        };
+        let available_balance = if equity.is_finite() {
+            equity - open_exposure
+        } else {
+            f64::INFINITY
+        };
         Ok(EventBankroll {
             realized_pnl,
             open_exposure,
             equity,
-            available_balance: equity - open_exposure,
+            available_balance,
         })
     }
 
@@ -506,23 +513,11 @@ pub fn run_cycle(path: &Path, symbols: &[String]) -> Result<EventPredictionSumma
     let settled = log.settle_due_with_prices(now, &settlement_prices)?;
 
     let open_time = (now / 60) * 60;
-    let mut available_balance = log.bankroll()?.available_balance;
     let mut created = 0;
-    let mut skipped_capital = 0;
     for symbol in &symbols {
-        let result = create_symbol_predictions(
-            &log,
-            &client,
-            symbol,
-            open_time,
-            now,
-            &mut available_balance,
-        );
+        let result = create_symbol_predictions(&log, &client, symbol, open_time, now);
         match result {
-            Ok((count, skipped)) => {
-                created += count;
-                skipped_capital += skipped;
-            }
+            Ok(count) => created += count,
             Err(error) => failures.push(format!("{symbol}: {error}")),
         }
     }
@@ -536,8 +531,8 @@ pub fn run_cycle(path: &Path, symbols: &[String]) -> Result<EventPredictionSumma
         bail!("{}", failures.join("; "));
     }
     let mut message = format!(
-        "event predictions: created {created}, settled {settled}, skipped_capital {skipped_capital}, open {open_count}, equity {:.2}, available {:.2}",
-        bankroll.equity, bankroll.available_balance
+        "event predictions: created {created}, settled {settled}, unlimited bankroll, open {open_count}, open_exposure {:.2}, realized_pnl {:+.2}",
+        bankroll.open_exposure, bankroll.realized_pnl
     );
     if !failures.is_empty() {
         message.push_str(&format!("; failures: {}", failures.join("; ")));
@@ -545,7 +540,6 @@ pub fn run_cycle(path: &Path, symbols: &[String]) -> Result<EventPredictionSumma
     Ok(EventPredictionSummary {
         created,
         settled,
-        skipped_capital,
         open_count,
         starting_bankroll: EVENT_STARTING_BANKROLL_USDT,
         stake_amount: EVENT_STAKE_USDT,
@@ -628,8 +622,7 @@ fn create_symbol_predictions(
     symbol: &str,
     open_time: i64,
     now: i64,
-    available_balance: &mut f64,
-) -> Result<(usize, usize)> {
+) -> Result<usize> {
     let candles = market::fetch_candles(client, symbol, Interval::OneMinute, 240)?;
     if candles.len() < 80 {
         bail!(
@@ -639,19 +632,13 @@ fn create_symbol_predictions(
     }
     let snapshot = market::fetch_snapshot(client, symbol)?;
     let mut created = 0;
-    let mut skipped = 0;
     for horizon in EventHorizon::ALL {
-        if *available_balance + f64::EPSILON < EVENT_STAKE_USDT {
-            skipped += 1;
-            continue;
-        }
         let prediction = make_prediction(symbol, horizon, &candles, &snapshot, open_time)?;
         if log.record_prediction(&prediction, now)? {
             created += 1;
-            *available_balance -= prediction.stake_amount;
         }
     }
-    Ok((created, skipped))
+    Ok(created)
 }
 
 fn make_prediction(
@@ -967,9 +954,9 @@ mod tests {
         assert_eq!(log.open_count().unwrap(), 3);
         let open_dashboard = log.dashboard().unwrap();
         assert_eq!(open_dashboard.stake_amount, 5.0);
-        assert_eq!(open_dashboard.starting_bankroll, 200.0);
+        assert!(open_dashboard.starting_bankroll.is_infinite());
         assert_eq!(open_dashboard.open_exposure, 15.0);
-        assert_eq!(open_dashboard.available_balance, 185.0);
+        assert!(open_dashboard.available_balance.is_infinite());
 
         let mut prices = BTreeMap::new();
         prices.insert("BTCUSDT".into(), 105.0);
@@ -982,7 +969,8 @@ mod tests {
         assert_eq!(dashboard.open_count, 0);
         assert_eq!(dashboard.open_exposure, 0.0);
         assert_close(dashboard.realized_pnl, 12.5);
-        assert_close(dashboard.equity, 212.5);
+        assert!(dashboard.equity.is_infinite());
+        assert!(dashboard.available_balance.is_infinite());
         assert_eq!(dashboard.open_recent.len(), 0);
         assert_eq!(dashboard.settled_recent.len(), 3);
         let pnl_by_horizon = dashboard

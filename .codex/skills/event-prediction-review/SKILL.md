@@ -23,7 +23,7 @@ Use this skill to review the GQT event prediction virtual-order log and propose 
 
 - Treat fewer than 50 settled tickets per horizon as exploratory; do not claim stable edge.
 - Binance-style event prediction in this project is scoped to `BTCUSDT` and `ETHUSDT` only.
-- The current virtual bankroll is 200 USDT and each virtual ticket stakes 5 USDT. Losing tickets return 0 and realize `-stake`. Winning `10m` tickets return principal plus 80% profit (`+4.00` on 5 USDT stake). Winning `30m` and `60m` tickets return principal plus 85% profit (`+4.25` on 5 USDT stake). If open exposure consumes available balance, new tickets may be skipped until older tickets settle.
+- The current event prediction bankroll is unlimited virtual capital and each virtual ticket stakes 5 USDT. Losing tickets return 0 and realize `-stake`. Winning `10m` tickets return principal plus 80% profit (`+4.00` on 5 USDT stake). Winning `30m` and `60m` tickets return principal plus 85% profit (`+4.25` on 5 USDT stake). Open exposure is tracked for visibility but must not block new virtual tickets.
 - Prefer settled tickets over open tickets. Open tickets are useful for operational checks only.
 - Separate late settlements from on-time settlements when the review text shows large `settled ...s late` values.
 - Do not delete or rewrite raw SQLite records during review.
