@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, Row, params};
 use serde_json::{Value, json};
 
 use crate::{
@@ -101,7 +101,8 @@ pub struct EventPredictionSummary {
     pub equity: f64,
     pub available_balance: f64,
     pub stats: Vec<EventPredictionStats>,
-    pub recent: Vec<EventPredictionTicket>,
+    pub open_recent: Vec<EventPredictionTicket>,
+    pub settled_recent: Vec<EventPredictionTicket>,
     pub message: String,
 }
 
@@ -178,7 +179,9 @@ impl EventPredictionLog {
              CREATE INDEX IF NOT EXISTS event_prediction_status_close
              ON event_prediction_tickets(status, close_time);
              CREATE INDEX IF NOT EXISTS event_prediction_symbol_horizon
-             ON event_prediction_tickets(symbol, horizon_minutes);",
+             ON event_prediction_tickets(symbol, horizon_minutes);
+             CREATE INDEX IF NOT EXISTS event_prediction_settled_recent
+             ON event_prediction_tickets(status, settled_at);",
         )?;
         migrate_schema(&connection)?;
         Ok(Self { connection })
@@ -198,7 +201,8 @@ impl EventPredictionLog {
             equity: bankroll.equity,
             available_balance: bankroll.available_balance,
             stats: self.stats()?,
-            recent: self.recent(80)?,
+            open_recent: self.open_recent(80)?,
+            settled_recent: self.settled_recent(80)?,
             message: "event prediction dashboard loaded".into(),
         })
     }
@@ -389,38 +393,56 @@ impl EventPredictionLog {
             .context("Failed to read event prediction stats")
     }
 
-    fn recent(&self, limit: usize) -> Result<Vec<EventPredictionTicket>> {
+    fn open_recent(&self, limit: usize) -> Result<Vec<EventPredictionTicket>> {
         let mut statement = self.connection.prepare(
             "SELECT id, symbol, horizon_minutes, open_time, close_time, direction,
                     confidence, score, stake_amount, entry_price, expiry_price, status,
                     COALESCE(result, ''), move_percent, virtual_pnl, COALESCE(review, '')
              FROM event_prediction_tickets
-             ORDER BY open_time DESC, horizon_minutes ASC
+             WHERE status = 'open'
+             ORDER BY close_time ASC, open_time DESC, horizon_minutes ASC
              LIMIT ?1",
         )?;
-        let rows = statement.query_map([limit as i64], |row| {
-            Ok(EventPredictionTicket {
-                id: row.get(0)?,
-                symbol: row.get(1)?,
-                horizon_minutes: row.get(2)?,
-                open_time: row.get(3)?,
-                close_time: row.get(4)?,
-                direction: row.get(5)?,
-                confidence: row.get(6)?,
-                score: row.get(7)?,
-                stake_amount: row.get(8)?,
-                entry_price: row.get(9)?,
-                expiry_price: row.get(10)?,
-                status: row.get(11)?,
-                result: row.get(12)?,
-                move_percent: row.get(13)?,
-                virtual_pnl: row.get(14)?,
-                review: row.get(15)?,
-            })
-        })?;
+        let rows = statement.query_map([limit as i64], ticket_from_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("Failed to read recent event predictions")
+            .context("Failed to read open event predictions")
     }
+
+    fn settled_recent(&self, limit: usize) -> Result<Vec<EventPredictionTicket>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, symbol, horizon_minutes, open_time, close_time, direction,
+                    confidence, score, stake_amount, entry_price, expiry_price, status,
+                    COALESCE(result, ''), move_percent, virtual_pnl, COALESCE(review, '')
+             FROM event_prediction_tickets
+             WHERE status = 'settled'
+             ORDER BY COALESCE(settled_at, close_time) DESC, close_time DESC, open_time DESC
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit as i64], ticket_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to read settled event predictions")
+    }
+}
+
+fn ticket_from_row(row: &Row<'_>) -> rusqlite::Result<EventPredictionTicket> {
+    Ok(EventPredictionTicket {
+        id: row.get(0)?,
+        symbol: row.get(1)?,
+        horizon_minutes: row.get(2)?,
+        open_time: row.get(3)?,
+        close_time: row.get(4)?,
+        direction: row.get(5)?,
+        confidence: row.get(6)?,
+        score: row.get(7)?,
+        stake_amount: row.get(8)?,
+        entry_price: row.get(9)?,
+        expiry_price: row.get(10)?,
+        status: row.get(11)?,
+        result: row.get(12)?,
+        move_percent: row.get(13)?,
+        virtual_pnl: row.get(14)?,
+        review: row.get(15)?,
+    })
 }
 
 pub fn run_cycle(path: &Path, symbols: &[String]) -> Result<EventPredictionSummary> {
@@ -464,7 +486,8 @@ pub fn run_cycle(path: &Path, symbols: &[String]) -> Result<EventPredictionSumma
     let open_count = log.open_count()?;
     let bankroll = log.bankroll()?;
     let stats = log.stats()?;
-    let recent = log.recent(80)?;
+    let open_recent = log.open_recent(80)?;
+    let settled_recent = log.settled_recent(80)?;
     if created == 0 && settled == 0 && !failures.is_empty() {
         bail!("{}", failures.join("; "));
     }
@@ -487,7 +510,8 @@ pub fn run_cycle(path: &Path, symbols: &[String]) -> Result<EventPredictionSumma
         equity: bankroll.equity,
         available_balance: bankroll.available_balance,
         stats,
-        recent,
+        open_recent,
+        settled_recent,
         message,
     })
 }
@@ -878,7 +902,8 @@ mod tests {
         assert_eq!(dashboard.open_exposure, 0.0);
         assert_eq!(dashboard.realized_pnl, 15.0);
         assert_eq!(dashboard.equity, 215.0);
-        assert_eq!(dashboard.recent.len(), 3);
+        assert_eq!(dashboard.open_recent.len(), 0);
+        assert_eq!(dashboard.settled_recent.len(), 3);
         assert_eq!(
             dashboard.stats.iter().map(|stat| stat.total).sum::<i64>(),
             3

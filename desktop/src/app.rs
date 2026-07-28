@@ -155,6 +155,7 @@ pub struct GqtApp {
     event_prediction_available_balance: f64,
     event_prediction_stats: Vec<EventPredictionStats>,
     event_prediction_recent: Vec<EventPredictionTicket>,
+    event_prediction_history: Vec<EventPredictionTicket>,
     toast: Option<(String, bool, Instant)>,
     task_sender: mpsc::Sender<TaskEvent>,
     task_receiver: mpsc::Receiver<TaskEvent>,
@@ -341,7 +342,8 @@ impl GqtApp {
             event_prediction_equity: event_prediction_dashboard.equity,
             event_prediction_available_balance: event_prediction_dashboard.available_balance,
             event_prediction_stats: event_prediction_dashboard.stats,
-            event_prediction_recent: event_prediction_dashboard.recent,
+            event_prediction_recent: event_prediction_dashboard.open_recent,
+            event_prediction_history: event_prediction_dashboard.settled_recent,
             toast: None,
             task_sender,
             task_receiver,
@@ -512,7 +514,8 @@ impl GqtApp {
                             self.event_prediction_equity = summary.equity;
                             self.event_prediction_available_balance = summary.available_balance;
                             self.event_prediction_stats = summary.stats;
-                            self.event_prediction_recent = summary.recent;
+                            self.event_prediction_recent = summary.open_recent;
+                            self.event_prediction_history = summary.settled_recent;
                         }
                         Err(error) => {
                             self.event_prediction_status = error.clone();
@@ -1451,6 +1454,13 @@ impl GqtApp {
     }
 
     fn render_event_prediction(&mut self, ui: &mut Ui) {
+        ScrollArea::vertical()
+            .id_salt("event-prediction-page")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.render_event_prediction_inner(ui));
+    }
+
+    fn render_event_prediction_inner(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(RichText::new("事件预测虚拟盘").size(16.0).strong());
@@ -1555,87 +1565,25 @@ impl GqtApp {
             event_metric(&mut cols[3], "1h 胜率", &stat60);
         });
         ui.add_space(18.0);
-        Frame::NONE
-            .fill(theme::SURFACE)
-            .stroke(Stroke::new(1.0, theme::BORDER))
-            .corner_radius(5)
-            .inner_margin(Margin::same(14))
-            .show(ui, |ui| {
-                if self.event_prediction_recent.is_empty() {
-                    ui.label(RichText::new("暂无事件预测虚拟票据").color(theme::MUTED));
-                    return;
-                }
-                ScrollArea::both()
-                    .id_salt("event-prediction-scroll")
-                    .max_height((ui.available_height() - 12.0).max(380.0))
-                    .show(ui, |ui| {
-                        egui::Grid::new("event-prediction-grid")
-                            .num_columns(15)
-                            .striped(true)
-                            .spacing([18.0, 12.0])
-                            .show(ui, |ui| {
-                                for heading in [
-                                    "票据",
-                                    "交易对",
-                                    "周期",
-                                    "方向",
-                                    "置信度",
-                                    "分数",
-                                    "下注",
-                                    "开盘价",
-                                    "到期价",
-                                    "结果",
-                                    "波动",
-                                    "虚拟盈亏",
-                                    "开盘时间",
-                                    "到期时间",
-                                    "复盘",
-                                ] {
-                                    ui.label(RichText::new(heading).color(theme::MUTED).strong());
-                                }
-                                ui.end_row();
-                                for ticket in &self.event_prediction_recent {
-                                    ui.label(compact_event_id(&ticket.id));
-                                    ui.label(RichText::new(&ticket.symbol).strong());
-                                    ui.label(format!("{}m", ticket.horizon_minutes));
-                                    ui.colored_label(
-                                        prediction_direction_color(&ticket.direction),
-                                        prediction_direction_label(&ticket.direction),
-                                    );
-                                    ui.label(format!("{:.1}%", ticket.confidence * 100.0));
-                                    ui.label(format!("{:+.3}", ticket.score));
-                                    ui.label(format!("{:.2}", ticket.stake_amount));
-                                    ui.label(format_price(ticket.entry_price));
-                                    ui.label(
-                                        ticket
-                                            .expiry_price
-                                            .map(format_price)
-                                            .unwrap_or_else(|| "--".into()),
-                                    );
-                                    ui.colored_label(
-                                        prediction_result_color(ticket),
-                                        prediction_result_label(ticket),
-                                    );
-                                    ui.label(
-                                        ticket
-                                            .move_percent
-                                            .map(|value| format!("{value:+.4}%"))
-                                            .unwrap_or_else(|| "--".into()),
-                                    );
-                                    ui.label(
-                                        ticket
-                                            .virtual_pnl
-                                            .map(|value| format!("{value:+.1}"))
-                                            .unwrap_or_else(|| "--".into()),
-                                    );
-                                    ui.label(format_event_time(ticket.open_time));
-                                    ui.label(format_event_time(ticket.close_time));
-                                    ui.label(compact_error(&ticket.review, 120));
-                                    ui.end_row();
-                                }
-                            });
-                    });
-            });
+        event_ticket_table(
+            ui,
+            "event-prediction-open-scroll",
+            "未结算票据",
+            "按到期时间排序，最先需要复盘的排前面",
+            &self.event_prediction_recent,
+            "暂无未结算票据",
+            260.0,
+        );
+        ui.add_space(14.0);
+        event_ticket_table(
+            ui,
+            "event-prediction-history-scroll",
+            "历史已结算",
+            "最近 80 条已结算虚拟订单，胜/负/平都在这里看",
+            &self.event_prediction_history,
+            "暂无历史已结算票据",
+            360.0,
+        );
     }
 
     fn render_market(&mut self, ui: &mut Ui) {
@@ -3773,6 +3721,109 @@ fn event_metric(ui: &mut Ui, label: &str, stat: &EventPredictionStats) {
             theme::TEXT
         },
     );
+}
+
+fn event_ticket_table(
+    ui: &mut Ui,
+    scroll_id: &str,
+    title: &str,
+    context: &str,
+    tickets: &[EventPredictionTicket],
+    empty_text: &str,
+    max_height: f32,
+) {
+    Frame::NONE
+        .fill(theme::SURFACE)
+        .stroke(Stroke::new(1.0, theme::BORDER))
+        .corner_radius(5)
+        .inner_margin(Margin::same(14))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(title).size(14.0).strong());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("{} 条 · {}", tickets.len(), context))
+                            .size(11.0)
+                            .color(theme::MUTED),
+                    );
+                });
+            });
+            ui.add_space(10.0);
+            if tickets.is_empty() {
+                ui.label(RichText::new(empty_text).color(theme::MUTED));
+                return;
+            }
+            ScrollArea::both()
+                .id_salt(scroll_id)
+                .max_height(max_height)
+                .show(ui, |ui| {
+                    egui::Grid::new(format!("{scroll_id}-grid"))
+                        .num_columns(15)
+                        .striped(true)
+                        .spacing([18.0, 12.0])
+                        .show(ui, |ui| {
+                            for heading in [
+                                "票据",
+                                "交易对",
+                                "周期",
+                                "方向",
+                                "置信度",
+                                "分数",
+                                "下注",
+                                "开盘价",
+                                "到期价",
+                                "结果",
+                                "波动",
+                                "虚拟盈亏",
+                                "开盘时间",
+                                "到期时间",
+                                "复盘",
+                            ] {
+                                ui.label(RichText::new(heading).color(theme::MUTED).strong());
+                            }
+                            ui.end_row();
+                            for ticket in tickets {
+                                ui.label(compact_event_id(&ticket.id));
+                                ui.label(RichText::new(&ticket.symbol).strong());
+                                ui.label(format!("{}m", ticket.horizon_minutes));
+                                ui.colored_label(
+                                    prediction_direction_color(&ticket.direction),
+                                    prediction_direction_label(&ticket.direction),
+                                );
+                                ui.label(format!("{:.1}%", ticket.confidence * 100.0));
+                                ui.label(format!("{:+.3}", ticket.score));
+                                ui.label(format!("{:.2}", ticket.stake_amount));
+                                ui.label(format_price(ticket.entry_price));
+                                ui.label(
+                                    ticket
+                                        .expiry_price
+                                        .map(format_price)
+                                        .unwrap_or_else(|| "--".into()),
+                                );
+                                ui.colored_label(
+                                    prediction_result_color(ticket),
+                                    prediction_result_label(ticket),
+                                );
+                                ui.label(
+                                    ticket
+                                        .move_percent
+                                        .map(|value| format!("{value:+.4}%"))
+                                        .unwrap_or_else(|| "--".into()),
+                                );
+                                ui.label(
+                                    ticket
+                                        .virtual_pnl
+                                        .map(|value| format!("{value:+.1}"))
+                                        .unwrap_or_else(|| "--".into()),
+                                );
+                                ui.label(format_event_time(ticket.open_time));
+                                ui.label(format_event_time(ticket.close_time));
+                                ui.label(compact_error(&ticket.review, 120));
+                                ui.end_row();
+                            }
+                        });
+                });
+        });
 }
 
 fn compact_event_id(id: &str) -> String {
