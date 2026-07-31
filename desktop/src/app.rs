@@ -500,8 +500,11 @@ impl GqtApp {
                     match result {
                         Ok(summary) => {
                             self.event_prediction_status = format!(
-                                "{}；本轮新增 {}，结算 {}，无限资金不跳过",
-                                summary.message, summary.created, summary.settled
+                                "{}；本轮评估 {}，新增样本 {}，结算 {}，无限资金不跳过",
+                                summary.message,
+                                summary.evaluated,
+                                summary.created,
+                                summary.settled
                             );
                             self.event_prediction_open_count = summary.open_count;
                             self.event_prediction_starting_bankroll = summary.starting_bankroll;
@@ -1463,7 +1466,7 @@ impl GqtApp {
                 ui.label(RichText::new("事件预测虚拟盘").size(16.0).strong());
                 ui.label(
                     RichText::new(
-                        "仅 BTC/ETH；无限虚拟资金；每分钟为 10m / 30m / 1h 生成虚拟方向票据；输单归零，10m 赢返本金+80%，30m/1h 赢返本金+85%",
+                        "仅 BTC/ETH；无限虚拟资金；每分钟生成 10m / 30m / 1h 全量虚拟预测样本；方向使用数据集校准，结算后用于训练 agent",
                     )
                         .size(11.0)
                         .color(theme::MUTED),
@@ -1484,7 +1487,7 @@ impl GqtApp {
                     self.start_event_prediction_cycle(true);
                 }
                 let changed = ui
-                    .checkbox(&mut self.event_prediction_enabled, "启用每分钟虚拟下单")
+                    .checkbox(&mut self.event_prediction_enabled, "启用每分钟策略评估")
                     .changed();
                 if changed {
                     let value = if self.event_prediction_enabled {
@@ -2460,7 +2463,7 @@ impl GqtApp {
         self.event_prediction_running = true;
         self.last_event_prediction_check = Instant::now();
         self.event_prediction_status = format!(
-            "事件预测正在运行：{} 个交易对，10m/30m/1h 虚拟下单",
+            "事件预测正在运行：{} 个交易对，10m/30m/1h 全量预测样本生成中",
             symbols.len()
         );
         let path = self.workspace.event_predictions.clone();

@@ -16,6 +16,7 @@ pub const EVENT_STAKE_USDT: f64 = 5.0;
 pub const EVENT_TEN_MINUTE_PROFIT_RATE: f64 = 0.80;
 pub const EVENT_DEFAULT_PROFIT_RATE: f64 = 0.85;
 pub const EVENT_SUPPORTED_SYMBOLS: [&str; 2] = ["BTCUSDT", "ETHUSDT"];
+pub const EVENT_STRATEGY_NAME: &str = "direction_dataset_v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventHorizon {
@@ -87,6 +88,38 @@ impl EventDirection {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventSignalAction {
+    Trade,
+}
+
+impl EventSignalAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            EventSignalAction::Trade => "trade",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EventStrategyDecision {
+    action: EventSignalAction,
+    reason: String,
+}
+
+impl EventStrategyDecision {
+    fn trade(reason: impl Into<String>) -> Self {
+        Self {
+            action: EventSignalAction::Trade,
+            reason: reason.into(),
+        }
+    }
+
+    fn should_trade(&self) -> bool {
+        self.action == EventSignalAction::Trade
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EventPredictionTicket {
     pub id: String,
@@ -122,6 +155,7 @@ pub struct EventPredictionStats {
 #[derive(Debug, Clone, Default)]
 pub struct EventPredictionSummary {
     pub created: usize,
+    pub evaluated: usize,
     pub settled: usize,
     pub open_count: i64,
     pub starting_bankroll: f64,
@@ -136,6 +170,7 @@ pub struct EventPredictionSummary {
     pub message: String,
 }
 
+#[derive(Debug, Clone)]
 struct NewEventPrediction {
     id: String,
     symbol: String,
@@ -147,7 +182,7 @@ struct NewEventPrediction {
     score: f64,
     stake_amount: f64,
     entry_price: f64,
-    features_json: String,
+    features: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +196,28 @@ struct DueTicket {
     stake_amount: f64,
     confidence: f64,
     score: f64,
+}
+
+#[derive(Debug, Clone)]
+struct DueSignal {
+    id: String,
+    symbol: String,
+    horizon_minutes: i64,
+    close_time: i64,
+    direction: String,
+    entry_price: f64,
+    stake_amount: f64,
+    confidence: f64,
+    score: f64,
+    action: String,
+    strategy: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct EventCreationSummary {
+    created: usize,
+    evaluated: usize,
 }
 
 struct EventBankroll {
@@ -211,7 +268,37 @@ impl EventPredictionLog {
              CREATE INDEX IF NOT EXISTS event_prediction_symbol_horizon
              ON event_prediction_tickets(symbol, horizon_minutes);
              CREATE INDEX IF NOT EXISTS event_prediction_settled_recent
-             ON event_prediction_tickets(status, settled_at);",
+             ON event_prediction_tickets(status, settled_at);
+             CREATE TABLE IF NOT EXISTS event_prediction_signals (
+                id TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                horizon_minutes INTEGER NOT NULL,
+                open_time INTEGER NOT NULL,
+                close_time INTEGER NOT NULL,
+                direction TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                score REAL NOT NULL,
+                stake_amount REAL NOT NULL DEFAULT 5.0,
+                entry_price REAL NOT NULL,
+                action TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                skip_reason TEXT,
+                status TEXT NOT NULL,
+                result TEXT,
+                expiry_price REAL,
+                move_percent REAL,
+                virtual_pnl REAL,
+                features_json TEXT NOT NULL,
+                review TEXT,
+                settled_at INTEGER
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS unique_event_prediction_signal_round
+             ON event_prediction_signals(symbol, horizon_minutes, open_time);
+             CREATE INDEX IF NOT EXISTS event_prediction_signal_status_close
+             ON event_prediction_signals(status, close_time);
+             CREATE INDEX IF NOT EXISTS event_prediction_signal_symbol_horizon
+             ON event_prediction_signals(symbol, horizon_minutes);",
         )?;
         migrate_schema(&connection)?;
         Ok(Self { connection })
@@ -221,6 +308,7 @@ impl EventPredictionLog {
         let bankroll = self.bankroll()?;
         Ok(EventPredictionSummary {
             created: 0,
+            evaluated: 0,
             settled: 0,
             open_count: self.open_count()?,
             starting_bankroll: EVENT_STARTING_BANKROLL_USDT,
@@ -240,6 +328,8 @@ impl EventPredictionLog {
         if !is_supported_symbol(&prediction.symbol) {
             return Ok(false);
         }
+        let features_json =
+            serde_json::to_string(&prediction.features).context("Failed to encode features")?;
         let changed = self.connection.execute(
             "INSERT OR IGNORE INTO event_prediction_tickets
              (id, created_at, symbol, horizon_minutes, open_time, close_time, direction,
@@ -257,7 +347,46 @@ impl EventPredictionLog {
                 prediction.score,
                 prediction.stake_amount,
                 prediction.entry_price,
-                prediction.features_json,
+                features_json,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    fn record_signal(
+        &self,
+        prediction: &NewEventPrediction,
+        decision: &EventStrategyDecision,
+        now: i64,
+    ) -> Result<bool> {
+        if !is_supported_symbol(&prediction.symbol) {
+            return Ok(false);
+        }
+        let features_json =
+            serde_json::to_string(&prediction.features).context("Failed to encode features")?;
+        let changed = self.connection.execute(
+            "INSERT OR IGNORE INTO event_prediction_signals
+             (id, created_at, symbol, horizon_minutes, open_time, close_time, direction,
+              confidence, score, stake_amount, entry_price, action, strategy, skip_reason,
+              status, features_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                     'open', ?15)",
+            params![
+                prediction.id,
+                now,
+                prediction.symbol,
+                prediction.horizon.minutes(),
+                prediction.open_time,
+                prediction.close_time,
+                prediction.direction.as_str(),
+                prediction.confidence,
+                prediction.score,
+                prediction.stake_amount,
+                prediction.entry_price,
+                decision.action.as_str(),
+                EVENT_STRATEGY_NAME,
+                decision.reason.as_str(),
+                features_json,
             ],
         )?;
         Ok(changed == 1)
@@ -290,6 +419,36 @@ impl EventPredictionLog {
             .context("Failed to read due event prediction tickets")
     }
 
+    fn due_signals(&self, now: i64) -> Result<Vec<DueSignal>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, symbol, horizon_minutes, close_time, direction, entry_price, stake_amount,
+                    confidence, score, action, strategy, COALESCE(skip_reason, '')
+             FROM event_prediction_signals
+             WHERE status = 'open'
+               AND close_time <= ?1
+               AND symbol IN ('BTCUSDT', 'ETHUSDT')
+             ORDER BY close_time ASC",
+        )?;
+        let rows = statement.query_map([now], |row| {
+            Ok(DueSignal {
+                id: row.get(0)?,
+                symbol: row.get(1)?,
+                horizon_minutes: row.get(2)?,
+                close_time: row.get(3)?,
+                direction: row.get(4)?,
+                entry_price: row.get(5)?,
+                stake_amount: row.get(6)?,
+                confidence: row.get(7)?,
+                score: row.get(8)?,
+                action: row.get(9)?,
+                strategy: row.get(10)?,
+                reason: row.get(11)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to read due event prediction signals")
+    }
+
     fn settle_due_with_prices(&self, now: i64, prices: &BTreeMap<String, f64>) -> Result<usize> {
         let due = self.due_tickets(now)?;
         let mut settled = 0;
@@ -300,16 +459,8 @@ impl EventPredictionLog {
             if !price.is_finite() || price <= 0.0 || ticket.entry_price <= 0.0 {
                 continue;
             }
-            let move_percent = (price / ticket.entry_price - 1.0) * 100.0;
-            let result = if move_percent.abs() <= 0.000001 {
-                "tie"
-            } else if (move_percent > 0.0 && ticket.direction == "up")
-                || (move_percent < 0.0 && ticket.direction == "down")
-            {
-                "win"
-            } else {
-                "loss"
-            };
+            let (result, move_percent) =
+                event_settlement_result(&ticket.direction, ticket.entry_price, price);
             let settlement_return =
                 event_settlement_return(result, ticket.horizon_minutes, ticket.stake_amount);
             let virtual_pnl = settlement_return - ticket.stake_amount;
@@ -341,6 +492,62 @@ impl EventPredictionLog {
                     review,
                     now,
                     ticket.id,
+                ],
+            )?;
+            settled += 1;
+        }
+        Ok(settled)
+    }
+
+    fn settle_due_signals_with_prices(
+        &self,
+        now: i64,
+        prices: &BTreeMap<String, f64>,
+    ) -> Result<usize> {
+        let due = self.due_signals(now)?;
+        let mut settled = 0;
+        for signal in due {
+            let Some(price) = prices.get(&signal.symbol).copied() else {
+                continue;
+            };
+            if !price.is_finite() || price <= 0.0 || signal.entry_price <= 0.0 {
+                continue;
+            }
+            let (result, move_percent) =
+                event_settlement_result(&signal.direction, signal.entry_price, price);
+            let settlement_return =
+                event_settlement_return(result, signal.horizon_minutes, signal.stake_amount);
+            let virtual_pnl = settlement_return - signal.stake_amount;
+            let review = format!(
+                "{} signal: action {}, {} {}m stake {:.2} USDT, hypothetical pnl {:+.2} USDT, entry {:.8}, expiry {:.8}, move {:+.4}%, confidence {:.1}%, score {:+.3}, strategy {}, reason {}, settled {}s late",
+                result,
+                signal.action,
+                signal.direction,
+                signal.horizon_minutes,
+                signal.stake_amount,
+                virtual_pnl,
+                signal.entry_price,
+                price,
+                move_percent,
+                signal.confidence * 100.0,
+                signal.score,
+                signal.strategy,
+                signal.reason,
+                now.saturating_sub(signal.close_time)
+            );
+            self.connection.execute(
+                "UPDATE event_prediction_signals
+                 SET status = 'settled', result = ?1, expiry_price = ?2, move_percent = ?3,
+                     virtual_pnl = ?4, review = ?5, settled_at = ?6
+                 WHERE id = ?7 AND status = 'open'",
+                params![
+                    result,
+                    price,
+                    move_percent,
+                    virtual_pnl,
+                    review,
+                    now,
+                    signal.id,
                 ],
             )?;
             settled += 1;
@@ -511,13 +718,17 @@ pub fn run_cycle(path: &Path, symbols: &[String]) -> Result<EventPredictionSumma
         }
     }
     let settled = log.settle_due_with_prices(now, &settlement_prices)?;
+    let settled_signals = log.settle_due_signals_with_prices(now, &settlement_prices)?;
 
     let open_time = (now / 60) * 60;
-    let mut created = 0;
+    let mut creation = EventCreationSummary::default();
     for symbol in &symbols {
         let result = create_symbol_predictions(&log, &client, symbol, open_time, now);
         match result {
-            Ok(count) => created += count,
+            Ok(summary) => {
+                creation.created += summary.created;
+                creation.evaluated += summary.evaluated;
+            }
             Err(error) => failures.push(format!("{symbol}: {error}")),
         }
     }
@@ -527,18 +738,26 @@ pub fn run_cycle(path: &Path, symbols: &[String]) -> Result<EventPredictionSumma
     let stats = log.stats()?;
     let open_recent = log.open_recent(80)?;
     let settled_recent = log.settled_recent(80)?;
-    if created == 0 && settled == 0 && !failures.is_empty() {
+    if creation.created == 0 && settled == 0 && settled_signals == 0 && !failures.is_empty() {
         bail!("{}", failures.join("; "));
     }
     let mut message = format!(
-        "event predictions: created {created}, settled {settled}, unlimited bankroll, open {open_count}, open_exposure {:.2}, realized_pnl {:+.2}",
-        bankroll.open_exposure, bankroll.realized_pnl
+        "event predictions: strategy {}, evaluated {}, created {}, settled {}, signal_settled {}, unlimited bankroll, open {}, open_exposure {:.2}, realized_pnl {:+.2}",
+        EVENT_STRATEGY_NAME,
+        creation.evaluated,
+        creation.created,
+        settled,
+        settled_signals,
+        open_count,
+        bankroll.open_exposure,
+        bankroll.realized_pnl
     );
     if !failures.is_empty() {
         message.push_str(&format!("; failures: {}", failures.join("; ")));
     }
     Ok(EventPredictionSummary {
-        created,
+        created: creation.created,
+        evaluated: creation.evaluated,
         settled,
         open_count,
         starting_bankroll: EVENT_STARTING_BANKROLL_USDT,
@@ -556,10 +775,18 @@ pub fn run_cycle(path: &Path, symbols: &[String]) -> Result<EventPredictionSumma
 
 fn due_symbols(log: &EventPredictionLog, now: i64) -> Result<Vec<String>> {
     let mut statement = log.connection.prepare(
-        "SELECT DISTINCT symbol FROM event_prediction_tickets
-         WHERE status = 'open'
-           AND close_time <= ?1
-           AND symbol IN ('BTCUSDT', 'ETHUSDT')",
+        "SELECT DISTINCT symbol FROM (
+            SELECT symbol FROM event_prediction_tickets
+             WHERE status = 'open'
+               AND close_time <= ?1
+               AND symbol IN ('BTCUSDT', 'ETHUSDT')
+            UNION
+            SELECT symbol FROM event_prediction_signals
+             WHERE status = 'open'
+               AND close_time <= ?1
+               AND symbol IN ('BTCUSDT', 'ETHUSDT')
+         )
+         ORDER BY symbol",
     )?;
     let rows = statement.query_map([now], |row| row.get(0))?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -597,6 +824,20 @@ fn migrate_payout_model(connection: &Connection) -> Result<()> {
             params![EVENT_TEN_MINUTE_PROFIT_RATE, EVENT_DEFAULT_PROFIT_RATE],
         )
         .context("Failed to migrate event prediction payout model")?;
+    connection
+        .execute(
+            "UPDATE event_prediction_signals
+             SET virtual_pnl = CASE
+                WHEN result = 'win' AND horizon_minutes = 10 THEN stake_amount * ?1
+                WHEN result = 'win' THEN stake_amount * ?2
+                WHEN result = 'loss' THEN -stake_amount
+                WHEN result = 'tie' THEN 0.0
+                ELSE virtual_pnl
+             END
+             WHERE status = 'settled'",
+            params![EVENT_TEN_MINUTE_PROFIT_RATE, EVENT_DEFAULT_PROFIT_RATE],
+        )
+        .context("Failed to migrate event prediction signal payout model")?;
     Ok(())
 }
 
@@ -606,6 +847,24 @@ fn event_profit_rate(horizon_minutes: i64) -> f64 {
     } else {
         EVENT_DEFAULT_PROFIT_RATE
     }
+}
+
+fn event_settlement_result(
+    direction: &str,
+    entry_price: f64,
+    expiry_price: f64,
+) -> (&'static str, f64) {
+    let move_percent = (expiry_price / entry_price - 1.0) * 100.0;
+    let result = if move_percent.abs() <= 0.000001 {
+        "tie"
+    } else if (move_percent > 0.0 && direction == "up")
+        || (move_percent < 0.0 && direction == "down")
+    {
+        "win"
+    } else {
+        "loss"
+    };
+    (result, move_percent)
 }
 
 fn event_settlement_return(result: &str, horizon_minutes: i64, stake_amount: f64) -> f64 {
@@ -622,7 +881,7 @@ fn create_symbol_predictions(
     symbol: &str,
     open_time: i64,
     now: i64,
-) -> Result<usize> {
+) -> Result<EventCreationSummary> {
     let candles = market::fetch_candles(client, symbol, Interval::OneMinute, 240)?;
     if candles.len() < 80 {
         bail!(
@@ -631,14 +890,18 @@ fn create_symbol_predictions(
         );
     }
     let snapshot = market::fetch_snapshot(client, symbol)?;
-    let mut created = 0;
+    let mut summary = EventCreationSummary::default();
     for horizon in EventHorizon::ALL {
         let prediction = make_prediction(symbol, horizon, &candles, &snapshot, open_time)?;
-        if log.record_prediction(&prediction, now)? {
-            created += 1;
+        let decision =
+            EventStrategyDecision::trade("每轮全量虚拟预测样本：用结算结果训练方向 agent");
+        summary.evaluated += 1;
+        let _ = log.record_signal(&prediction, &decision, now)?;
+        if decision.should_trade() && log.record_prediction(&prediction, now)? {
+            summary.created += 1;
         }
     }
-    Ok(created)
+    Ok(summary)
 }
 
 fn make_prediction(
@@ -652,18 +915,29 @@ fn make_prediction(
     if !entry_price.is_finite() || entry_price <= 0.0 {
         bail!("invalid entry price");
     }
-    let features = prediction_features(candles, snapshot);
-    let score = horizon_score(horizon, &features).clamp(-1.0, 1.0);
-    let direction = if score > 0.0 {
+    let mut features = prediction_features(candles, snapshot);
+    let raw_score = horizon_score(horizon, &features).clamp(-1.0, 1.0);
+    let raw_direction = if raw_score > 0.0 {
         EventDirection::Up
-    } else if score < 0.0 {
+    } else if raw_score < 0.0 {
         EventDirection::Down
     } else if snapshot.change_percent >= 0.0 {
         EventDirection::Up
     } else {
         EventDirection::Down
     };
-    let confidence = (0.50 + score.abs() * 0.38).clamp(0.51, 0.88);
+    let direction_decision = calibrated_direction(horizon, raw_score, raw_direction);
+    let direction = direction_decision.direction;
+    let score = signed_score_for_direction(raw_score.abs(), direction);
+    add_direction_training_fields(
+        &mut features,
+        horizon,
+        raw_score,
+        raw_direction,
+        &direction_decision,
+        score,
+    );
+    let confidence = (0.50 + raw_score.abs() * 0.38).clamp(0.51, 0.88);
     let close_time = open_time + horizon.seconds();
     let id = format!(
         "{}-{}m-{}",
@@ -682,8 +956,74 @@ fn make_prediction(
         score,
         stake_amount: EVENT_STAKE_USDT,
         entry_price,
-        features_json: serde_json::to_string(&features)?,
+        features,
     })
+}
+
+#[derive(Debug, Clone)]
+struct DirectionDecision {
+    direction: EventDirection,
+    reason: &'static str,
+    flipped: bool,
+}
+
+fn calibrated_direction(
+    horizon: EventHorizon,
+    raw_score: f64,
+    raw_direction: EventDirection,
+) -> DirectionDecision {
+    let abs_score = raw_score.abs();
+    if raw_direction == EventDirection::Up {
+        return DirectionDecision {
+            direction: EventDirection::Down,
+            reason: "raw_up_contrarian_calibration",
+            flipped: true,
+        };
+    }
+    if abs_score >= 0.60 {
+        return DirectionDecision {
+            direction: EventDirection::Up,
+            reason: match horizon {
+                EventHorizon::TenMinutes => "strong_down_short_reversal_calibration",
+                EventHorizon::ThirtyMinutes => "strong_down_mid_reversal_calibration",
+                EventHorizon::OneHour => "strong_down_long_reversal_calibration",
+            },
+            flipped: true,
+        };
+    }
+    DirectionDecision {
+        direction: raw_direction,
+        reason: "raw_down_continuation_calibration",
+        flipped: false,
+    }
+}
+
+fn signed_score_for_direction(abs_score: f64, direction: EventDirection) -> f64 {
+    match direction {
+        EventDirection::Up => abs_score.abs(),
+        EventDirection::Down => -abs_score.abs(),
+    }
+    .clamp(-1.0, 1.0)
+}
+
+fn add_direction_training_fields(
+    features: &mut Value,
+    horizon: EventHorizon,
+    raw_score: f64,
+    raw_direction: EventDirection,
+    decision: &DirectionDecision,
+    final_score: f64,
+) {
+    if let Some(object) = features.as_object_mut() {
+        object.insert("strategy_version".into(), json!(EVENT_STRATEGY_NAME));
+        object.insert("horizon_minutes".into(), json!(horizon.minutes()));
+        object.insert("raw_score".into(), json!(raw_score));
+        object.insert("raw_direction".into(), json!(raw_direction.as_str()));
+        object.insert("final_score".into(), json!(final_score));
+        object.insert("final_direction".into(), json!(decision.direction.as_str()));
+        object.insert("direction_flipped".into(), json!(decision.flipped));
+        object.insert("direction_reason".into(), json!(decision.reason));
+    }
 }
 
 fn usable_price(snapshot: &MarketSnapshot) -> f64 {
@@ -959,7 +1299,7 @@ mod tests {
         assert!(open_dashboard.available_balance.is_infinite());
 
         let mut prices = BTreeMap::new();
-        prices.insert("BTCUSDT".into(), 105.0);
+        prices.insert("BTCUSDT".into(), 101.0);
         assert_eq!(
             log.settle_due_with_prices(open_time + 60 * 60 + 1, &prices)
                 .unwrap(),
@@ -986,6 +1326,37 @@ mod tests {
             3
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn direction_dataset_calibrates_direction_without_dropping_samples() {
+        let raw_up = calibrated_direction(EventHorizon::ThirtyMinutes, 0.42, EventDirection::Up);
+        assert_eq!(raw_up.direction, EventDirection::Down);
+        assert!(raw_up.flipped);
+
+        let strong_raw_down =
+            calibrated_direction(EventHorizon::OneHour, -0.72, EventDirection::Down);
+        assert_eq!(strong_raw_down.direction, EventDirection::Up);
+        assert!(strong_raw_down.flipped);
+
+        let moderate_raw_down =
+            calibrated_direction(EventHorizon::TenMinutes, -0.32, EventDirection::Down);
+        assert_eq!(moderate_raw_down.direction, EventDirection::Down);
+        assert!(!moderate_raw_down.flipped);
+
+        let mut features = json!({"momentum10": 0.25});
+        add_direction_training_fields(
+            &mut features,
+            EventHorizon::ThirtyMinutes,
+            0.42,
+            EventDirection::Up,
+            &raw_up,
+            -0.42,
+        );
+        assert_eq!(features["strategy_version"], EVENT_STRATEGY_NAME);
+        assert_eq!(features["raw_direction"], "up");
+        assert_eq!(features["final_direction"], "down");
+        assert_eq!(features["direction_flipped"], true);
     }
 
     #[test]
