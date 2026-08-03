@@ -98,3 +98,9 @@ Append one compact entry after each event prediction review. Keep raw ticket dat
 - Failure mode: 17:00 local regime flipped into an upward rebound. Latest 30m realized average moves were positive across horizons (+0.057% 10m, +0.201% 30m, +0.295% 60m), while v3 was still mostly DOWN. The worst recent bucket is `raw_up_contrarian_or_exhaustion_down_v3` on 10m: 130 tickets since 15:43, 31.54%, -281.0.
 - Settlement quality: after 17:00 local average lateness was about 9-10 seconds by horizon, max 67 seconds, and no ticket exceeded 120 seconds late, so the drawdown is not explained by late settlement.
 - Next tuning hypothesis: do not reduce sampling. Measure a v4 regime detector that keeps full BTC/ETH 10m/30m/60m tickets but stops forcing DOWN when short-term rebound momentum and RSI are already positive after a 24h drawdown; 10m needs separate treatment from 30m/60m.
+
+## 2026-08-03 Active Horizon and Data Cadence Update
+
+- Operational change: retire 10m from the active event-contract workflow because recent live-forward samples showed it dragging headline operation performance. New automatic and manual virtual tickets should now be BTC/ETH 30m and 60m only; old 10m SQLite records remain untouched and may still settle silently if already open.
+- Active headline stats and training-pack exports should exclude retired 10m rows. Historical review notes keep 10m results only as legacy evidence, not as the current operating target.
+- Normal futures/AI trading data cadence changed to favor more samples: `one_signal_per_candle` defaults to false and existing runtime configs/strategies are migrated away from `process_only_new_candles = True`, so signal collection is no longer blocked by the old per-candle timing gate.

@@ -133,6 +133,7 @@ def export(args: argparse.Namespace) -> int:
          WHERE status = 'settled'
            AND result IN ('win', 'loss', 'tie')
            AND symbol IN ('BTCUSDT', 'ETHUSDT')
+           AND horizon_minutes IN (30, 60)
          ORDER BY created_at ASC, symbol ASC, horizon_minutes ASC
         """
     )

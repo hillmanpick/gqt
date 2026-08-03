@@ -63,7 +63,7 @@ impl Page {
             Page::Overview => "Binance U 本位永续",
             Page::Account => "真实账户资金与合约持仓",
             Page::PositionHistory => "模拟盘成交与仓位记录",
-            Page::EventPrediction => "10m / 30m / 1h 虚拟预测复盘",
+            Page::EventPrediction => "30m / 1h 虚拟预测复盘",
             Page::Market => "实时 K 线与市场情绪",
             Page::Strategy => "Rust 客户端 / Freqtrade Interface v3",
             Page::Backtest => "历史验证与成本压力测试",
@@ -466,7 +466,7 @@ impl Default for AiTradingConfig {
             minimum_volume_ratio: -0.35,
             model_timeout_seconds: 30,
             market_max_age_seconds: 90,
-            one_signal_per_candle: true,
+            one_signal_per_candle: false,
         }
     }
 }

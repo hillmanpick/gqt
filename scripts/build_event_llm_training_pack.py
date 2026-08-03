@@ -3,9 +3,10 @@
 
 The script is read-only against SQLite and writes generated artifacts under an
 ignored local output directory by default. It keeps sample volume high: every
-settled BTC/ETH 10m/30m/60m ticket becomes a supervised label, while factor
+settled BTC/ETH 30m/60m ticket becomes a supervised label, while factor
 reports are generated separately so strategy changes can be measured instead of
-hand-waved.
+hand-waved. The active event-contract dataset uses BTC/ETH 30m and 60m tickets;
+older 10m rows are intentionally excluded because that horizon was retired.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from typing import Any, Iterable
 
 
 SUPPORTED_SYMBOLS = ("BTCUSDT", "ETHUSDT")
-SUPPORTED_HORIZONS = (10, 30, 60)
+SUPPORTED_HORIZONS = (30, 60)
 CURRENT_STRATEGY = "direction_dataset_v3"
 KNOWN_STRATEGIES = ("legacy_raw", "direction_dataset_v2", "direction_dataset_v3")
 DEFAULT_OUTPUT_DIR = Path("data/event_llm_training")
@@ -144,7 +145,7 @@ def load_rows(database: Path) -> list[dict[str, Any]]:
          WHERE status = 'settled'
            AND result IN ('win', 'loss', 'tie')
            AND symbol IN ('BTCUSDT', 'ETHUSDT')
-           AND horizon_minutes IN (10, 30, 60)
+           AND horizon_minutes IN (30, 60)
          ORDER BY created_at ASC, symbol ASC, horizon_minutes ASC
         """
     ).fetchall()
@@ -497,7 +498,6 @@ def make_manifest(
         "by_horizon": aggregate(selected_records, "horizon_minutes"),
         "by_symbol": aggregate(selected_records, "symbol"),
         "payout_breakeven": {
-            "10m": breakeven_rate(10),
             "30m": breakeven_rate(30),
             "60m": breakeven_rate(60),
         },

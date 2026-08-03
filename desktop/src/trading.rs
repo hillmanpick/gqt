@@ -611,6 +611,14 @@ fn migrate_default_strategy(path: &Path) -> Result<()> {
                 || !source.contains("gqt_daily_profit_timezone_offset_hours")));
     if legacy_default {
         fs::write(path, DEFAULT_STRATEGY).context("无法迁移默认 Freqtrade 策略")?;
+    } else {
+        let updated = source.replace(
+            "process_only_new_candles = True",
+            "process_only_new_candles = False",
+        );
+        if updated != source {
+            fs::write(path, updated).context("无法更新 Freqtrade 策略处理频率")?;
+        }
     }
     Ok(())
 }
@@ -624,6 +632,14 @@ fn migrate_ai_strategy(path: &Path) -> Result<()> {
     if legacy_default {
         fs::write(path, DEFAULT_AI_STRATEGY)
             .context("Failed to migrate default AI Freqtrade strategy")?;
+    } else {
+        let updated = source.replace(
+            "process_only_new_candles = True",
+            "process_only_new_candles = False",
+        );
+        if updated != source {
+            fs::write(path, updated).context("Failed to update AI strategy processing cadence")?;
+        }
     }
     Ok(())
 }
@@ -660,6 +676,10 @@ fn migrate_ai_config(path: &Path) -> Result<()> {
         config.minimum_trend_quality = 0.42;
         config.minimum_adx = 10.0;
         config.minimum_volume_ratio = -0.35;
+        should_write = true;
+    }
+    if config.one_signal_per_candle {
+        config.one_signal_per_candle = false;
         should_write = true;
     }
     if should_write {
@@ -1044,6 +1064,7 @@ mod tests {
         let workspace = TradingWorkspace::ensure(&root).unwrap();
         let stored_ai = workspace.ai_trading_config().unwrap();
         assert_eq!(stored_ai.symbol_whitelist, default_ai_symbol_whitelist());
+        assert!(!stored_ai.one_signal_per_candle);
         let config: Value =
             serde_json::from_str(&fs::read_to_string(&workspace.config).unwrap()).unwrap();
         assert_eq!(

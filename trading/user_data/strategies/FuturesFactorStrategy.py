@@ -148,7 +148,7 @@ class FuturesFactorStrategy(IStrategy):
     INTERFACE_VERSION = 3
     can_short = True
     timeframe = "15m"
-    process_only_new_candles = True
+    process_only_new_candles = False
     startup_candle_count = 320
 
     position_adjustment_enable = True

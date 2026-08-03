@@ -26,11 +26,7 @@ pub enum EventHorizon {
 }
 
 impl EventHorizon {
-    pub const ALL: [EventHorizon; 3] = [
-        EventHorizon::TenMinutes,
-        EventHorizon::ThirtyMinutes,
-        EventHorizon::OneHour,
-    ];
+    pub const ALL: [EventHorizon; 2] = [EventHorizon::ThirtyMinutes, EventHorizon::OneHour];
 
     pub fn minutes(self) -> i64 {
         match self {
@@ -50,6 +46,10 @@ impl EventHorizon {
 
     fn seconds(self) -> i64 {
         self.minutes() * 60
+    }
+
+    fn is_active(self) -> bool {
+        matches!(self, EventHorizon::ThirtyMinutes | EventHorizon::OneHour)
     }
 }
 
@@ -351,7 +351,7 @@ impl EventPredictionLog {
             open_recent: self.open_recent(80)?,
             settled_recent: self.settled_recent(80)?,
             directions: Vec::new(),
-            message: format!("事件预测虚拟盘就绪：当前策略 {EVENT_STRATEGY_NAME}"),
+            message: format!("事件预测虚拟盘就绪：当前策略 {EVENT_STRATEGY_NAME}，活跃周期 30m/1h"),
         })
     }
 
@@ -593,6 +593,7 @@ impl EventPredictionLog {
                 "SELECT COUNT(*) FROM event_prediction_tickets
                  WHERE status = 'open'
                    AND symbol IN ('BTCUSDT', 'ETHUSDT')
+                   AND horizon_minutes IN (30, 60)
                    AND instr(features_json, ?1) > 0",
                 [marker],
                 |row| row.get(0),
@@ -615,12 +616,14 @@ impl EventPredictionLog {
                      FROM event_prediction_tickets
                      WHERE status = 'settled'
                        AND symbol IN ('BTCUSDT', 'ETHUSDT')
+                       AND horizon_minutes IN (30, 60)
                        AND instr(features_json, ?1) > 0"
         } else {
             "SELECT COALESCE(SUM(virtual_pnl), 0.0)
                      FROM event_prediction_tickets
                      WHERE status = 'settled'
-                       AND symbol IN ('BTCUSDT', 'ETHUSDT')"
+                       AND symbol IN ('BTCUSDT', 'ETHUSDT')
+                       AND horizon_minutes IN (30, 60)"
         };
         let realized_params = strategy_filter.iter().map(String::as_str);
         let realized_pnl = self
@@ -636,12 +639,14 @@ impl EventPredictionLog {
                      FROM event_prediction_tickets
                      WHERE status = 'open'
                        AND symbol IN ('BTCUSDT', 'ETHUSDT')
+                       AND horizon_minutes IN (30, 60)
                        AND instr(features_json, ?1) > 0"
         } else {
             "SELECT COALESCE(SUM(stake_amount), 0.0)
                      FROM event_prediction_tickets
                      WHERE status = 'open'
-                       AND symbol IN ('BTCUSDT', 'ETHUSDT')"
+                       AND symbol IN ('BTCUSDT', 'ETHUSDT')
+                       AND horizon_minutes IN (30, 60)"
         };
         let open_params = strategy_filter.iter().map(String::as_str);
         let open_exposure = self
@@ -688,6 +693,7 @@ impl EventPredictionLog {
                  FROM event_prediction_tickets
                  WHERE status = 'settled'
                    AND symbol IN ('BTCUSDT', 'ETHUSDT')
+                   AND horizon_minutes IN (30, 60)
                    AND instr(features_json, ?1) > 0
                  GROUP BY horizon_minutes
                  ORDER BY horizon_minutes"
@@ -702,6 +708,7 @@ impl EventPredictionLog {
                  FROM event_prediction_tickets
                  WHERE status = 'settled'
                    AND symbol IN ('BTCUSDT', 'ETHUSDT')
+                   AND horizon_minutes IN (30, 60)
                  GROUP BY horizon_minutes
                  ORDER BY horizon_minutes"
         })?;
@@ -743,6 +750,7 @@ impl EventPredictionLog {
              FROM event_prediction_tickets
              WHERE status = 'open'
                AND symbol IN ('BTCUSDT', 'ETHUSDT')
+               AND horizon_minutes IN (30, 60)
                AND instr(features_json, ?2) > 0
              ORDER BY close_time ASC, open_time DESC, horizon_minutes ASC
              LIMIT ?1",
@@ -761,6 +769,7 @@ impl EventPredictionLog {
              FROM event_prediction_tickets
              WHERE status = 'settled'
                AND symbol IN ('BTCUSDT', 'ETHUSDT')
+               AND horizon_minutes IN (30, 60)
                AND instr(features_json, ?2) > 0
              ORDER BY COALESCE(settled_at, close_time) DESC, close_time DESC, open_time DESC
              LIMIT ?1",
@@ -879,9 +888,10 @@ pub fn run_cycle_for_horizons(
 fn normalized_horizons(horizons: &[EventHorizon]) -> Vec<EventHorizon> {
     let mut normalized = Vec::new();
     for horizon in horizons {
-        if !normalized
-            .iter()
-            .any(|existing: &EventHorizon| existing.minutes() == horizon.minutes())
+        if horizon.is_active()
+            && !normalized
+                .iter()
+                .any(|existing: &EventHorizon| existing.minutes() == horizon.minutes())
         {
             normalized.push(*horizon);
         }
@@ -1465,7 +1475,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn predicts_all_event_horizons_and_settles() {
+    fn predicts_active_event_horizons_and_settles() {
         let root = std::env::temp_dir().join(format!("gqt-event-{}", rand::random::<u64>()));
         fs::create_dir_all(&root).unwrap();
         let log = EventPredictionLog::open(&root.join("events.sqlite")).unwrap();
@@ -1493,12 +1503,12 @@ mod tests {
                 created += 1;
             }
         }
-        assert_eq!(created, 3);
-        assert_eq!(log.open_count().unwrap(), 3);
+        assert_eq!(created, 2);
+        assert_eq!(log.open_count().unwrap(), 2);
         let open_dashboard = log.dashboard().unwrap();
         assert_eq!(open_dashboard.stake_amount, 5.0);
         assert!(open_dashboard.starting_bankroll.is_infinite());
-        assert_eq!(open_dashboard.open_exposure, 15.0);
+        assert_eq!(open_dashboard.open_exposure, 10.0);
         assert!(open_dashboard.available_balance.is_infinite());
 
         let mut prices = BTreeMap::new();
@@ -1506,29 +1516,40 @@ mod tests {
         assert_eq!(
             log.settle_due_with_prices(open_time + 60 * 60 + 1, &prices)
                 .unwrap(),
-            3
+            2
         );
         let dashboard = log.dashboard().unwrap();
         assert_eq!(dashboard.open_count, 0);
         assert_eq!(dashboard.open_exposure, 0.0);
-        assert_close(dashboard.realized_pnl, 12.5);
+        assert_close(dashboard.realized_pnl, 8.5);
         assert!(dashboard.equity.is_infinite());
         assert!(dashboard.available_balance.is_infinite());
         assert_eq!(dashboard.open_recent.len(), 0);
-        assert_eq!(dashboard.settled_recent.len(), 3);
+        assert_eq!(dashboard.settled_recent.len(), 2);
         let pnl_by_horizon = dashboard
             .settled_recent
             .iter()
             .map(|ticket| (ticket.horizon_minutes, ticket.virtual_pnl.unwrap()))
             .collect::<BTreeMap<_, _>>();
-        assert_close(*pnl_by_horizon.get(&10).unwrap(), 4.0);
         assert_close(*pnl_by_horizon.get(&30).unwrap(), 4.25);
         assert_close(*pnl_by_horizon.get(&60).unwrap(), 4.25);
         assert_eq!(
             dashboard.stats.iter().map(|stat| stat.total).sum::<i64>(),
-            3
+            2
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inactive_ten_minute_requests_do_not_create_new_samples() {
+        let horizons = normalized_horizons(&[EventHorizon::TenMinutes]);
+        assert_eq!(
+            horizons
+                .iter()
+                .map(|horizon| horizon.minutes())
+                .collect::<Vec<_>>(),
+            vec![30, 60]
+        );
     }
 
     #[test]

@@ -1,8 +1,9 @@
 # Event contract LLM training
 
 This workflow turns local BTC/ETH event-contract virtual tickets into local LLM
-training artifacts and factor reports. Generated data stays local under
-`data/`, which is ignored by Git.
+training artifacts and factor reports. The active dataset uses 30m and 1h
+tickets; retired 10m tickets are excluded from new packs. Generated data stays
+local under `data/`, which is ignored by Git.
 
 ## Generate the pack
 

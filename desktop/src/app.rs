@@ -162,7 +162,6 @@ pub struct GqtApp {
     event_prediction_recent: Vec<EventPredictionTicket>,
     event_prediction_history: Vec<EventPredictionTicket>,
     event_prediction_run_dialog_open: bool,
-    event_prediction_manual_10m: bool,
     event_prediction_manual_30m: bool,
     event_prediction_manual_60m: bool,
     event_prediction_order_dialog: Option<EventOrderKind>,
@@ -366,7 +365,6 @@ impl GqtApp {
             event_prediction_recent: event_prediction_dashboard.open_recent,
             event_prediction_history: event_prediction_dashboard.settled_recent,
             event_prediction_run_dialog_open: false,
-            event_prediction_manual_10m: true,
             event_prediction_manual_30m: true,
             event_prediction_manual_60m: true,
             event_prediction_order_dialog: None,
@@ -1511,7 +1509,7 @@ impl GqtApp {
                 ui.label(
                     RichText::new(
                         format!(
-                            "仅 BTC/ETH；无限虚拟资金；每分钟生成 10m / 30m / 1h 全量虚拟预测样本；当前策略 {}，主胜率只看当前策略",
+                            "仅 BTC/ETH；无限虚拟资金；每分钟生成 30m / 1h 全量虚拟预测样本；当前策略 {}，主胜率只看当前策略",
                             event_prediction::EVENT_STRATEGY_NAME
                         ),
                     )
@@ -1556,10 +1554,8 @@ impl GqtApp {
         );
         ui.add_space(10.0);
 
-        let stat10 = event_stat(&self.event_prediction_stats, 10);
         let stat30 = event_stat(&self.event_prediction_stats, 30);
         let stat60 = event_stat(&self.event_prediction_stats, 60);
-        let all_stat10 = event_stat(&self.event_prediction_all_stats, 10);
         let all_stat30 = event_stat(&self.event_prediction_all_stats, 30);
         let all_stat60 = event_stat(&self.event_prediction_all_stats, 60);
         ui.columns(4, |cols| {
@@ -1608,7 +1604,7 @@ impl GqtApp {
             );
         });
         ui.add_space(10.0);
-        ui.columns(4, |cols| {
+        ui.columns(3, |cols| {
             metric(
                 &mut cols[0],
                 "未结算票据",
@@ -1616,22 +1612,20 @@ impl GqtApp {
                 "等待到期复盘",
                 theme::YELLOW,
             );
-            event_metric(&mut cols[1], "v3 10m 胜率", &stat10);
-            event_metric(&mut cols[2], "v3 30m 胜率", &stat30);
-            event_metric(&mut cols[3], "v3 1h 胜率", &stat60);
+            event_metric(&mut cols[1], "v3 30m 胜率", &stat30);
+            event_metric(&mut cols[2], "v3 1h 胜率", &stat60);
         });
         ui.add_space(10.0);
-        ui.columns(4, |cols| {
+        ui.columns(3, |cols| {
             metric(
                 &mut cols[0],
                 "统计口径",
-                "当前 / 全历史",
-                "上排胜率只看当前策略；下排是历史参考",
+                "30m / 1h",
+                "10m 已停用；这里不再纳入 10m 历史票据",
                 theme::TEXT,
             );
-            event_metric(&mut cols[1], "历史 10m", &all_stat10);
-            event_metric(&mut cols[2], "历史 30m", &all_stat30);
-            event_metric(&mut cols[3], "历史 1h", &all_stat60);
+            event_metric(&mut cols[1], "历史 30m", &all_stat30);
+            event_metric(&mut cols[2], "历史 1h", &all_stat60);
         });
         ui.add_space(18.0);
         if let Some(ticket) = event_ticket_list_card(
@@ -2347,20 +2341,18 @@ impl GqtApp {
                 ui.set_min_width(360.0);
                 ui.label("选择这次要生成的虚拟预测周期：");
                 ui.add_space(6.0);
-                ui.checkbox(&mut self.event_prediction_manual_10m, "10 分钟");
                 ui.checkbox(&mut self.event_prediction_manual_30m, "30 分钟");
                 ui.checkbox(&mut self.event_prediction_manual_60m, "1 小时");
                 ui.add_space(8.0);
                 ui.label(
-                    RichText::new("确认后会立即读取 Binance Futures 公共行情，并返回 BTC/ETH 当前买涨或买跌。")
+                    RichText::new("10分钟已停用。确认后会立即读取 Binance Futures 公共行情，并返回 BTC/ETH 当前买涨或买跌。")
                         .size(11.0)
                         .color(theme::MUTED),
                 );
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    let has_selection = self.event_prediction_manual_10m
-                        || self.event_prediction_manual_30m
-                        || self.event_prediction_manual_60m;
+                    let has_selection =
+                        self.event_prediction_manual_30m || self.event_prediction_manual_60m;
                     if ui
                         .add_enabled(
                             has_selection && !self.event_prediction_running,
@@ -2791,9 +2783,6 @@ impl GqtApp {
 
     fn start_event_prediction_manual_cycle(&mut self) {
         let mut horizons = Vec::new();
-        if self.event_prediction_manual_10m {
-            horizons.push(EventHorizon::TenMinutes);
-        }
         if self.event_prediction_manual_30m {
             horizons.push(EventHorizon::ThirtyMinutes);
         }
@@ -2946,7 +2935,7 @@ impl GqtApp {
                     ui.checkbox(&mut self.ai_config.dry_run_only, "仅允许模拟盘");
                     ui.checkbox(
                         &mut self.ai_config.one_signal_per_candle,
-                        "每根 K 线只执行一次",
+                        "限制为每根 K 线只执行一次（数据采集建议关闭）",
                     );
                 });
                 ui.add_space(8.0);
@@ -4357,7 +4346,7 @@ fn format_event_horizon_selection(horizons: &[EventHorizon]) -> String {
 
 fn format_event_run_directions(directions: &[EventPredictionRunDirection]) -> String {
     let mut groups = Vec::new();
-    for horizon in [10, 30, 60] {
+    for horizon in [30, 60] {
         let mut parts = directions
             .iter()
             .filter(|direction| direction.horizon_minutes == horizon)

@@ -30,5 +30,5 @@
   "minimum_volume_ratio": -0.35,
   "model_timeout_seconds": 30,
   "market_max_age_seconds": 90,
-  "one_signal_per_candle": true
+  "one_signal_per_candle": false
 }
