@@ -34,7 +34,7 @@ use crate::{
 };
 
 const AI_TIMEFRAMES: [&str; 6] = ["1m", "5m", "15m", "1h", "4h", "1d"];
-const BUILD_LABEL: &str = "0.4.0-event-v3";
+const BUILD_LABEL: &str = "0.4.0-event-v4";
 const RELAY_DEFAULT_MODEL: &str = "gpt-5.6-luna";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1612,8 +1612,8 @@ impl GqtApp {
                 "等待到期复盘",
                 theme::YELLOW,
             );
-            event_metric(&mut cols[1], "v3 30m 胜率", &stat30);
-            event_metric(&mut cols[2], "v3 1h 胜率", &stat60);
+            event_metric(&mut cols[1], "v4 30m 胜率", &stat30);
+            event_metric(&mut cols[2], "v4 1h 胜率", &stat60);
         });
         ui.add_space(10.0);
         ui.columns(3, |cols| {

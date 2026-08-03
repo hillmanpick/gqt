@@ -25,8 +25,13 @@ from typing import Any, Iterable
 
 SUPPORTED_SYMBOLS = ("BTCUSDT", "ETHUSDT")
 SUPPORTED_HORIZONS = (30, 60)
-CURRENT_STRATEGY = "direction_dataset_v3"
-KNOWN_STRATEGIES = ("legacy_raw", "direction_dataset_v2", "direction_dataset_v3")
+CURRENT_STRATEGY = "direction_dataset_v4"
+KNOWN_STRATEGIES = (
+    "legacy_raw",
+    "direction_dataset_v2",
+    "direction_dataset_v3",
+    "direction_dataset_v4",
+)
 DEFAULT_OUTPUT_DIR = Path("data/event_llm_training")
 
 FACTOR_DESCRIPTIONS = {

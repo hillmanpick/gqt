@@ -16,7 +16,11 @@ pub const EVENT_STAKE_USDT: f64 = 5.0;
 pub const EVENT_TEN_MINUTE_PROFIT_RATE: f64 = 0.80;
 pub const EVENT_DEFAULT_PROFIT_RATE: f64 = 0.85;
 pub const EVENT_SUPPORTED_SYMBOLS: [&str; 2] = ["BTCUSDT", "ETHUSDT"];
-pub const EVENT_STRATEGY_NAME: &str = "direction_dataset_v3";
+pub const EVENT_STRATEGY_NAME: &str = "direction_dataset_v4";
+const EVENT_REGIME_SAMPLE_LIMIT: i64 = 80;
+const EVENT_REGIME_MIN_SAMPLES: i64 = 40;
+const EVENT_REGIME_UP_THRESHOLD: f64 = 0.58;
+const EVENT_REGIME_DOWN_THRESHOLD: f64 = 0.42;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventHorizon {
@@ -601,6 +605,68 @@ impl EventPredictionLog {
             .context("Failed to count open event predictions")
     }
 
+    fn recent_regime_bias(
+        &self,
+        horizon: EventHorizon,
+        now: i64,
+    ) -> Result<Option<DirectionRegimeBias>> {
+        if !horizon.is_active() {
+            return Ok(None);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT move_percent
+               FROM event_prediction_tickets
+              WHERE status = 'settled'
+                AND result IN ('win', 'loss', 'tie')
+                AND symbol IN ('BTCUSDT', 'ETHUSDT')
+                AND horizon_minutes = ?1
+                AND close_time <= ?2
+                AND move_percent IS NOT NULL
+              ORDER BY close_time DESC, COALESCE(settled_at, close_time) DESC
+              LIMIT ?3",
+        )?;
+        let moves = statement
+            .query_map(
+                params![horizon.minutes(), now, EVENT_REGIME_SAMPLE_LIMIT],
+                |row| row.get::<_, f64>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut up = 0_i64;
+        let mut down = 0_i64;
+        for move_percent in moves {
+            if move_percent > 0.000001 {
+                up += 1;
+            } else if move_percent < -0.000001 {
+                down += 1;
+            }
+        }
+        let sample_size = up + down;
+        if sample_size < EVENT_REGIME_MIN_SAMPLES {
+            return Ok(None);
+        }
+        let up_rate = up as f64 / sample_size as f64;
+        let score_strength = ((up_rate - 0.5).abs() * 2.0).clamp(0.08, 0.65);
+        if up_rate >= EVENT_REGIME_UP_THRESHOLD {
+            Ok(Some(DirectionRegimeBias {
+                direction: EventDirection::Up,
+                reason: "rolling_up_regime_v4",
+                sample_size,
+                up_rate,
+                score_strength,
+            }))
+        } else if up_rate <= EVENT_REGIME_DOWN_THRESHOLD {
+            Ok(Some(DirectionRegimeBias {
+                direction: EventDirection::Down,
+                reason: "rolling_down_regime_v4",
+                sample_size,
+                up_rate,
+                score_strength,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn bankroll(&self) -> Result<EventBankroll> {
         self.bankroll_for_strategy(Some(EVENT_STRATEGY_NAME))
     }
@@ -1024,7 +1090,15 @@ fn create_symbol_predictions(
     let snapshot = market::fetch_snapshot(client, symbol)?;
     let mut summary = EventCreationSummary::default();
     for horizon in horizons {
-        let prediction = make_prediction(symbol, *horizon, &candles, &snapshot, open_time)?;
+        let regime_bias = log.recent_regime_bias(*horizon, now)?;
+        let prediction = make_prediction(
+            symbol,
+            *horizon,
+            &candles,
+            &snapshot,
+            open_time,
+            regime_bias.as_ref(),
+        )?;
         let decision =
             EventStrategyDecision::trade("每轮全量虚拟预测样本：用结算结果训练方向 agent");
         summary.evaluated += 1;
@@ -1052,6 +1126,7 @@ fn make_prediction(
     candles: &[Candle],
     snapshot: &MarketSnapshot,
     open_time: i64,
+    regime_bias: Option<&DirectionRegimeBias>,
 ) -> Result<NewEventPrediction> {
     let entry_price = usable_price(snapshot);
     if !entry_price.is_finite() || entry_price <= 0.0 {
@@ -1068,7 +1143,8 @@ fn make_prediction(
     } else {
         EventDirection::Down
     };
-    let direction_decision = calibrated_direction(horizon, raw_score, raw_direction, &features);
+    let direction_decision =
+        calibrated_direction(horizon, raw_score, raw_direction, &features, regime_bias);
     let direction = direction_decision.direction;
     let score = signed_score_for_direction(direction_decision.score_strength, direction);
     add_direction_training_fields(
@@ -1109,6 +1185,17 @@ struct DirectionDecision {
     flipped: bool,
     score_strength: f64,
     factor_score: f64,
+    regime_sample_size: Option<i64>,
+    regime_up_rate: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct DirectionRegimeBias {
+    direction: EventDirection,
+    reason: &'static str,
+    sample_size: i64,
+    up_rate: f64,
+    score_strength: f64,
 }
 
 fn calibrated_direction(
@@ -1116,8 +1203,21 @@ fn calibrated_direction(
     raw_score: f64,
     raw_direction: EventDirection,
     features: &Value,
+    regime_bias: Option<&DirectionRegimeBias>,
 ) -> DirectionDecision {
     let abs_score = raw_score.abs();
+    if let Some(bias) = regime_bias {
+        return DirectionDecision {
+            direction: bias.direction,
+            reason: bias.reason,
+            flipped: raw_direction != bias.direction,
+            score_strength: abs_score.max(bias.score_strength).clamp(0.05, 1.0),
+            factor_score: signed_factor_score(bias.score_strength, bias.direction),
+            regime_sample_size: Some(bias.sample_size),
+            regime_up_rate: Some(bias.up_rate),
+        };
+    }
+
     if let Some((reason, factor_score)) = rebound_up_signal(horizon, features) {
         return DirectionDecision {
             direction: EventDirection::Up,
@@ -1125,6 +1225,22 @@ fn calibrated_direction(
             flipped: raw_direction != EventDirection::Up,
             score_strength: abs_score.max(factor_score).clamp(0.05, 1.0),
             factor_score,
+            regime_sample_size: None,
+            regime_up_rate: None,
+        };
+    }
+
+    if let Some((reason, factor_score)) =
+        confirmed_trend_up_signal(horizon, raw_direction, features)
+    {
+        return DirectionDecision {
+            direction: EventDirection::Up,
+            reason,
+            flipped: raw_direction != EventDirection::Up,
+            score_strength: abs_score.max(factor_score).clamp(0.05, 1.0),
+            factor_score,
+            regime_sample_size: None,
+            regime_up_rate: None,
         };
     }
 
@@ -1133,10 +1249,12 @@ fn calibrated_direction(
         let score_strength = abs_score.max(factor_score.abs());
         return DirectionDecision {
             direction: EventDirection::Down,
-            reason: "raw_up_contrarian_or_exhaustion_down_v3",
+            reason: "raw_up_unconfirmed_trend_down_v4",
             flipped: true,
             score_strength,
             factor_score,
+            regime_sample_size: None,
+            regime_up_rate: None,
         };
     }
 
@@ -1144,11 +1262,21 @@ fn calibrated_direction(
     let score_strength = abs_score.max(factor_score.abs());
     DirectionDecision {
         direction: EventDirection::Down,
-        reason: "raw_down_continuation_no_strong_reversal_v3",
+        reason: "raw_down_continuation_v4",
         flipped: false,
         score_strength,
         factor_score,
+        regime_sample_size: None,
+        regime_up_rate: None,
     }
+}
+
+fn signed_factor_score(abs_score: f64, direction: EventDirection) -> f64 {
+    match direction {
+        EventDirection::Up => abs_score.abs(),
+        EventDirection::Down => -abs_score.abs(),
+    }
+    .clamp(-1.0, 1.0)
 }
 
 fn signed_score_for_direction(abs_score: f64, direction: EventDirection) -> f64 {
@@ -1177,6 +1305,12 @@ fn add_direction_training_fields(
         object.insert("direction_flipped".into(), json!(decision.flipped));
         object.insert("direction_reason".into(), json!(decision.reason));
         object.insert("factor_score".into(), json!(decision.factor_score));
+        if let Some(sample_size) = decision.regime_sample_size {
+            object.insert("regime_sample_size".into(), json!(sample_size));
+        }
+        if let Some(up_rate) = decision.regime_up_rate {
+            object.insert("regime_up_rate".into(), json!(up_rate));
+        }
     }
 }
 
@@ -1191,7 +1325,7 @@ fn rebound_up_signal(horizon: EventHorizon, features: &Value) -> Option<(&'stati
                 let rsi = (-rsi_trend).clamp(0.0, 1.0);
                 let sentiment_strength = sentiment.clamp(0.0, 1.0);
                 Some((
-                    "short_oversold_rsi_sentiment_rebound_v3",
+                    "short_oversold_rsi_sentiment_rebound_v4",
                     (0.40 * oversold + 0.35 * rsi + 0.25 * sentiment_strength).clamp(0.05, 1.0),
                 ))
             } else {
@@ -1203,7 +1337,7 @@ fn rebound_up_signal(horizon: EventHorizon, features: &Value) -> Option<(&'stati
                 let oversold = (-snapshot_change / 5.0).clamp(0.0, 1.0);
                 let sentiment_strength = sentiment.clamp(0.0, 1.0);
                 Some((
-                    "mid_24h_oversold_sentiment_rebound_v3",
+                    "mid_24h_oversold_sentiment_rebound_v4",
                     (0.65 * oversold + 0.35 * sentiment_strength).clamp(0.05, 1.0),
                 ))
             } else {
@@ -1213,8 +1347,72 @@ fn rebound_up_signal(horizon: EventHorizon, features: &Value) -> Option<(&'stati
         EventHorizon::OneHour => {
             if snapshot_change <= -3.0 {
                 Some((
-                    "long_extreme_24h_oversold_rebound_v3",
+                    "long_extreme_24h_oversold_rebound_v4",
                     (-snapshot_change / 6.0).clamp(0.05, 1.0),
+                ))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn confirmed_trend_up_signal(
+    horizon: EventHorizon,
+    raw_direction: EventDirection,
+    features: &Value,
+) -> Option<(&'static str, f64)> {
+    let momentum10 = feature_value(features, "momentum10");
+    let momentum30 = feature_value(features, "momentum30");
+    let ema_short = feature_value(features, "ema_short");
+    let ema_mid = feature_value(features, "ema_mid");
+    let ema_long = feature_value(features, "ema_long");
+    let breakout = feature_value(features, "breakout");
+    match horizon {
+        EventHorizon::TenMinutes => None,
+        EventHorizon::ThirtyMinutes => {
+            if raw_direction == EventDirection::Up
+                && ema_short >= 0.05
+                && ema_mid >= -0.05
+                && breakout >= 0.0
+            {
+                Some((
+                    "mid_confirmed_raw_up_trend_v4",
+                    (0.32 * momentum10.clamp(0.0, 1.0)
+                        + 0.24 * ema_short.clamp(0.0, 1.0)
+                        + 0.24 * (ema_mid + 0.05).clamp(0.0, 1.0)
+                        + 0.20 * breakout.clamp(0.0, 1.0))
+                    .clamp(0.05, 1.0),
+                ))
+            } else if momentum10 >= 0.30 && ema_short >= 0.15 {
+                Some((
+                    "mid_short_rebound_momentum_v4",
+                    (0.58 * momentum10.clamp(0.0, 1.0) + 0.42 * ema_short.clamp(0.0, 1.0))
+                        .clamp(0.05, 1.0),
+                ))
+            } else {
+                None
+            }
+        }
+        EventHorizon::OneHour => {
+            if raw_direction == EventDirection::Up
+                && ema_mid >= 0.05
+                && ema_long >= 0.0
+                && breakout >= 0.0
+            {
+                Some((
+                    "long_confirmed_raw_up_trend_v4",
+                    (0.24 * momentum30.clamp(0.0, 1.0)
+                        + 0.24 * ema_mid.clamp(0.0, 1.0)
+                        + 0.28 * ema_long.clamp(0.0, 1.0)
+                        + 0.24 * breakout.clamp(0.0, 1.0))
+                    .clamp(0.05, 1.0),
+                ))
+            } else if momentum30 >= 0.25 && ema_mid >= 0.10 {
+                Some((
+                    "long_mid_trend_rebound_v4",
+                    (0.60 * momentum30.clamp(0.0, 1.0) + 0.40 * ema_mid.clamp(0.0, 1.0))
+                        .clamp(0.05, 1.0),
                 ))
             } else {
                 None
@@ -1494,7 +1692,7 @@ mod tests {
         let mut created = 0;
         for horizon in EventHorizon::ALL {
             let prediction =
-                make_prediction("BTCUSDT", horizon, &candles, &snapshot, open_time).unwrap();
+                make_prediction("BTCUSDT", horizon, &candles, &snapshot, open_time, None).unwrap();
             assert!(matches!(
                 prediction.direction,
                 EventDirection::Up | EventDirection::Down
@@ -1512,7 +1710,7 @@ mod tests {
         assert!(open_dashboard.available_balance.is_infinite());
 
         let mut prices = BTreeMap::new();
-        prices.insert("BTCUSDT".into(), 101.0);
+        prices.insert("BTCUSDT".into(), 105.0);
         assert_eq!(
             log.settle_due_with_prices(open_time + 60 * 60 + 1, &prices)
                 .unwrap(),
@@ -1568,15 +1766,34 @@ mod tests {
             0.42,
             EventDirection::Up,
             &neutral_features,
+            None,
         );
         assert_eq!(raw_up.direction, EventDirection::Down);
         assert!(raw_up.flipped);
+
+        let trend_up_features = json!({
+            "momentum10": 0.45,
+            "ema_short": 0.16,
+            "ema_mid": 0.02,
+            "breakout": 0.18,
+        });
+        let trend_up = calibrated_direction(
+            EventHorizon::ThirtyMinutes,
+            0.36,
+            EventDirection::Up,
+            &trend_up_features,
+            None,
+        );
+        assert_eq!(trend_up.direction, EventDirection::Up);
+        assert_eq!(trend_up.reason, "mid_confirmed_raw_up_trend_v4");
+        assert!(!trend_up.flipped);
 
         let strong_raw_down = calibrated_direction(
             EventHorizon::OneHour,
             -0.72,
             EventDirection::Down,
             &neutral_features,
+            None,
         );
         assert_eq!(strong_raw_down.direction, EventDirection::Down);
         assert!(!strong_raw_down.flipped);
@@ -1586,6 +1803,7 @@ mod tests {
             -0.32,
             EventDirection::Down,
             &neutral_features,
+            None,
         );
         assert_eq!(moderate_raw_down.direction, EventDirection::Down);
         assert!(!moderate_raw_down.flipped);
@@ -1600,6 +1818,7 @@ mod tests {
             -0.18,
             EventDirection::Down,
             &short_rebound_features,
+            None,
         );
         assert_eq!(short_rebound.direction, EventDirection::Up);
         assert!(short_rebound.flipped);
@@ -1613,6 +1832,7 @@ mod tests {
             -0.22,
             EventDirection::Down,
             &mid_rebound_features,
+            None,
         );
         assert_eq!(mid_rebound.direction, EventDirection::Up);
 
@@ -1624,8 +1844,27 @@ mod tests {
             -0.22,
             EventDirection::Down,
             &long_rebound_features,
+            None,
         );
         assert_eq!(long_rebound.direction, EventDirection::Up);
+
+        let rolling_bias = DirectionRegimeBias {
+            direction: EventDirection::Up,
+            reason: "rolling_up_regime_v4",
+            sample_size: 80,
+            up_rate: 0.66,
+            score_strength: 0.32,
+        };
+        let rolling_rebound = calibrated_direction(
+            EventHorizon::OneHour,
+            -0.22,
+            EventDirection::Down,
+            &neutral_features,
+            Some(&rolling_bias),
+        );
+        assert_eq!(rolling_rebound.direction, EventDirection::Up);
+        assert_eq!(rolling_rebound.reason, "rolling_up_regime_v4");
+        assert!(rolling_rebound.flipped);
 
         let mut features = json!({"momentum10": 0.25});
         add_direction_training_fields(
@@ -1641,6 +1880,18 @@ mod tests {
         assert_eq!(features["final_direction"], "down");
         assert_eq!(features["direction_flipped"], true);
         assert!(features["factor_score"].as_f64().is_some());
+
+        let mut rolling_features = json!({});
+        add_direction_training_fields(
+            &mut rolling_features,
+            EventHorizon::OneHour,
+            -0.22,
+            EventDirection::Down,
+            &rolling_rebound,
+            0.32,
+        );
+        assert_eq!(rolling_features["regime_sample_size"], 80);
+        assert_eq!(rolling_features["regime_up_rate"], 0.66);
     }
 
     #[test]
@@ -1664,6 +1915,7 @@ mod tests {
             &candles,
             &snapshot,
             1_700_000_000,
+            None,
         )
         .unwrap();
 

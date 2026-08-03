@@ -35,4 +35,5 @@ The default `--strategy all` uses all settled BTC/ETH labels because even losing
 legacy strategy tickets still contain valid pre-expiry factors and realized
 direction labels. Use `--strategy current` when you only want the active
 strategy, or pass `--strategy direction_dataset_v2` / `--strategy
-direction_dataset_v3` for a specific version comparison.
+direction_dataset_v3` / `--strategy direction_dataset_v4` for a specific
+version comparison.
