@@ -17,7 +17,8 @@ Use this skill to review the GQT event prediction virtual-order log and propose 
 3. Inspect only `BTCUSDT` and `ETHUSDT`; ignore older records for unsupported symbols. Inspect horizon-level performance separately for `10m`, `30m`, and `60m`. Do not blend them into one headline number.
 4. Review recent losses by reading `features_json`, `score`, `confidence`, `direction`, `stake_amount`, `virtual_pnl`, and `move_percent`.
 5. Propose only measurable tuning changes, such as changing weights, adding a confidence floor, excluding low-volatility windows, or separating symbol-specific thresholds.
-6. Append a compact dated entry to `references/review-log.md` after each review. Include sample size, win rate by horizon, likely failure mode, and the next tuning hypothesis.
+6. When the user asks about LLM/agent training data or factors, run `scripts/build_event_llm_training_pack.py <sqlite-path> --output-dir data/event_llm_training --strategy all --format both` from the repo root. Use the generated `manifest.json` and `factor_report.md` for the answer; do not commit generated JSONL artifacts.
+7. Append a compact dated entry to `references/review-log.md` after each review. Include sample size, win rate by horizon, likely failure mode, and the next tuning hypothesis.
 
 ## Review Rules
 

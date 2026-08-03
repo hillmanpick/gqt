@@ -16,7 +16,7 @@ pub const EVENT_STAKE_USDT: f64 = 5.0;
 pub const EVENT_TEN_MINUTE_PROFIT_RATE: f64 = 0.80;
 pub const EVENT_DEFAULT_PROFIT_RATE: f64 = 0.85;
 pub const EVENT_SUPPORTED_SYMBOLS: [&str; 2] = ["BTCUSDT", "ETHUSDT"];
-pub const EVENT_STRATEGY_NAME: &str = "direction_dataset_v2";
+pub const EVENT_STRATEGY_NAME: &str = "direction_dataset_v3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventHorizon {
@@ -37,6 +37,14 @@ impl EventHorizon {
             EventHorizon::TenMinutes => 10,
             EventHorizon::ThirtyMinutes => 30,
             EventHorizon::OneHour => 60,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            EventHorizon::TenMinutes => "10m",
+            EventHorizon::ThirtyMinutes => "30m",
+            EventHorizon::OneHour => "1h",
         }
     }
 
@@ -71,6 +79,10 @@ fn supported_cycle_symbols(symbols: &[String]) -> Vec<String> {
     } else {
         filtered
     }
+}
+
+fn strategy_marker(strategy: &str) -> String {
+    format!("\"strategy_version\":\"{strategy}\"")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +165,17 @@ pub struct EventPredictionStats {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct EventPredictionRunDirection {
+    pub symbol: String,
+    pub horizon_minutes: i64,
+    pub open_time: i64,
+    pub close_time: i64,
+    pub direction: String,
+    pub confidence: f64,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct EventPredictionSummary {
     pub created: usize,
     pub evaluated: usize,
@@ -165,8 +188,11 @@ pub struct EventPredictionSummary {
     pub equity: f64,
     pub available_balance: f64,
     pub stats: Vec<EventPredictionStats>,
+    pub all_realized_pnl: f64,
+    pub all_stats: Vec<EventPredictionStats>,
     pub open_recent: Vec<EventPredictionTicket>,
     pub settled_recent: Vec<EventPredictionTicket>,
+    pub directions: Vec<EventPredictionRunDirection>,
     pub message: String,
 }
 
@@ -214,10 +240,11 @@ struct DueSignal {
     reason: String,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct EventCreationSummary {
     created: usize,
     evaluated: usize,
+    directions: Vec<EventPredictionRunDirection>,
 }
 
 struct EventBankroll {
@@ -306,6 +333,7 @@ impl EventPredictionLog {
 
     pub fn dashboard(&self) -> Result<EventPredictionSummary> {
         let bankroll = self.bankroll()?;
+        let all_bankroll = self.all_bankroll()?;
         Ok(EventPredictionSummary {
             created: 0,
             evaluated: 0,
@@ -318,9 +346,12 @@ impl EventPredictionLog {
             equity: bankroll.equity,
             available_balance: bankroll.available_balance,
             stats: self.stats()?,
+            all_realized_pnl: all_bankroll.realized_pnl,
+            all_stats: self.all_stats()?,
             open_recent: self.open_recent(80)?,
             settled_recent: self.settled_recent(80)?,
-            message: "event prediction dashboard loaded".into(),
+            directions: Vec::new(),
+            message: format!("事件预测虚拟盘就绪：当前策略 {EVENT_STRATEGY_NAME}"),
         })
     }
 
@@ -556,39 +587,68 @@ impl EventPredictionLog {
     }
 
     fn open_count(&self) -> Result<i64> {
+        let marker = strategy_marker(EVENT_STRATEGY_NAME);
         self.connection
             .query_row(
                 "SELECT COUNT(*) FROM event_prediction_tickets
                  WHERE status = 'open'
-                   AND symbol IN ('BTCUSDT', 'ETHUSDT')",
-                [],
+                   AND symbol IN ('BTCUSDT', 'ETHUSDT')
+                   AND instr(features_json, ?1) > 0",
+                [marker],
                 |row| row.get(0),
             )
             .context("Failed to count open event predictions")
     }
 
     fn bankroll(&self) -> Result<EventBankroll> {
+        self.bankroll_for_strategy(Some(EVENT_STRATEGY_NAME))
+    }
+
+    fn all_bankroll(&self) -> Result<EventBankroll> {
+        self.bankroll_for_strategy(None)
+    }
+
+    fn bankroll_for_strategy(&self, strategy: Option<&str>) -> Result<EventBankroll> {
+        let strategy_filter = strategy.map(strategy_marker);
+        let realized_sql = if strategy_filter.is_some() {
+            "SELECT COALESCE(SUM(virtual_pnl), 0.0)
+                     FROM event_prediction_tickets
+                     WHERE status = 'settled'
+                       AND symbol IN ('BTCUSDT', 'ETHUSDT')
+                       AND instr(features_json, ?1) > 0"
+        } else {
+            "SELECT COALESCE(SUM(virtual_pnl), 0.0)
+                     FROM event_prediction_tickets
+                     WHERE status = 'settled'
+                       AND symbol IN ('BTCUSDT', 'ETHUSDT')"
+        };
+        let realized_params = strategy_filter.iter().map(String::as_str);
         let realized_pnl = self
             .connection
             .query_row(
-                "SELECT COALESCE(SUM(virtual_pnl), 0.0)
-                 FROM event_prediction_tickets
-                 WHERE status = 'settled'
-                   AND symbol IN ('BTCUSDT', 'ETHUSDT')",
-                [],
+                realized_sql,
+                rusqlite::params_from_iter(realized_params),
                 |row| row.get::<_, f64>(0),
             )
             .context("Failed to read event prediction realized pnl")?;
+        let open_sql = if strategy_filter.is_some() {
+            "SELECT COALESCE(SUM(stake_amount), 0.0)
+                     FROM event_prediction_tickets
+                     WHERE status = 'open'
+                       AND symbol IN ('BTCUSDT', 'ETHUSDT')
+                       AND instr(features_json, ?1) > 0"
+        } else {
+            "SELECT COALESCE(SUM(stake_amount), 0.0)
+                     FROM event_prediction_tickets
+                     WHERE status = 'open'
+                       AND symbol IN ('BTCUSDT', 'ETHUSDT')"
+        };
+        let open_params = strategy_filter.iter().map(String::as_str);
         let open_exposure = self
             .connection
-            .query_row(
-                "SELECT COALESCE(SUM(stake_amount), 0.0)
-                 FROM event_prediction_tickets
-                 WHERE status = 'open'
-                   AND symbol IN ('BTCUSDT', 'ETHUSDT')",
-                [],
-                |row| row.get::<_, f64>(0),
-            )
+            .query_row(open_sql, rusqlite::params_from_iter(open_params), |row| {
+                row.get::<_, f64>(0)
+            })
             .context("Failed to read event prediction open exposure")?;
         let equity = if EVENT_STARTING_BANKROLL_USDT.is_finite() {
             EVENT_STARTING_BANKROLL_USDT + realized_pnl
@@ -609,21 +669,47 @@ impl EventPredictionLog {
     }
 
     fn stats(&self) -> Result<Vec<EventPredictionStats>> {
-        let mut statement = self.connection.prepare(
+        self.stats_for_strategy(Some(EVENT_STRATEGY_NAME))
+    }
+
+    fn all_stats(&self) -> Result<Vec<EventPredictionStats>> {
+        self.stats_for_strategy(None)
+    }
+
+    fn stats_for_strategy(&self, strategy: Option<&str>) -> Result<Vec<EventPredictionStats>> {
+        let mut statement = self.connection.prepare(if strategy.is_some() {
             "SELECT horizon_minutes,
-                    COUNT(*),
-                    SUM(CASE WHEN result = 'win' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN result = 'loss' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN result = 'tie' THEN 1 ELSE 0 END),
-                    AVG(confidence),
-                    AVG(move_percent)
-             FROM event_prediction_tickets
-             WHERE status = 'settled'
-               AND symbol IN ('BTCUSDT', 'ETHUSDT')
-             GROUP BY horizon_minutes
-             ORDER BY horizon_minutes",
-        )?;
-        let rows = statement.query_map([], |row| {
+                        COUNT(*),
+                        SUM(CASE WHEN result = 'win' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN result = 'loss' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN result = 'tie' THEN 1 ELSE 0 END),
+                        AVG(confidence),
+                        AVG(move_percent)
+                 FROM event_prediction_tickets
+                 WHERE status = 'settled'
+                   AND symbol IN ('BTCUSDT', 'ETHUSDT')
+                   AND instr(features_json, ?1) > 0
+                 GROUP BY horizon_minutes
+                 ORDER BY horizon_minutes"
+        } else {
+            "SELECT horizon_minutes,
+                        COUNT(*),
+                        SUM(CASE WHEN result = 'win' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN result = 'loss' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN result = 'tie' THEN 1 ELSE 0 END),
+                        AVG(confidence),
+                        AVG(move_percent)
+                 FROM event_prediction_tickets
+                 WHERE status = 'settled'
+                   AND symbol IN ('BTCUSDT', 'ETHUSDT')
+                 GROUP BY horizon_minutes
+                 ORDER BY horizon_minutes"
+        })?;
+        let marker_params = strategy
+            .map(strategy_marker)
+            .map(|marker| vec![marker])
+            .unwrap_or_default();
+        let rows = statement.query_map(rusqlite::params_from_iter(marker_params), |row| {
             let total: i64 = row.get(1)?;
             let wins: i64 = row.get::<_, Option<i64>>(2)?.unwrap_or(0);
             let losses: i64 = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
@@ -649,6 +735,7 @@ impl EventPredictionLog {
     }
 
     fn open_recent(&self, limit: usize) -> Result<Vec<EventPredictionTicket>> {
+        let marker = strategy_marker(EVENT_STRATEGY_NAME);
         let mut statement = self.connection.prepare(
             "SELECT id, symbol, horizon_minutes, open_time, close_time, direction,
                     confidence, score, stake_amount, entry_price, expiry_price, status,
@@ -656,15 +743,17 @@ impl EventPredictionLog {
              FROM event_prediction_tickets
              WHERE status = 'open'
                AND symbol IN ('BTCUSDT', 'ETHUSDT')
+               AND instr(features_json, ?2) > 0
              ORDER BY close_time ASC, open_time DESC, horizon_minutes ASC
              LIMIT ?1",
         )?;
-        let rows = statement.query_map([limit as i64], ticket_from_row)?;
+        let rows = statement.query_map(params![limit as i64, marker], ticket_from_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("Failed to read open event predictions")
     }
 
     fn settled_recent(&self, limit: usize) -> Result<Vec<EventPredictionTicket>> {
+        let marker = strategy_marker(EVENT_STRATEGY_NAME);
         let mut statement = self.connection.prepare(
             "SELECT id, symbol, horizon_minutes, open_time, close_time, direction,
                     confidence, score, stake_amount, entry_price, expiry_price, status,
@@ -672,10 +761,11 @@ impl EventPredictionLog {
              FROM event_prediction_tickets
              WHERE status = 'settled'
                AND symbol IN ('BTCUSDT', 'ETHUSDT')
+               AND instr(features_json, ?2) > 0
              ORDER BY COALESCE(settled_at, close_time) DESC, close_time DESC, open_time DESC
              LIMIT ?1",
         )?;
-        let rows = statement.query_map([limit as i64], ticket_from_row)?;
+        let rows = statement.query_map(params![limit as i64, marker], ticket_from_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("Failed to read settled event predictions")
     }
@@ -703,8 +793,17 @@ fn ticket_from_row(row: &Row<'_>) -> rusqlite::Result<EventPredictionTicket> {
 }
 
 pub fn run_cycle(path: &Path, symbols: &[String]) -> Result<EventPredictionSummary> {
+    run_cycle_for_horizons(path, symbols, &EventHorizon::ALL)
+}
+
+pub fn run_cycle_for_horizons(
+    path: &Path,
+    symbols: &[String],
+    horizons: &[EventHorizon],
+) -> Result<EventPredictionSummary> {
     let log = EventPredictionLog::open(path)?;
     let symbols = supported_cycle_symbols(symbols);
+    let horizons = normalized_horizons(horizons);
     let client = network::client(Duration::from_secs(20))?;
     let now = chrono::Utc::now().timestamp();
     let mut failures = Vec::new();
@@ -723,11 +822,12 @@ pub fn run_cycle(path: &Path, symbols: &[String]) -> Result<EventPredictionSumma
     let open_time = (now / 60) * 60;
     let mut creation = EventCreationSummary::default();
     for symbol in &symbols {
-        let result = create_symbol_predictions(&log, &client, symbol, open_time, now);
+        let result = create_symbol_predictions(&log, &client, symbol, &horizons, open_time, now);
         match result {
             Ok(summary) => {
                 creation.created += summary.created;
                 creation.evaluated += summary.evaluated;
+                creation.directions.extend(summary.directions);
             }
             Err(error) => failures.push(format!("{symbol}: {error}")),
         }
@@ -735,22 +835,22 @@ pub fn run_cycle(path: &Path, symbols: &[String]) -> Result<EventPredictionSumma
 
     let open_count = log.open_count()?;
     let bankroll = log.bankroll()?;
+    let all_bankroll = log.all_bankroll()?;
     let stats = log.stats()?;
+    let all_stats = log.all_stats()?;
     let open_recent = log.open_recent(80)?;
     let settled_recent = log.settled_recent(80)?;
     if creation.created == 0 && settled == 0 && settled_signals == 0 && !failures.is_empty() {
         bail!("{}", failures.join("; "));
     }
     let mut message = format!(
-        "event predictions: strategy {}, evaluated {}, created {}, settled {}, signal_settled {}, unlimited bankroll, open {}, open_exposure {:.2}, realized_pnl {:+.2}",
+        "事件预测：当前策略 {}，当前未结算 {}，当前占用 {:.2}，当前策略盈亏 {:+.2}，全历史盈亏 {:+.2}，信号结算 {}",
         EVENT_STRATEGY_NAME,
-        creation.evaluated,
-        creation.created,
-        settled,
-        settled_signals,
         open_count,
         bankroll.open_exposure,
-        bankroll.realized_pnl
+        bankroll.realized_pnl,
+        all_bankroll.realized_pnl,
+        settled_signals
     );
     if !failures.is_empty() {
         message.push_str(&format!("; failures: {}", failures.join("; ")));
@@ -767,10 +867,31 @@ pub fn run_cycle(path: &Path, symbols: &[String]) -> Result<EventPredictionSumma
         equity: bankroll.equity,
         available_balance: bankroll.available_balance,
         stats,
+        all_realized_pnl: all_bankroll.realized_pnl,
+        all_stats,
         open_recent,
         settled_recent,
+        directions: creation.directions,
         message,
     })
+}
+
+fn normalized_horizons(horizons: &[EventHorizon]) -> Vec<EventHorizon> {
+    let mut normalized = Vec::new();
+    for horizon in horizons {
+        if !normalized
+            .iter()
+            .any(|existing: &EventHorizon| existing.minutes() == horizon.minutes())
+        {
+            normalized.push(*horizon);
+        }
+    }
+    if normalized.is_empty() {
+        EventHorizon::ALL.to_vec()
+    } else {
+        normalized.sort_by_key(|horizon| horizon.minutes());
+        normalized
+    }
 }
 
 fn due_symbols(log: &EventPredictionLog, now: i64) -> Result<Vec<String>> {
@@ -879,6 +1000,7 @@ fn create_symbol_predictions(
     log: &EventPredictionLog,
     client: &Client,
     symbol: &str,
+    horizons: &[EventHorizon],
     open_time: i64,
     now: i64,
 ) -> Result<EventCreationSummary> {
@@ -891,15 +1013,25 @@ fn create_symbol_predictions(
     }
     let snapshot = market::fetch_snapshot(client, symbol)?;
     let mut summary = EventCreationSummary::default();
-    for horizon in EventHorizon::ALL {
-        let prediction = make_prediction(symbol, horizon, &candles, &snapshot, open_time)?;
+    for horizon in horizons {
+        let prediction = make_prediction(symbol, *horizon, &candles, &snapshot, open_time)?;
         let decision =
             EventStrategyDecision::trade("每轮全量虚拟预测样本：用结算结果训练方向 agent");
         summary.evaluated += 1;
         let _ = log.record_signal(&prediction, &decision, now)?;
-        if decision.should_trade() && log.record_prediction(&prediction, now)? {
+        let created = decision.should_trade() && log.record_prediction(&prediction, now)?;
+        if created {
             summary.created += 1;
         }
+        summary.directions.push(EventPredictionRunDirection {
+            symbol: prediction.symbol.clone(),
+            horizon_minutes: prediction.horizon.minutes(),
+            open_time: prediction.open_time,
+            close_time: prediction.close_time,
+            direction: prediction.direction.as_str().into(),
+            confidence: prediction.confidence,
+            created,
+        });
     }
     Ok(summary)
 }
@@ -926,9 +1058,9 @@ fn make_prediction(
     } else {
         EventDirection::Down
     };
-    let direction_decision = calibrated_direction(horizon, raw_score, raw_direction);
+    let direction_decision = calibrated_direction(horizon, raw_score, raw_direction, &features);
     let direction = direction_decision.direction;
-    let score = signed_score_for_direction(raw_score.abs(), direction);
+    let score = signed_score_for_direction(direction_decision.score_strength, direction);
     add_direction_training_fields(
         &mut features,
         horizon,
@@ -937,7 +1069,7 @@ fn make_prediction(
         &direction_decision,
         score,
     );
-    let confidence = (0.50 + raw_score.abs() * 0.38).clamp(0.51, 0.88);
+    let confidence = (0.50 + direction_decision.score_strength * 0.38).clamp(0.51, 0.88);
     let close_time = open_time + horizon.seconds();
     let id = format!(
         "{}-{}m-{}",
@@ -965,36 +1097,47 @@ struct DirectionDecision {
     direction: EventDirection,
     reason: &'static str,
     flipped: bool,
+    score_strength: f64,
+    factor_score: f64,
 }
 
 fn calibrated_direction(
     horizon: EventHorizon,
     raw_score: f64,
     raw_direction: EventDirection,
+    features: &Value,
 ) -> DirectionDecision {
     let abs_score = raw_score.abs();
-    if raw_direction == EventDirection::Up {
-        return DirectionDecision {
-            direction: EventDirection::Down,
-            reason: "raw_up_contrarian_calibration",
-            flipped: true,
-        };
-    }
-    if abs_score >= 0.60 {
+    if let Some((reason, factor_score)) = rebound_up_signal(horizon, features) {
         return DirectionDecision {
             direction: EventDirection::Up,
-            reason: match horizon {
-                EventHorizon::TenMinutes => "strong_down_short_reversal_calibration",
-                EventHorizon::ThirtyMinutes => "strong_down_mid_reversal_calibration",
-                EventHorizon::OneHour => "strong_down_long_reversal_calibration",
-            },
-            flipped: true,
+            reason,
+            flipped: raw_direction != EventDirection::Up,
+            score_strength: abs_score.max(factor_score).clamp(0.05, 1.0),
+            factor_score,
         };
     }
+
+    if raw_direction == EventDirection::Up {
+        let factor_score = -exhaustion_down_score(horizon, features);
+        let score_strength = abs_score.max(factor_score.abs());
+        return DirectionDecision {
+            direction: EventDirection::Down,
+            reason: "raw_up_contrarian_or_exhaustion_down_v3",
+            flipped: true,
+            score_strength,
+            factor_score,
+        };
+    }
+
+    let factor_score = -exhaustion_down_score(horizon, features);
+    let score_strength = abs_score.max(factor_score.abs());
     DirectionDecision {
-        direction: raw_direction,
-        reason: "raw_down_continuation_calibration",
+        direction: EventDirection::Down,
+        reason: "raw_down_continuation_no_strong_reversal_v3",
         flipped: false,
+        score_strength,
+        factor_score,
     }
 }
 
@@ -1023,7 +1166,66 @@ fn add_direction_training_fields(
         object.insert("final_direction".into(), json!(decision.direction.as_str()));
         object.insert("direction_flipped".into(), json!(decision.flipped));
         object.insert("direction_reason".into(), json!(decision.reason));
+        object.insert("factor_score".into(), json!(decision.factor_score));
     }
+}
+
+fn rebound_up_signal(horizon: EventHorizon, features: &Value) -> Option<(&'static str, f64)> {
+    let snapshot_change = feature_value(features, "snapshot_change_percent");
+    let sentiment = feature_value(features, "sentiment");
+    let rsi_trend = feature_value(features, "rsi_trend");
+    match horizon {
+        EventHorizon::TenMinutes => {
+            if snapshot_change <= -1.0 && rsi_trend <= -0.30 && sentiment >= 0.30 {
+                let oversold = (-snapshot_change / 4.0).clamp(0.0, 1.0);
+                let rsi = (-rsi_trend).clamp(0.0, 1.0);
+                let sentiment_strength = sentiment.clamp(0.0, 1.0);
+                Some((
+                    "short_oversold_rsi_sentiment_rebound_v3",
+                    (0.40 * oversold + 0.35 * rsi + 0.25 * sentiment_strength).clamp(0.05, 1.0),
+                ))
+            } else {
+                None
+            }
+        }
+        EventHorizon::ThirtyMinutes => {
+            if snapshot_change <= -2.0 && sentiment >= 0.50 {
+                let oversold = (-snapshot_change / 5.0).clamp(0.0, 1.0);
+                let sentiment_strength = sentiment.clamp(0.0, 1.0);
+                Some((
+                    "mid_24h_oversold_sentiment_rebound_v3",
+                    (0.65 * oversold + 0.35 * sentiment_strength).clamp(0.05, 1.0),
+                ))
+            } else {
+                None
+            }
+        }
+        EventHorizon::OneHour => {
+            if snapshot_change <= -3.0 {
+                Some((
+                    "long_extreme_24h_oversold_rebound_v3",
+                    (-snapshot_change / 6.0).clamp(0.05, 1.0),
+                ))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn exhaustion_down_score(horizon: EventHorizon, features: &Value) -> f64 {
+    let snapshot_change =
+        (feature_value(features, "snapshot_change_percent") / 5.0).clamp(0.0, 1.0);
+    let trend = match horizon {
+        EventHorizon::TenMinutes => feature_value(features, "momentum3"),
+        EventHorizon::ThirtyMinutes => feature_value(features, "momentum30"),
+        EventHorizon::OneHour => {
+            0.50 * feature_value(features, "momentum60")
+                + 0.50 * feature_value(features, "ema_long")
+        }
+    }
+    .clamp(0.0, 1.0);
+    (0.60 * snapshot_change + 0.40 * trend).clamp(0.05, 1.0)
 }
 
 fn usable_price(snapshot: &MarketSnapshot) -> f64 {
@@ -1084,37 +1286,38 @@ fn prediction_features(candles: &[Candle], snapshot: &MarketSnapshot) -> Value {
     })
 }
 
+fn feature_value(features: &Value, name: &str) -> f64 {
+    features
+        .get(name)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .unwrap_or_default()
+}
+
 fn horizon_score(horizon: EventHorizon, features: &Value) -> f64 {
-    let value = |name: &str| {
-        features
-            .get(name)
-            .and_then(Value::as_f64)
-            .filter(|value| value.is_finite())
-            .unwrap_or_default()
-    };
     match horizon {
         EventHorizon::TenMinutes => {
-            0.42 * value("momentum3")
-                + 0.22 * value("momentum10")
-                + 0.18 * value("ema_short")
-                + 0.10 * value("volume_bias")
-                + 0.08 * value("sentiment")
+            0.42 * feature_value(features, "momentum3")
+                + 0.22 * feature_value(features, "momentum10")
+                + 0.18 * feature_value(features, "ema_short")
+                + 0.10 * feature_value(features, "volume_bias")
+                + 0.08 * feature_value(features, "sentiment")
         }
         EventHorizon::ThirtyMinutes => {
-            0.20 * value("momentum10")
-                + 0.30 * value("momentum30")
-                + 0.22 * value("ema_mid")
-                + 0.10 * value("breakout")
-                + 0.10 * value("sentiment")
-                + 0.08 * value("rsi_trend")
+            0.20 * feature_value(features, "momentum10")
+                + 0.30 * feature_value(features, "momentum30")
+                + 0.22 * feature_value(features, "ema_mid")
+                + 0.10 * feature_value(features, "breakout")
+                + 0.10 * feature_value(features, "sentiment")
+                + 0.08 * feature_value(features, "rsi_trend")
         }
         EventHorizon::OneHour => {
-            0.16 * value("momentum10")
-                + 0.26 * value("momentum60")
-                + 0.28 * value("ema_long")
-                + 0.14 * value("breakout")
-                + 0.10 * value("sentiment")
-                + 0.06 * value("rsi_trend")
+            0.16 * feature_value(features, "momentum10")
+                + 0.26 * feature_value(features, "momentum60")
+                + 0.28 * feature_value(features, "ema_long")
+                + 0.14 * feature_value(features, "breakout")
+                + 0.10 * feature_value(features, "sentiment")
+                + 0.06 * feature_value(features, "rsi_trend")
         }
     }
 }
@@ -1330,19 +1533,78 @@ mod tests {
 
     #[test]
     fn direction_dataset_calibrates_direction_without_dropping_samples() {
-        let raw_up = calibrated_direction(EventHorizon::ThirtyMinutes, 0.42, EventDirection::Up);
+        let neutral_features = json!({
+            "snapshot_change_percent": 1.2,
+            "sentiment": 0.1,
+            "rsi_trend": 0.1,
+            "momentum3": 0.2,
+            "momentum30": 0.2,
+            "momentum60": 0.2,
+            "ema_long": 0.2,
+        });
+        let raw_up = calibrated_direction(
+            EventHorizon::ThirtyMinutes,
+            0.42,
+            EventDirection::Up,
+            &neutral_features,
+        );
         assert_eq!(raw_up.direction, EventDirection::Down);
         assert!(raw_up.flipped);
 
-        let strong_raw_down =
-            calibrated_direction(EventHorizon::OneHour, -0.72, EventDirection::Down);
-        assert_eq!(strong_raw_down.direction, EventDirection::Up);
-        assert!(strong_raw_down.flipped);
+        let strong_raw_down = calibrated_direction(
+            EventHorizon::OneHour,
+            -0.72,
+            EventDirection::Down,
+            &neutral_features,
+        );
+        assert_eq!(strong_raw_down.direction, EventDirection::Down);
+        assert!(!strong_raw_down.flipped);
 
-        let moderate_raw_down =
-            calibrated_direction(EventHorizon::TenMinutes, -0.32, EventDirection::Down);
+        let moderate_raw_down = calibrated_direction(
+            EventHorizon::TenMinutes,
+            -0.32,
+            EventDirection::Down,
+            &neutral_features,
+        );
         assert_eq!(moderate_raw_down.direction, EventDirection::Down);
         assert!(!moderate_raw_down.flipped);
+
+        let short_rebound_features = json!({
+            "snapshot_change_percent": -1.2,
+            "sentiment": 0.45,
+            "rsi_trend": -0.35,
+        });
+        let short_rebound = calibrated_direction(
+            EventHorizon::TenMinutes,
+            -0.18,
+            EventDirection::Down,
+            &short_rebound_features,
+        );
+        assert_eq!(short_rebound.direction, EventDirection::Up);
+        assert!(short_rebound.flipped);
+
+        let mid_rebound_features = json!({
+            "snapshot_change_percent": -2.1,
+            "sentiment": 0.55,
+        });
+        let mid_rebound = calibrated_direction(
+            EventHorizon::ThirtyMinutes,
+            -0.22,
+            EventDirection::Down,
+            &mid_rebound_features,
+        );
+        assert_eq!(mid_rebound.direction, EventDirection::Up);
+
+        let long_rebound_features = json!({
+            "snapshot_change_percent": -3.1,
+        });
+        let long_rebound = calibrated_direction(
+            EventHorizon::OneHour,
+            -0.22,
+            EventDirection::Down,
+            &long_rebound_features,
+        );
+        assert_eq!(long_rebound.direction, EventDirection::Up);
 
         let mut features = json!({"momentum10": 0.25});
         add_direction_training_fields(
@@ -1357,6 +1619,7 @@ mod tests {
         assert_eq!(features["raw_direction"], "up");
         assert_eq!(features["final_direction"], "down");
         assert_eq!(features["direction_flipped"], true);
+        assert!(features["factor_score"].as_f64().is_some());
     }
 
     #[test]
