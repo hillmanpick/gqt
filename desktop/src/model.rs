@@ -354,24 +354,24 @@ impl StrategyProfile {
                 daily_profit_timezone_offset_hours: 8.0,
             },
             StrategyProfile::Aggressive => StrategyProfilePreset {
-                leverage: 3,
+                leverage: 100,
                 capital_usage_percent: 18.0,
                 risk_reward_ratio: 1.0,
-                minimum_long_score: 0.58,
-                minimum_short_score: 0.58,
-                minimum_factor_score: 0.08,
-                minimum_trend_quality: 0.35,
-                minimum_adx: 8.0,
-                minimum_volume_ratio: -0.50,
-                take_profit: 0.012,
-                stop_loss: 0.012,
-                pyramid_profit: 0.004,
+                minimum_long_score: 0.54,
+                minimum_short_score: 0.54,
+                minimum_factor_score: 0.05,
+                minimum_trend_quality: 0.30,
+                minimum_adx: 6.0,
+                minimum_volume_ratio: -0.60,
+                take_profit: 0.010,
+                stop_loss: 0.010,
+                pyramid_profit: 0.003,
                 pyramid_stake_ratio: 0.60,
                 fee_rate: 0.0005,
                 slippage_rate: 0.0003,
-                min_net_profit: 0.0035,
-                min_pyramid_net_profit: 0.0015,
-                time_roll_net_profit: 0.0015,
+                min_net_profit: 0.0025,
+                min_pyramid_net_profit: 0.0010,
+                time_roll_net_profit: 0.0010,
                 daily_profit_target: 0.10,
                 daily_profit_timezone_offset_hours: 8.0,
             },
@@ -472,13 +472,7 @@ impl Default for AiTradingConfig {
 }
 
 pub fn default_ai_symbol_whitelist() -> Vec<String> {
-    [
-        "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "LINKUSDT",
-        "AVAXUSDT", "LTCUSDT",
-    ]
-    .iter()
-    .map(|symbol| symbol.to_string())
-    .collect()
+    vec!["BTCUSDT".to_string()]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

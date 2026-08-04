@@ -1072,8 +1072,9 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            10
+            1
         );
+        assert_eq!(config["exchange"]["pair_whitelist"], json!(["BTC/USDT:USDT"]));
         let _ = fs::remove_dir_all(root);
     }
 
