@@ -2496,13 +2496,19 @@ impl GqtApp {
 
         let mut open = true;
         let mut close = false;
+        let content_rect = ctx.content_rect();
+        let dialog_width = (content_rect.width() - 32.0).clamp(320.0, 540.0);
+        let dialog_height = (content_rect.height() - 32.0).max(320.0);
         egui::Window::new(format!("订单详情 {}", compact_event_id(&ticket.id)))
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .collapsible(false)
             .resizable(true)
+            .min_width(dialog_width)
+            .max_width(dialog_width)
+            .max_height(dialog_height)
+            .vscroll(true)
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.set_min_width(540.0);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&ticket.symbol).size(18.0).strong());
                     ui.colored_label(
@@ -2581,7 +2587,8 @@ impl GqtApp {
                 }
             });
 
-        if close || !open {
+        let escape_pressed = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        if close || !open || escape_pressed {
             self.event_prediction_ticket_dialog = None;
         }
     }
