@@ -1,8 +1,12 @@
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
-use rusqlite::{Connection, Row, params};
+use rusqlite::{Connection, Row, TransactionBehavior, params};
 use serde_json::{Value, json};
 
 use crate::{
@@ -16,11 +20,19 @@ pub const EVENT_STAKE_USDT: f64 = 5.0;
 pub const EVENT_TEN_MINUTE_PROFIT_RATE: f64 = 0.80;
 pub const EVENT_DEFAULT_PROFIT_RATE: f64 = 0.85;
 pub const EVENT_SUPPORTED_SYMBOLS: [&str; 2] = ["BTCUSDT", "ETHUSDT"];
-pub const EVENT_STRATEGY_NAME: &str = "direction_dataset_v4";
-const EVENT_REGIME_SAMPLE_LIMIT: i64 = 80;
-const EVENT_REGIME_MIN_SAMPLES: i64 = 40;
-const EVENT_REGIME_UP_THRESHOLD: f64 = 0.58;
-const EVENT_REGIME_DOWN_THRESHOLD: f64 = 0.42;
+pub const EVENT_STRATEGY_NAME: &str = "event_reinvest_cycle_v1";
+pub const EVENT_CYCLE_MAX_ORDERS: i64 = 5;
+const EVENT_SCHEMA_VERSION: i64 = 1;
+const EVENT_EXPERT_HISTORY_LIMIT: i64 = 400;
+const EVENT_EXPERT_MIN_SAMPLES: usize = 8;
+const EVENT_UP_COMMITMENT_RATE: f64 = 0.65;
+const EVENT_EXTREME_MIN_SAMPLES: usize = 20;
+const EVENT_EXTREME_UP_RATE: f64 = 0.75;
+const EVENT_EXTREME_DOWN_RATE: f64 = 0.25;
+const EVENT_30M_EXPERT_SPACING_SECONDS: i64 = 30 * 60;
+const EVENT_30M_EXPERT_SAMPLE_LIMIT: usize = EVENT_EXTREME_MIN_SAMPLES;
+const EVENT_60M_EXPERT_SPACING_SECONDS: i64 = 60 * 60;
+const EVENT_60M_EXPERT_SAMPLE_LIMIT: usize = EVENT_EXTREME_MIN_SAMPLES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventHorizon {
@@ -30,7 +42,11 @@ pub enum EventHorizon {
 }
 
 impl EventHorizon {
-    pub const ALL: [EventHorizon; 2] = [EventHorizon::ThirtyMinutes, EventHorizon::OneHour];
+    pub const ALL: [EventHorizon; 3] = [
+        EventHorizon::TenMinutes,
+        EventHorizon::ThirtyMinutes,
+        EventHorizon::OneHour,
+    ];
 
     pub fn minutes(self) -> i64 {
         match self {
@@ -53,7 +69,10 @@ impl EventHorizon {
     }
 
     fn is_active(self) -> bool {
-        matches!(self, EventHorizon::ThirtyMinutes | EventHorizon::OneHour)
+        matches!(
+            self,
+            EventHorizon::TenMinutes | EventHorizon::ThirtyMinutes | EventHorizon::OneHour
+        )
     }
 }
 
@@ -107,12 +126,14 @@ impl EventDirection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EventSignalAction {
     Trade,
+    Observe,
 }
 
 impl EventSignalAction {
     fn as_str(self) -> &'static str {
         match self {
             EventSignalAction::Trade => "trade",
+            EventSignalAction::Observe => "observe",
         }
     }
 }
@@ -127,6 +148,13 @@ impl EventStrategyDecision {
     fn trade(reason: impl Into<String>) -> Self {
         Self {
             action: EventSignalAction::Trade,
+            reason: reason.into(),
+        }
+    }
+
+    fn observe(reason: impl Into<String>) -> Self {
+        Self {
+            action: EventSignalAction::Observe,
             reason: reason.into(),
         }
     }
@@ -153,6 +181,10 @@ pub struct EventPredictionTicket {
     pub result: String,
     pub move_percent: Option<f64>,
     pub virtual_pnl: Option<f64>,
+    pub cycle_id: String,
+    pub cycle_number: i64,
+    pub cycle_order: i64,
+    pub cycle_balance_after: Option<f64>,
     pub review: String,
 }
 
@@ -185,6 +217,7 @@ pub struct EventPredictionSummary {
     pub evaluated: usize,
     pub settled: usize,
     pub open_count: i64,
+    pub legacy_open_count: i64,
     pub starting_bankroll: f64,
     pub stake_amount: f64,
     pub realized_pnl: f64,
@@ -212,7 +245,18 @@ struct NewEventPrediction {
     score: f64,
     stake_amount: f64,
     entry_price: f64,
+    cycle_id: String,
+    cycle_number: i64,
+    cycle_order: i64,
     features: Value,
+}
+
+#[derive(Debug, Clone)]
+struct CyclePlan {
+    cycle_id: String,
+    cycle_number: i64,
+    cycle_order: i64,
+    stake_amount: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -226,6 +270,9 @@ struct DueTicket {
     stake_amount: f64,
     confidence: f64,
     score: f64,
+    cycle_id: String,
+    cycle_number: i64,
+    cycle_order: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -268,7 +315,11 @@ impl EventPredictionLog {
             std::fs::create_dir_all(parent)
                 .context("Failed to create event prediction directory")?;
         }
-        let connection = Connection::open(path).context("Failed to open event prediction log")?;
+        let mut connection =
+            Connection::open(path).context("Failed to open event prediction log")?;
+        connection
+            .busy_timeout(Duration::from_secs(10))
+            .context("Failed to configure event prediction database timeout")?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS event_prediction_tickets (
@@ -290,7 +341,11 @@ impl EventPredictionLog {
                 virtual_pnl REAL,
                 features_json TEXT NOT NULL,
                 review TEXT,
-                settled_at INTEGER
+                settled_at INTEGER,
+                cycle_id TEXT,
+                cycle_number INTEGER,
+                cycle_order INTEGER,
+                cycle_balance_after REAL
              );
              CREATE UNIQUE INDEX IF NOT EXISTS unique_event_prediction_round
              ON event_prediction_tickets(symbol, horizon_minutes, open_time);
@@ -331,18 +386,20 @@ impl EventPredictionLog {
              CREATE INDEX IF NOT EXISTS event_prediction_signal_symbol_horizon
              ON event_prediction_signals(symbol, horizon_minutes);",
         )?;
-        migrate_schema(&connection)?;
+        migrate_schema(&mut connection)?;
         Ok(Self { connection })
     }
 
     pub fn dashboard(&self) -> Result<EventPredictionSummary> {
         let bankroll = self.bankroll()?;
         let all_bankroll = self.all_bankroll()?;
+        let legacy_open_count = self.legacy_open_count()?;
         Ok(EventPredictionSummary {
             created: 0,
             evaluated: 0,
             settled: 0,
             open_count: self.open_count()?,
+            legacy_open_count,
             starting_bankroll: EVENT_STARTING_BANKROLL_USDT,
             stake_amount: EVENT_STAKE_USDT,
             realized_pnl: bankroll.realized_pnl,
@@ -355,7 +412,9 @@ impl EventPredictionLog {
             open_recent: self.open_recent(80)?,
             settled_recent: self.settled_recent(80)?,
             directions: Vec::new(),
-            message: format!("事件预测虚拟盘就绪：当前策略 {EVENT_STRATEGY_NAME}，活跃周期 30m/1h"),
+            message: format!(
+                "事件预测虚拟盘就绪：当前策略 {EVENT_STRATEGY_NAME}，活跃周期 10m/30m/1h，等待旧票结算 {legacy_open_count}"
+            ),
         })
     }
 
@@ -368,8 +427,10 @@ impl EventPredictionLog {
         let changed = self.connection.execute(
             "INSERT OR IGNORE INTO event_prediction_tickets
              (id, created_at, symbol, horizon_minutes, open_time, close_time, direction,
-              confidence, score, stake_amount, entry_price, status, features_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open', ?12)",
+              confidence, score, stake_amount, entry_price, status, features_json,
+              cycle_id, cycle_number, cycle_order)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open', ?12,
+                     ?13, ?14, ?15)",
             params![
                 prediction.id,
                 now,
@@ -383,6 +444,9 @@ impl EventPredictionLog {
                 prediction.stake_amount,
                 prediction.entry_price,
                 features_json,
+                prediction.cycle_id,
+                prediction.cycle_number,
+                prediction.cycle_order,
             ],
         )?;
         Ok(changed == 1)
@@ -427,10 +491,81 @@ impl EventPredictionLog {
         Ok(changed == 1)
     }
 
+    fn cycle_plan(&self, symbol: &str, horizon: EventHorizon) -> Result<Option<CyclePlan>> {
+        let open_count = self.connection.query_row(
+            "SELECT COUNT(*)
+               FROM event_prediction_tickets
+              WHERE status = 'open'
+                AND symbol = ?1
+                AND horizon_minutes = ?2",
+            params![symbol, horizon.minutes()],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if open_count > 0 {
+            return Ok(None);
+        }
+
+        let last = self.connection.query_row(
+            "SELECT cycle_number, cycle_order, COALESCE(result, ''), stake_amount,
+                    COALESCE(cycle_balance_after, 0.0)
+               FROM event_prediction_tickets
+              WHERE symbol = ?1
+                AND horizon_minutes = ?2
+                AND cycle_number IS NOT NULL
+              ORDER BY cycle_number DESC, cycle_order DESC, created_at DESC
+              LIMIT 1",
+            params![symbol, horizon.minutes()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, f64>(4)?,
+                ))
+            },
+        );
+
+        let (cycle_number, cycle_order, stake_amount) = match last {
+            Ok((last_cycle, last_order, result, last_stake, balance_after)) => {
+                if result == "win" && last_order < EVENT_CYCLE_MAX_ORDERS {
+                    let next_stake = if balance_after > 0.0 {
+                        balance_after
+                    } else {
+                        event_settlement_return("win", horizon.minutes(), last_stake)
+                    };
+                    (last_cycle, last_order + 1, next_stake)
+                } else if result == "tie" && last_order < EVENT_CYCLE_MAX_ORDERS {
+                    (last_cycle, last_order + 1, last_stake)
+                } else {
+                    (last_cycle + 1, 1, EVENT_STAKE_USDT)
+                }
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => (1, 1, EVENT_STAKE_USDT),
+            Err(error) => return Err(error).context("Failed to recover event reinvestment cycle"),
+        };
+        let cycle_id = format!(
+            "{}-{}m-C{:06}",
+            symbol.to_ascii_uppercase(),
+            horizon.minutes(),
+            cycle_number
+        );
+        if !stake_amount.is_finite() || stake_amount <= 0.0 {
+            bail!("invalid event cycle stake: {stake_amount}");
+        }
+        Ok(Some(CyclePlan {
+            cycle_id,
+            cycle_number,
+            cycle_order,
+            stake_amount,
+        }))
+    }
+
     fn due_tickets(&self, now: i64) -> Result<Vec<DueTicket>> {
         let mut statement = self.connection.prepare(
             "SELECT id, symbol, horizon_minutes, close_time, direction, entry_price, stake_amount,
-                    confidence, score
+                    confidence, score, COALESCE(cycle_id, ''), COALESCE(cycle_number, 0),
+                    COALESCE(cycle_order, 0)
              FROM event_prediction_tickets
              WHERE status = 'open'
                AND close_time <= ?1
@@ -448,6 +583,9 @@ impl EventPredictionLog {
                 stake_amount: row.get(6)?,
                 confidence: row.get(7)?,
                 score: row.get(8)?,
+                cycle_id: row.get(9)?,
+                cycle_number: row.get(10)?,
+                cycle_order: row.get(11)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -499,14 +637,26 @@ impl EventPredictionLog {
             let settlement_return =
                 event_settlement_return(result, ticket.horizon_minutes, ticket.stake_amount);
             let virtual_pnl = settlement_return - ticket.stake_amount;
+            let cycle_balance_after = if ticket.cycle_number > 0 {
+                Some(settlement_return)
+            } else {
+                None
+            };
             let review = format!(
-                "{}: {} {}m stake {:.2} USDT, return {:.2} USDT, pnl {:+.2} USDT, entry {:.8}, expiry {:.8}, move {:+.4}%, confidence {:.1}%, score {:+.3}, settled {}s late",
+                "{}: {} {}m stake {:.2} USDT, return {:.2} USDT, pnl {:+.2} USDT, cycle {} order {}/{}, entry {:.8}, expiry {:.8}, move {:+.4}%, confidence {:.1}%, score {:+.3}, settled {}s late",
                 result,
                 ticket.direction,
                 ticket.horizon_minutes,
                 ticket.stake_amount,
                 settlement_return,
                 virtual_pnl,
+                if ticket.cycle_id.is_empty() {
+                    "legacy"
+                } else {
+                    &ticket.cycle_id
+                },
+                ticket.cycle_order,
+                EVENT_CYCLE_MAX_ORDERS,
                 ticket.entry_price,
                 price,
                 move_percent,
@@ -514,11 +664,11 @@ impl EventPredictionLog {
                 ticket.score,
                 now.saturating_sub(ticket.close_time)
             );
-            self.connection.execute(
+            let changed = self.connection.execute(
                 "UPDATE event_prediction_tickets
                  SET status = 'settled', result = ?1, expiry_price = ?2, move_percent = ?3,
-                     virtual_pnl = ?4, review = ?5, settled_at = ?6
-                 WHERE id = ?7 AND status = 'open'",
+                     virtual_pnl = ?4, review = ?5, settled_at = ?6, cycle_balance_after = ?7
+                 WHERE id = ?8 AND status = 'open'",
                 params![
                     result,
                     price,
@@ -526,10 +676,11 @@ impl EventPredictionLog {
                     virtual_pnl,
                     review,
                     now,
+                    cycle_balance_after,
                     ticket.id,
                 ],
             )?;
-            settled += 1;
+            settled += changed;
         }
         Ok(settled)
     }
@@ -570,7 +721,7 @@ impl EventPredictionLog {
                 signal.reason,
                 now.saturating_sub(signal.close_time)
             );
-            self.connection.execute(
+            let changed = self.connection.execute(
                 "UPDATE event_prediction_signals
                  SET status = 'settled', result = ?1, expiry_price = ?2, move_percent = ?3,
                      virtual_pnl = ?4, review = ?5, settled_at = ?6
@@ -585,7 +736,7 @@ impl EventPredictionLog {
                     signal.id,
                 ],
             )?;
-            settled += 1;
+            settled += changed;
         }
         Ok(settled)
     }
@@ -597,7 +748,7 @@ impl EventPredictionLog {
                 "SELECT COUNT(*) FROM event_prediction_tickets
                  WHERE status = 'open'
                    AND symbol IN ('BTCUSDT', 'ETHUSDT')
-                   AND horizon_minutes IN (30, 60)
+                   AND horizon_minutes IN (10, 30, 60)
                    AND instr(features_json, ?1) > 0",
                 [marker],
                 |row| row.get(0),
@@ -605,66 +756,101 @@ impl EventPredictionLog {
             .context("Failed to count open event predictions")
     }
 
-    fn recent_regime_bias(
+    fn legacy_open_count(&self) -> Result<i64> {
+        let marker = strategy_marker(EVENT_STRATEGY_NAME);
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM event_prediction_tickets
+                 WHERE status = 'open'
+                   AND symbol IN ('BTCUSDT', 'ETHUSDT')
+                   AND horizon_minutes IN (10, 30, 60)
+                   AND instr(features_json, ?1) = 0",
+                [marker],
+                |row| row.get(0),
+            )
+            .context("Failed to count legacy open event predictions")
+    }
+
+    fn recent_expert_bias(
         &self,
+        symbol: &str,
         horizon: EventHorizon,
         now: i64,
     ) -> Result<Option<DirectionRegimeBias>> {
-        if !horizon.is_active() {
-            return Ok(None);
-        }
+        let (spacing_seconds, sample_limit) = match horizon {
+            EventHorizon::ThirtyMinutes => (
+                EVENT_30M_EXPERT_SPACING_SECONDS,
+                EVENT_30M_EXPERT_SAMPLE_LIMIT,
+            ),
+            EventHorizon::OneHour => (
+                EVENT_60M_EXPERT_SPACING_SECONDS,
+                EVENT_60M_EXPERT_SAMPLE_LIMIT,
+            ),
+            EventHorizon::TenMinutes => return Ok(None),
+        };
         let mut statement = self.connection.prepare(
-            "SELECT move_percent
+            "SELECT open_time, move_percent
                FROM event_prediction_tickets
               WHERE status = 'settled'
                 AND result IN ('win', 'loss', 'tie')
-                AND symbol IN ('BTCUSDT', 'ETHUSDT')
-                AND horizon_minutes = ?1
-                AND close_time <= ?2
+                AND symbol = ?1
+                AND horizon_minutes = ?2
+                AND close_time <= ?3
                 AND move_percent IS NOT NULL
+                AND instr(features_json, '\"strategy_version\"') > 0
               ORDER BY close_time DESC, COALESCE(settled_at, close_time) DESC
-              LIMIT ?3",
+              LIMIT ?4",
         )?;
-        let moves = statement
-            .query_map(
-                params![horizon.minutes(), now, EVENT_REGIME_SAMPLE_LIMIT],
-                |row| row.get::<_, f64>(0),
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut up = 0_i64;
-        let mut down = 0_i64;
-        for move_percent in moves {
-            if move_percent > 0.000001 {
-                up += 1;
-            } else if move_percent < -0.000001 {
-                down += 1;
+        let rows = statement.query_map(
+            params![symbol, horizon.minutes(), now, EVENT_EXPERT_HISTORY_LIMIT],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)),
+        )?;
+        let mut seen_buckets = BTreeSet::new();
+        let mut samples = Vec::new();
+        for row in rows {
+            let (open_time, move_percent) = row?;
+            let bucket = open_time.div_euclid(spacing_seconds);
+            if !seen_buckets.insert(bucket) {
+                continue;
+            }
+            samples.push(ExpertSample { move_percent });
+            if samples.len() >= sample_limit {
+                break;
             }
         }
-        let sample_size = up + down;
-        if sample_size < EVENT_REGIME_MIN_SAMPLES {
+        if samples.is_empty() {
             return Ok(None);
         }
-        let up_rate = up as f64 / sample_size as f64;
-        let score_strength = ((up_rate - 0.5).abs() * 2.0).clamp(0.08, 0.65);
-        if up_rate >= EVENT_REGIME_UP_THRESHOLD {
-            Ok(Some(DirectionRegimeBias {
-                direction: EventDirection::Up,
-                reason: "rolling_up_regime_v4",
-                sample_size,
-                up_rate,
-                score_strength,
-            }))
-        } else if up_rate <= EVENT_REGIME_DOWN_THRESHOLD {
-            Ok(Some(DirectionRegimeBias {
-                direction: EventDirection::Down,
-                reason: "rolling_down_regime_v4",
-                sample_size,
-                up_rate,
-                score_strength,
-            }))
+        let up = samples
+            .iter()
+            .filter(|sample| sample.move_percent > 0.000001)
+            .count();
+        let up_rate = up as f64 / samples.len() as f64;
+        let direction =
+            if samples.len() >= EVENT_EXPERT_MIN_SAMPLES && up_rate >= EVENT_UP_COMMITMENT_RATE {
+                EventDirection::Up
+            } else {
+                EventDirection::Down
+            };
+        let reason = if direction == EventDirection::Up {
+            "rolling_up_commitment_v9"
         } else {
-            Ok(None)
-        }
+            "rolling_down_commitment_v9"
+        };
+        let score_strength = if samples.len() < EVENT_EXPERT_MIN_SAMPLES {
+            0.20
+        } else {
+            ((up_rate - 0.5).abs() * 2.0).clamp(0.20, 0.65)
+        };
+        Ok(Some(DirectionRegimeBias {
+            direction,
+            reason,
+            sample_size: samples.len() as i64,
+            up_rate,
+            long_sample_size: None,
+            long_up_rate: None,
+            score_strength,
+        }))
     }
 
     fn bankroll(&self) -> Result<EventBankroll> {
@@ -682,14 +868,14 @@ impl EventPredictionLog {
                      FROM event_prediction_tickets
                      WHERE status = 'settled'
                        AND symbol IN ('BTCUSDT', 'ETHUSDT')
-                       AND horizon_minutes IN (30, 60)
+                       AND horizon_minutes IN (10, 30, 60)
                        AND instr(features_json, ?1) > 0"
         } else {
             "SELECT COALESCE(SUM(virtual_pnl), 0.0)
                      FROM event_prediction_tickets
                      WHERE status = 'settled'
                        AND symbol IN ('BTCUSDT', 'ETHUSDT')
-                       AND horizon_minutes IN (30, 60)"
+                       AND horizon_minutes IN (10, 30, 60)"
         };
         let realized_params = strategy_filter.iter().map(String::as_str);
         let realized_pnl = self
@@ -705,14 +891,14 @@ impl EventPredictionLog {
                      FROM event_prediction_tickets
                      WHERE status = 'open'
                        AND symbol IN ('BTCUSDT', 'ETHUSDT')
-                       AND horizon_minutes IN (30, 60)
+                       AND horizon_minutes IN (10, 30, 60)
                        AND instr(features_json, ?1) > 0"
         } else {
             "SELECT COALESCE(SUM(stake_amount), 0.0)
                      FROM event_prediction_tickets
                      WHERE status = 'open'
                        AND symbol IN ('BTCUSDT', 'ETHUSDT')
-                       AND horizon_minutes IN (30, 60)"
+                       AND horizon_minutes IN (10, 30, 60)"
         };
         let open_params = strategy_filter.iter().map(String::as_str);
         let open_exposure = self
@@ -759,7 +945,7 @@ impl EventPredictionLog {
                  FROM event_prediction_tickets
                  WHERE status = 'settled'
                    AND symbol IN ('BTCUSDT', 'ETHUSDT')
-                   AND horizon_minutes IN (30, 60)
+                   AND horizon_minutes IN (10, 30, 60)
                    AND instr(features_json, ?1) > 0
                  GROUP BY horizon_minutes
                  ORDER BY horizon_minutes"
@@ -774,7 +960,7 @@ impl EventPredictionLog {
                  FROM event_prediction_tickets
                  WHERE status = 'settled'
                    AND symbol IN ('BTCUSDT', 'ETHUSDT')
-                   AND horizon_minutes IN (30, 60)
+                   AND horizon_minutes IN (10, 30, 60)
                  GROUP BY horizon_minutes
                  ORDER BY horizon_minutes"
         })?;
@@ -812,11 +998,13 @@ impl EventPredictionLog {
         let mut statement = self.connection.prepare(
             "SELECT id, symbol, horizon_minutes, open_time, close_time, direction,
                     confidence, score, stake_amount, entry_price, expiry_price, status,
-                    COALESCE(result, ''), move_percent, virtual_pnl, COALESCE(review, '')
+                    COALESCE(result, ''), move_percent, virtual_pnl,
+                    COALESCE(cycle_id, ''), COALESCE(cycle_number, 0),
+                    COALESCE(cycle_order, 0), cycle_balance_after, COALESCE(review, '')
              FROM event_prediction_tickets
              WHERE status = 'open'
                AND symbol IN ('BTCUSDT', 'ETHUSDT')
-               AND horizon_minutes IN (30, 60)
+               AND horizon_minutes IN (10, 30, 60)
                AND instr(features_json, ?2) > 0
              ORDER BY close_time ASC, open_time DESC, horizon_minutes ASC
              LIMIT ?1",
@@ -831,11 +1019,13 @@ impl EventPredictionLog {
         let mut statement = self.connection.prepare(
             "SELECT id, symbol, horizon_minutes, open_time, close_time, direction,
                     confidence, score, stake_amount, entry_price, expiry_price, status,
-                    COALESCE(result, ''), move_percent, virtual_pnl, COALESCE(review, '')
+                    COALESCE(result, ''), move_percent, virtual_pnl,
+                    COALESCE(cycle_id, ''), COALESCE(cycle_number, 0),
+                    COALESCE(cycle_order, 0), cycle_balance_after, COALESCE(review, '')
              FROM event_prediction_tickets
              WHERE status = 'settled'
                AND symbol IN ('BTCUSDT', 'ETHUSDT')
-               AND horizon_minutes IN (30, 60)
+               AND horizon_minutes IN (10, 30, 60)
                AND instr(features_json, ?2) > 0
              ORDER BY COALESCE(settled_at, close_time) DESC, close_time DESC, open_time DESC
              LIMIT ?1",
@@ -863,7 +1053,11 @@ fn ticket_from_row(row: &Row<'_>) -> rusqlite::Result<EventPredictionTicket> {
         result: row.get(12)?,
         move_percent: row.get(13)?,
         virtual_pnl: row.get(14)?,
-        review: row.get(15)?,
+        cycle_id: row.get(15)?,
+        cycle_number: row.get(16)?,
+        cycle_order: row.get(17)?,
+        cycle_balance_after: row.get(18)?,
+        review: row.get(19)?,
     })
 }
 
@@ -909,6 +1103,7 @@ pub fn run_cycle_for_horizons(
     }
 
     let open_count = log.open_count()?;
+    let legacy_open_count = log.legacy_open_count()?;
     let bankroll = log.bankroll()?;
     let all_bankroll = log.all_bankroll()?;
     let stats = log.stats()?;
@@ -919,9 +1114,10 @@ pub fn run_cycle_for_horizons(
         bail!("{}", failures.join("; "));
     }
     let mut message = format!(
-        "事件预测：当前策略 {}，当前未结算 {}，当前占用 {:.2}，当前策略盈亏 {:+.2}，全历史盈亏 {:+.2}，信号结算 {}",
+        "事件预测：当前策略 {}，周期票未结算 {}，等待旧票结算 {}，当前占用 {:.2}，当前策略盈亏 {:+.2}，全历史盈亏 {:+.2}，信号结算 {}",
         EVENT_STRATEGY_NAME,
         open_count,
+        legacy_open_count,
         bankroll.open_exposure,
         bankroll.realized_pnl,
         all_bankroll.realized_pnl,
@@ -935,6 +1131,7 @@ pub fn run_cycle_for_horizons(
         evaluated: creation.evaluated,
         settled,
         open_count,
+        legacy_open_count,
         starting_bankroll: EVENT_STARTING_BANKROLL_USDT,
         stake_amount: EVENT_STAKE_USDT,
         realized_pnl: bankroll.realized_pnl,
@@ -990,19 +1187,95 @@ fn due_symbols(log: &EventPredictionLog, now: i64) -> Result<Vec<String>> {
         .context("Failed to read due event prediction symbols")
 }
 
-fn migrate_schema(connection: &Connection) -> Result<()> {
-    let mut statement = connection.prepare("PRAGMA table_info(event_prediction_tickets)")?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+fn migrate_schema(connection: &mut Connection) -> Result<()> {
+    let schema_version =
+        connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+    if schema_version == EVENT_SCHEMA_VERSION {
+        return Ok(());
+    }
+    if schema_version > EVENT_SCHEMA_VERSION {
+        bail!(
+            "event prediction database schema version {schema_version} is newer than supported version {EVENT_SCHEMA_VERSION}"
+        );
+    }
+
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("Failed to start event prediction schema migration")?;
+    let columns = {
+        let mut statement = transaction.prepare("PRAGMA table_info(event_prediction_tickets)")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
     if !columns.iter().any(|column| column == "stake_amount") {
-        connection.execute(
+        transaction.execute(
             "ALTER TABLE event_prediction_tickets
              ADD COLUMN stake_amount REAL NOT NULL DEFAULT 5.0",
             [],
         )?;
     }
-    migrate_payout_model(connection)?;
+    for (column, definition) in [
+        ("cycle_id", "TEXT"),
+        ("cycle_number", "INTEGER"),
+        ("cycle_order", "INTEGER"),
+        ("cycle_balance_after", "REAL"),
+    ] {
+        if !columns.iter().any(|existing| existing == column) {
+            transaction.execute(
+                &format!("ALTER TABLE event_prediction_tickets ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+    migrate_payout_model(&transaction)?;
+    ensure_cycle_indexes_can_be_created(&transaction)?;
+    transaction.execute_batch(
+        "CREATE INDEX IF NOT EXISTS event_prediction_cycle
+         ON event_prediction_tickets(symbol, horizon_minutes, cycle_number, cycle_order);
+         CREATE UNIQUE INDEX IF NOT EXISTS unique_event_prediction_cycle_order
+         ON event_prediction_tickets(symbol, horizon_minutes, cycle_number, cycle_order)
+         WHERE cycle_number IS NOT NULL AND cycle_order IS NOT NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS unique_event_prediction_open_cycle_chain
+         ON event_prediction_tickets(symbol, horizon_minutes)
+         WHERE status = 'open' AND cycle_number IS NOT NULL;",
+    )?;
+    transaction.pragma_update(None, "user_version", EVENT_SCHEMA_VERSION)?;
+    transaction
+        .commit()
+        .context("Failed to commit event prediction schema migration")?;
+    Ok(())
+}
+
+fn ensure_cycle_indexes_can_be_created(connection: &Connection) -> Result<()> {
+    let duplicate_order = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+              FROM event_prediction_tickets
+             WHERE cycle_number IS NOT NULL AND cycle_order IS NOT NULL
+             GROUP BY symbol, horizon_minutes, cycle_number, cycle_order
+            HAVING COUNT(*) > 1
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if duplicate_order {
+        bail!("duplicate event prediction cycle orders must be resolved before migration");
+    }
+    let duplicate_open_chain = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+              FROM event_prediction_tickets
+             WHERE status = 'open' AND cycle_number IS NOT NULL
+             GROUP BY symbol, horizon_minutes
+            HAVING COUNT(*) > 1
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if duplicate_open_chain {
+        bail!("multiple open event prediction tickets exist in one cycle chain");
+    }
     Ok(())
 }
 
@@ -1017,7 +1290,15 @@ fn migrate_payout_model(connection: &Connection) -> Result<()> {
                 WHEN result = 'tie' THEN 0.0
                 ELSE virtual_pnl
              END
-             WHERE status = 'settled'",
+             WHERE status = 'settled'
+               AND result IN ('win', 'loss', 'tie')
+               AND (virtual_pnl IS NULL OR ABS(virtual_pnl - CASE
+                    WHEN result = 'win' AND horizon_minutes = 10 THEN stake_amount * ?1
+                    WHEN result = 'win' THEN stake_amount * ?2
+                    WHEN result = 'loss' THEN -stake_amount
+                    WHEN result = 'tie' THEN 0.0
+                    ELSE virtual_pnl
+               END) > 0.000000001)",
             params![EVENT_TEN_MINUTE_PROFIT_RATE, EVENT_DEFAULT_PROFIT_RATE],
         )
         .context("Failed to migrate event prediction payout model")?;
@@ -1031,7 +1312,15 @@ fn migrate_payout_model(connection: &Connection) -> Result<()> {
                 WHEN result = 'tie' THEN 0.0
                 ELSE virtual_pnl
              END
-             WHERE status = 'settled'",
+             WHERE status = 'settled'
+               AND result IN ('win', 'loss', 'tie')
+               AND (virtual_pnl IS NULL OR ABS(virtual_pnl - CASE
+                    WHEN result = 'win' AND horizon_minutes = 10 THEN stake_amount * ?1
+                    WHEN result = 'win' THEN stake_amount * ?2
+                    WHEN result = 'loss' THEN -stake_amount
+                    WHEN result = 'tie' THEN 0.0
+                    ELSE virtual_pnl
+               END) > 0.000000001)",
             params![EVENT_TEN_MINUTE_PROFIT_RATE, EVENT_DEFAULT_PROFIT_RATE],
         )
         .context("Failed to migrate event prediction signal payout model")?;
@@ -1090,8 +1379,9 @@ fn create_symbol_predictions(
     let snapshot = market::fetch_snapshot(client, symbol)?;
     let mut summary = EventCreationSummary::default();
     for horizon in horizons {
-        let regime_bias = log.recent_regime_bias(*horizon, now)?;
-        let prediction = make_prediction(
+        let cycle_plan = log.cycle_plan(symbol, *horizon)?;
+        let regime_bias = log.recent_expert_bias(symbol, *horizon, now)?;
+        let mut prediction = make_prediction(
             symbol,
             *horizon,
             &candles,
@@ -1099,8 +1389,23 @@ fn create_symbol_predictions(
             open_time,
             regime_bias.as_ref(),
         )?;
-        let decision =
-            EventStrategyDecision::trade("每轮全量虚拟预测样本：用结算结果训练方向 agent");
+        let state_decision = extreme_commitment_decision(&prediction.features);
+        let decision = if let Some(plan) = cycle_plan.as_ref() {
+            prediction.stake_amount = plan.stake_amount;
+            prediction.cycle_id = plan.cycle_id.clone();
+            prediction.cycle_number = plan.cycle_number;
+            prediction.cycle_order = plan.cycle_order;
+            add_cycle_fields(&mut prediction.features, plan);
+            EventStrategyDecision::trade(format!(
+                "{}_cycle_{}_order_{}",
+                state_decision.reason, plan.cycle_number, plan.cycle_order
+            ))
+        } else {
+            EventStrategyDecision::observe(format!(
+                "chain_waiting_for_settlement_{}",
+                state_decision.reason
+            ))
+        };
         summary.evaluated += 1;
         let _ = log.record_signal(&prediction, &decision, now)?;
         let created = decision.should_trade() && log.record_prediction(&prediction, now)?;
@@ -1118,6 +1423,36 @@ fn create_symbol_predictions(
         });
     }
     Ok(summary)
+}
+
+fn extreme_commitment_decision(features: &Value) -> EventStrategyDecision {
+    let sample_size = feature_value(features, "regime_sample_size")
+        .max(0.0)
+        .round() as usize;
+    let up_rate = feature_value(features, "regime_up_rate");
+    let strong_up = sample_size >= EVENT_EXTREME_MIN_SAMPLES && up_rate >= EVENT_EXTREME_UP_RATE;
+    let strong_down =
+        sample_size >= EVENT_EXTREME_MIN_SAMPLES && up_rate <= EVENT_EXTREME_DOWN_RATE;
+    let state = if strong_up {
+        "extreme_up"
+    } else if strong_down {
+        "extreme_down"
+    } else {
+        "balanced"
+    };
+    EventStrategyDecision::trade(format!(
+        "full_volume_{state}_v10_2_sample_{sample_size}_up_rate_{up_rate:.3}"
+    ))
+}
+
+fn add_cycle_fields(features: &mut Value, plan: &CyclePlan) {
+    if let Some(object) = features.as_object_mut() {
+        object.insert("cycle_id".into(), json!(plan.cycle_id));
+        object.insert("cycle_number".into(), json!(plan.cycle_number));
+        object.insert("cycle_order".into(), json!(plan.cycle_order));
+        object.insert("cycle_max_orders".into(), json!(EVENT_CYCLE_MAX_ORDERS));
+        object.insert("cycle_stake_amount".into(), json!(plan.stake_amount));
+    }
 }
 
 fn make_prediction(
@@ -1174,6 +1509,9 @@ fn make_prediction(
         score,
         stake_amount: EVENT_STAKE_USDT,
         entry_price,
+        cycle_id: String::new(),
+        cycle_number: 0,
+        cycle_order: 0,
         features,
     })
 }
@@ -1187,6 +1525,8 @@ struct DirectionDecision {
     factor_score: f64,
     regime_sample_size: Option<i64>,
     regime_up_rate: Option<f64>,
+    regime_long_sample_size: Option<i64>,
+    regime_long_up_rate: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1195,7 +1535,40 @@ struct DirectionRegimeBias {
     reason: &'static str,
     sample_size: i64,
     up_rate: f64,
+    long_sample_size: Option<i64>,
+    long_up_rate: Option<f64>,
     score_strength: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExpertSample {
+    move_percent: f64,
+}
+
+fn fast_reversal_signal(
+    horizon: EventHorizon,
+    features: &Value,
+) -> Option<(EventDirection, &'static str, f64)> {
+    if !matches!(horizon, EventHorizon::ThirtyMinutes) {
+        return None;
+    }
+    let momentum3 = feature_value(features, "momentum3");
+    let momentum30 = feature_value(features, "momentum30");
+    if momentum3 >= 0.20 && momentum30 <= -0.30 {
+        return Some((
+            EventDirection::Down,
+            "bottom_reversal_up_blocked_v8",
+            (0.5 * momentum3 + 0.5 * (-momentum30)).clamp(0.08, 0.80),
+        ));
+    }
+    if momentum3 <= -0.10 && momentum30 >= 0.20 {
+        return Some((
+            EventDirection::Down,
+            "fast_top_reversal_down_v8",
+            (0.5 * (-momentum3) + 0.5 * momentum30).clamp(0.08, 0.80),
+        ));
+    }
+    None
 }
 
 fn calibrated_direction(
@@ -1215,59 +1588,41 @@ fn calibrated_direction(
             factor_score: signed_factor_score(bias.score_strength, bias.direction),
             regime_sample_size: Some(bias.sample_size),
             regime_up_rate: Some(bias.up_rate),
+            regime_long_sample_size: bias.long_sample_size,
+            regime_long_up_rate: bias.long_up_rate,
         };
     }
 
-    if let Some((reason, factor_score)) = rebound_up_signal(horizon, features) {
+    if let Some((direction, reason, factor_score)) = fast_reversal_signal(horizon, features) {
         return DirectionDecision {
-            direction: EventDirection::Up,
+            direction,
             reason,
-            flipped: raw_direction != EventDirection::Up,
+            flipped: raw_direction != direction,
             score_strength: abs_score.max(factor_score).clamp(0.05, 1.0),
-            factor_score,
+            factor_score: signed_factor_score(factor_score, direction),
             regime_sample_size: None,
             regime_up_rate: None,
+            regime_long_sample_size: None,
+            regime_long_up_rate: None,
         };
     }
 
-    if let Some((reason, factor_score)) =
-        confirmed_trend_up_signal(horizon, raw_direction, features)
-    {
-        return DirectionDecision {
-            direction: EventDirection::Up,
-            reason,
-            flipped: raw_direction != EventDirection::Up,
-            score_strength: abs_score.max(factor_score).clamp(0.05, 1.0),
-            factor_score,
-            regime_sample_size: None,
-            regime_up_rate: None,
-        };
-    }
-
-    if raw_direction == EventDirection::Up {
-        let factor_score = -exhaustion_down_score(horizon, features);
-        let score_strength = abs_score.max(factor_score.abs());
-        return DirectionDecision {
-            direction: EventDirection::Down,
-            reason: "raw_up_unconfirmed_trend_down_v4",
-            flipped: true,
-            score_strength,
-            factor_score,
-            regime_sample_size: None,
-            regime_up_rate: None,
-        };
-    }
-
-    let factor_score = -exhaustion_down_score(horizon, features);
-    let score_strength = abs_score.max(factor_score.abs());
+    let direction = if raw_score <= 0.0 {
+        EventDirection::Up
+    } else {
+        EventDirection::Down
+    };
+    let factor_score = signed_factor_score(abs_score.max(0.08), direction);
     DirectionDecision {
-        direction: EventDirection::Down,
-        reason: "raw_down_continuation_v4",
-        flipped: false,
-        score_strength,
+        direction,
+        reason: "raw_score_contrarian_fallback_v7",
+        flipped: raw_direction != direction,
+        score_strength: abs_score.max(0.08),
         factor_score,
         regime_sample_size: None,
         regime_up_rate: None,
+        regime_long_sample_size: None,
+        regime_long_up_rate: None,
     }
 }
 
@@ -1311,129 +1666,13 @@ fn add_direction_training_fields(
         if let Some(up_rate) = decision.regime_up_rate {
             object.insert("regime_up_rate".into(), json!(up_rate));
         }
-    }
-}
-
-fn rebound_up_signal(horizon: EventHorizon, features: &Value) -> Option<(&'static str, f64)> {
-    let snapshot_change = feature_value(features, "snapshot_change_percent");
-    let sentiment = feature_value(features, "sentiment");
-    let rsi_trend = feature_value(features, "rsi_trend");
-    match horizon {
-        EventHorizon::TenMinutes => {
-            if snapshot_change <= -1.0 && rsi_trend <= -0.30 && sentiment >= 0.30 {
-                let oversold = (-snapshot_change / 4.0).clamp(0.0, 1.0);
-                let rsi = (-rsi_trend).clamp(0.0, 1.0);
-                let sentiment_strength = sentiment.clamp(0.0, 1.0);
-                Some((
-                    "short_oversold_rsi_sentiment_rebound_v4",
-                    (0.40 * oversold + 0.35 * rsi + 0.25 * sentiment_strength).clamp(0.05, 1.0),
-                ))
-            } else {
-                None
-            }
+        if let Some(sample_size) = decision.regime_long_sample_size {
+            object.insert("regime_long_sample_size".into(), json!(sample_size));
         }
-        EventHorizon::ThirtyMinutes => {
-            if snapshot_change <= -2.0 && sentiment >= 0.50 {
-                let oversold = (-snapshot_change / 5.0).clamp(0.0, 1.0);
-                let sentiment_strength = sentiment.clamp(0.0, 1.0);
-                Some((
-                    "mid_24h_oversold_sentiment_rebound_v4",
-                    (0.65 * oversold + 0.35 * sentiment_strength).clamp(0.05, 1.0),
-                ))
-            } else {
-                None
-            }
-        }
-        EventHorizon::OneHour => {
-            if snapshot_change <= -3.0 {
-                Some((
-                    "long_extreme_24h_oversold_rebound_v4",
-                    (-snapshot_change / 6.0).clamp(0.05, 1.0),
-                ))
-            } else {
-                None
-            }
+        if let Some(up_rate) = decision.regime_long_up_rate {
+            object.insert("regime_long_up_rate".into(), json!(up_rate));
         }
     }
-}
-
-fn confirmed_trend_up_signal(
-    horizon: EventHorizon,
-    raw_direction: EventDirection,
-    features: &Value,
-) -> Option<(&'static str, f64)> {
-    let momentum10 = feature_value(features, "momentum10");
-    let momentum30 = feature_value(features, "momentum30");
-    let ema_short = feature_value(features, "ema_short");
-    let ema_mid = feature_value(features, "ema_mid");
-    let ema_long = feature_value(features, "ema_long");
-    let breakout = feature_value(features, "breakout");
-    match horizon {
-        EventHorizon::TenMinutes => None,
-        EventHorizon::ThirtyMinutes => {
-            if raw_direction == EventDirection::Up
-                && ema_short >= 0.05
-                && ema_mid >= -0.05
-                && breakout >= 0.0
-            {
-                Some((
-                    "mid_confirmed_raw_up_trend_v4",
-                    (0.32 * momentum10.clamp(0.0, 1.0)
-                        + 0.24 * ema_short.clamp(0.0, 1.0)
-                        + 0.24 * (ema_mid + 0.05).clamp(0.0, 1.0)
-                        + 0.20 * breakout.clamp(0.0, 1.0))
-                    .clamp(0.05, 1.0),
-                ))
-            } else if momentum10 >= 0.30 && ema_short >= 0.15 {
-                Some((
-                    "mid_short_rebound_momentum_v4",
-                    (0.58 * momentum10.clamp(0.0, 1.0) + 0.42 * ema_short.clamp(0.0, 1.0))
-                        .clamp(0.05, 1.0),
-                ))
-            } else {
-                None
-            }
-        }
-        EventHorizon::OneHour => {
-            if raw_direction == EventDirection::Up
-                && ema_mid >= 0.05
-                && ema_long >= 0.0
-                && breakout >= 0.0
-            {
-                Some((
-                    "long_confirmed_raw_up_trend_v4",
-                    (0.24 * momentum30.clamp(0.0, 1.0)
-                        + 0.24 * ema_mid.clamp(0.0, 1.0)
-                        + 0.28 * ema_long.clamp(0.0, 1.0)
-                        + 0.24 * breakout.clamp(0.0, 1.0))
-                    .clamp(0.05, 1.0),
-                ))
-            } else if momentum30 >= 0.25 && ema_mid >= 0.10 {
-                Some((
-                    "long_mid_trend_rebound_v4",
-                    (0.60 * momentum30.clamp(0.0, 1.0) + 0.40 * ema_mid.clamp(0.0, 1.0))
-                        .clamp(0.05, 1.0),
-                ))
-            } else {
-                None
-            }
-        }
-    }
-}
-
-fn exhaustion_down_score(horizon: EventHorizon, features: &Value) -> f64 {
-    let snapshot_change =
-        (feature_value(features, "snapshot_change_percent") / 5.0).clamp(0.0, 1.0);
-    let trend = match horizon {
-        EventHorizon::TenMinutes => feature_value(features, "momentum3"),
-        EventHorizon::ThirtyMinutes => feature_value(features, "momentum30"),
-        EventHorizon::OneHour => {
-            0.50 * feature_value(features, "momentum60")
-                + 0.50 * feature_value(features, "ema_long")
-        }
-    }
-    .clamp(0.0, 1.0);
-    (0.60 * snapshot_change + 0.40 * trend).clamp(0.05, 1.0)
 }
 
 fn usable_price(snapshot: &MarketSnapshot) -> f64 {
@@ -1690,6 +1929,7 @@ mod tests {
 
         let open_time = 1_700_000_000;
         let mut created = 0;
+        let mut expected_pnl_by_horizon = BTreeMap::new();
         for horizon in EventHorizon::ALL {
             let prediction =
                 make_prediction("BTCUSDT", horizon, &candles, &snapshot, open_time, None).unwrap();
@@ -1697,16 +1937,22 @@ mod tests {
                 prediction.direction,
                 EventDirection::Up | EventDirection::Down
             ));
+            let expected_pnl = if prediction.direction == EventDirection::Up {
+                5.0 * event_profit_rate(horizon.minutes())
+            } else {
+                -5.0
+            };
+            expected_pnl_by_horizon.insert(horizon.minutes(), expected_pnl);
             if log.record_prediction(&prediction, open_time).unwrap() {
                 created += 1;
             }
         }
-        assert_eq!(created, 2);
-        assert_eq!(log.open_count().unwrap(), 2);
+        assert_eq!(created, 3);
+        assert_eq!(log.open_count().unwrap(), 3);
         let open_dashboard = log.dashboard().unwrap();
         assert_eq!(open_dashboard.stake_amount, 5.0);
         assert!(open_dashboard.starting_bankroll.is_infinite());
-        assert_eq!(open_dashboard.open_exposure, 10.0);
+        assert_eq!(open_dashboard.open_exposure, 15.0);
         assert!(open_dashboard.available_balance.is_infinite());
 
         let mut prices = BTreeMap::new();
@@ -1714,52 +1960,325 @@ mod tests {
         assert_eq!(
             log.settle_due_with_prices(open_time + 60 * 60 + 1, &prices)
                 .unwrap(),
-            2
+            3
         );
         let dashboard = log.dashboard().unwrap();
         assert_eq!(dashboard.open_count, 0);
         assert_eq!(dashboard.open_exposure, 0.0);
-        assert_close(dashboard.realized_pnl, 8.5);
+        assert_close(
+            dashboard.realized_pnl,
+            expected_pnl_by_horizon.values().sum(),
+        );
         assert!(dashboard.equity.is_infinite());
         assert!(dashboard.available_balance.is_infinite());
         assert_eq!(dashboard.open_recent.len(), 0);
-        assert_eq!(dashboard.settled_recent.len(), 2);
+        assert_eq!(dashboard.settled_recent.len(), 3);
         let pnl_by_horizon = dashboard
             .settled_recent
             .iter()
             .map(|ticket| (ticket.horizon_minutes, ticket.virtual_pnl.unwrap()))
             .collect::<BTreeMap<_, _>>();
-        assert_close(*pnl_by_horizon.get(&30).unwrap(), 4.25);
-        assert_close(*pnl_by_horizon.get(&60).unwrap(), 4.25);
+        for (horizon, expected_pnl) in expected_pnl_by_horizon {
+            assert_close(*pnl_by_horizon.get(&horizon).unwrap(), expected_pnl);
+        }
         assert_eq!(
             dashboard.stats.iter().map(|stat| stat.total).sum::<i64>(),
-            2
+            3
         );
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn inactive_ten_minute_requests_do_not_create_new_samples() {
+    fn active_ten_minute_requests_create_new_samples() {
         let horizons = normalized_horizons(&[EventHorizon::TenMinutes]);
         assert_eq!(
             horizons
                 .iter()
                 .map(|horizon| horizon.minutes())
                 .collect::<Vec<_>>(),
-            vec![30, 60]
+            vec![10]
         );
     }
 
     #[test]
-    fn direction_dataset_calibrates_direction_without_dropping_samples() {
+    fn reinvestment_cycle_compounds_win_and_resets_after_loss() {
+        let root = std::env::temp_dir().join(format!("gqt-event-cycle-{}", rand::random::<u64>()));
+        fs::create_dir_all(&root).unwrap();
+        let log = EventPredictionLog::open(&root.join("events.sqlite")).unwrap();
+        let candles = sample_candles();
+        let snapshot = sample_snapshot();
+        let horizon = EventHorizon::TenMinutes;
+        let mut open_time = 1_700_100_000;
+
+        let first = log.cycle_plan("BTCUSDT", horizon).unwrap().unwrap();
+        assert_eq!(first.cycle_number, 1);
+        assert_eq!(first.cycle_order, 1);
+        assert_close(first.stake_amount, 5.0);
+        let first_prediction = cycle_prediction(horizon, &candles, &snapshot, open_time, &first);
+        assert!(log.record_prediction(&first_prediction, open_time).unwrap());
+        assert!(log.cycle_plan("BTCUSDT", horizon).unwrap().is_none());
+        settle_prediction(&log, &first_prediction, true);
+
+        open_time += horizon.seconds() + 60;
+        let second = log.cycle_plan("BTCUSDT", horizon).unwrap().unwrap();
+        assert_eq!(second.cycle_number, 1);
+        assert_eq!(second.cycle_order, 2);
+        assert_close(second.stake_amount, 9.0);
+        let second_prediction = cycle_prediction(horizon, &candles, &snapshot, open_time, &second);
+        assert!(
+            log.record_prediction(&second_prediction, open_time)
+                .unwrap()
+        );
+        settle_prediction(&log, &second_prediction, false);
+
+        let reset = log.cycle_plan("BTCUSDT", horizon).unwrap().unwrap();
+        assert_eq!(reset.cycle_number, 2);
+        assert_eq!(reset.cycle_order, 1);
+        assert_close(reset.stake_amount, 5.0);
+
+        let settled = log.settled_recent(10).unwrap();
+        let second_ticket = settled
+            .iter()
+            .find(|ticket| ticket.cycle_order == 2)
+            .unwrap();
+        assert_eq!(second_ticket.result, "loss");
+        assert_close(second_ticket.cycle_balance_after.unwrap(), 0.0);
+        let first_ticket = settled
+            .iter()
+            .find(|ticket| ticket.cycle_order == 1)
+            .unwrap();
+        assert_close(first_ticket.cycle_balance_after.unwrap(), 9.0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reinvestment_cycle_stops_after_five_orders() {
+        let root = std::env::temp_dir().join(format!("gqt-event-cycle-{}", rand::random::<u64>()));
+        fs::create_dir_all(&root).unwrap();
+        let log = EventPredictionLog::open(&root.join("events.sqlite")).unwrap();
+        let candles = sample_candles();
+        let snapshot = sample_snapshot();
+        let horizon = EventHorizon::ThirtyMinutes;
+        let mut open_time = 1_700_200_000;
+        let mut expected_stake = 5.0;
+
+        for order in 1..=EVENT_CYCLE_MAX_ORDERS {
+            let plan = log.cycle_plan("ETHUSDT", horizon).unwrap().unwrap();
+            assert_eq!(plan.cycle_number, 1);
+            assert_eq!(plan.cycle_order, order);
+            assert_close(plan.stake_amount, expected_stake);
+            let prediction = cycle_prediction(horizon, &candles, &snapshot, open_time, &plan);
+            assert!(log.record_prediction(&prediction, open_time).unwrap());
+            settle_prediction(&log, &prediction, true);
+            expected_stake = event_settlement_return("win", horizon.minutes(), expected_stake);
+            open_time += horizon.seconds() + 60;
+        }
+
+        let next = log.cycle_plan("ETHUSDT", horizon).unwrap().unwrap();
+        assert_eq!(next.cycle_number, 2);
+        assert_eq!(next.cycle_order, 1);
+        assert_close(next.stake_amount, 5.0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_open_ticket_blocks_new_cycle_until_settlement() {
+        let root = std::env::temp_dir().join(format!("gqt-event-legacy-{}", rand::random::<u64>()));
+        fs::create_dir_all(&root).unwrap();
+        let log = EventPredictionLog::open(&root.join("events.sqlite")).unwrap();
+        log.connection
+            .execute(
+                "INSERT INTO event_prediction_tickets
+                 (id, created_at, symbol, horizon_minutes, open_time, close_time, direction,
+                  confidence, score, stake_amount, entry_price, status, features_json)
+                 VALUES ('legacy-open', 1, 'BTCUSDT', 10, 60, 660, 'up', 0.5, 0.1,
+                         5.0, 100.0, 'open', '{}')",
+                [],
+            )
+            .unwrap();
+
+        assert!(
+            log.cycle_plan("BTCUSDT", EventHorizon::TenMinutes)
+                .unwrap()
+                .is_none()
+        );
+        let mut prices = BTreeMap::new();
+        prices.insert("BTCUSDT".into(), 101.0);
+        assert_eq!(log.settle_due_with_prices(661, &prices).unwrap(), 1);
+        let first = log
+            .cycle_plan("BTCUSDT", EventHorizon::TenMinutes)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.cycle_number, 1);
+        assert_eq!(first.cycle_order, 1);
+        assert_close(first.stake_amount, 5.0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn database_prevents_two_open_tickets_in_one_cycle_chain() {
+        let root = std::env::temp_dir().join(format!("gqt-event-lock-{}", rand::random::<u64>()));
+        fs::create_dir_all(&root).unwrap();
+        let log = EventPredictionLog::open(&root.join("events.sqlite")).unwrap();
+        let candles = sample_candles();
+        let snapshot = sample_snapshot();
+        let horizon = EventHorizon::OneHour;
+        let plan = log.cycle_plan("BTCUSDT", horizon).unwrap().unwrap();
+        let first = cycle_prediction(horizon, &candles, &snapshot, 1_700_300_000, &plan);
+        let second = cycle_prediction(horizon, &candles, &snapshot, 1_700_300_060, &plan);
+
+        assert!(log.record_prediction(&first, first.open_time).unwrap());
+        assert!(!log.record_prediction(&second, second.open_time).unwrap());
+        assert_eq!(log.open_count().unwrap(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn schema_migration_runs_once_and_preserves_legacy_open_tickets() {
+        let root =
+            std::env::temp_dir().join(format!("gqt-event-migration-{}", rand::random::<u64>()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("events.sqlite");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE event_prediction_tickets (
+                        id TEXT PRIMARY KEY,
+                        created_at INTEGER NOT NULL,
+                        symbol TEXT NOT NULL,
+                        horizon_minutes INTEGER NOT NULL,
+                        open_time INTEGER NOT NULL,
+                        close_time INTEGER NOT NULL,
+                        direction TEXT NOT NULL,
+                        confidence REAL NOT NULL,
+                        score REAL NOT NULL,
+                        entry_price REAL NOT NULL,
+                        expiry_price REAL,
+                        status TEXT NOT NULL,
+                        result TEXT,
+                        move_percent REAL,
+                        virtual_pnl REAL,
+                        features_json TEXT NOT NULL,
+                        review TEXT,
+                        settled_at INTEGER
+                     );
+                     CREATE TABLE event_prediction_signals (
+                        id TEXT PRIMARY KEY,
+                        created_at INTEGER NOT NULL,
+                        symbol TEXT NOT NULL,
+                        horizon_minutes INTEGER NOT NULL,
+                        open_time INTEGER NOT NULL,
+                        close_time INTEGER NOT NULL,
+                        direction TEXT NOT NULL,
+                        confidence REAL NOT NULL,
+                        score REAL NOT NULL,
+                        stake_amount REAL NOT NULL DEFAULT 5.0,
+                        entry_price REAL NOT NULL,
+                        action TEXT NOT NULL,
+                        strategy TEXT NOT NULL,
+                        skip_reason TEXT,
+                        status TEXT NOT NULL,
+                        result TEXT,
+                        expiry_price REAL,
+                        move_percent REAL,
+                        virtual_pnl REAL,
+                        features_json TEXT NOT NULL,
+                        review TEXT,
+                        settled_at INTEGER
+                     );
+                     INSERT INTO event_prediction_tickets
+                     (id, created_at, symbol, horizon_minutes, open_time, close_time, direction,
+                      confidence, score, entry_price, status, features_json)
+                     VALUES ('legacy-open', 1, 'BTCUSDT', 10, 60, 660, 'up', 0.5, 0.1,
+                             100.0, 'open', '{}');
+                     INSERT INTO event_prediction_tickets
+                     (id, created_at, symbol, horizon_minutes, open_time, close_time, direction,
+                      confidence, score, entry_price, status, result, virtual_pnl, features_json)
+                     VALUES ('legacy-win', 1, 'ETHUSDT', 30, 60, 1860, 'up', 0.5, 0.1,
+                             100.0, 'settled', 'win', 999.0, '{}');",
+                )
+                .unwrap();
+        }
+
+        let log = EventPredictionLog::open(&path).unwrap();
+        assert_eq!(log.legacy_open_count().unwrap(), 1);
+        assert!(
+            log.cycle_plan("BTCUSDT", EventHorizon::TenMinutes)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            log.connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            EVENT_SCHEMA_VERSION
+        );
+        assert_close(
+            log.connection
+                .query_row(
+                    "SELECT virtual_pnl FROM event_prediction_tickets WHERE id = 'legacy-win'",
+                    [],
+                    |row| row.get::<_, f64>(0),
+                )
+                .unwrap(),
+            4.25,
+        );
+        drop(log);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE migration_update_counter (updates INTEGER NOT NULL);
+                 INSERT INTO migration_update_counter VALUES (0);
+                 CREATE TRIGGER count_ticket_migration_updates
+                 AFTER UPDATE ON event_prediction_tickets
+                 BEGIN
+                    UPDATE migration_update_counter SET updates = updates + 1;
+                 END;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let log = EventPredictionLog::open(&path).unwrap();
+        assert_eq!(
+            log.connection
+                .query_row("SELECT updates FROM migration_update_counter", [], |row| {
+                    row.get::<_, i64>(0)
+                },)
+                .unwrap(),
+            0
+        );
+        let indexes = {
+            let mut statement = log
+                .connection
+                .prepare("PRAGMA index_list(event_prediction_tickets)")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert!(
+            indexes
+                .iter()
+                .any(|name| name == "unique_event_prediction_cycle_order")
+        );
+        assert!(
+            indexes
+                .iter()
+                .any(|name| name == "unique_event_prediction_open_cycle_chain")
+        );
+        drop(log);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn direction_dataset_v9_commits_to_one_direction() {
         let neutral_features = json!({
-            "snapshot_change_percent": 1.2,
-            "sentiment": 0.1,
-            "rsi_trend": 0.1,
-            "momentum3": 0.2,
-            "momentum30": 0.2,
-            "momentum60": 0.2,
-            "ema_long": 0.2,
+            "momentum3": 0.0,
+            "momentum30": 0.0,
         });
         let raw_up = calibrated_direction(
             EventHorizon::ThirtyMinutes,
@@ -1769,102 +2288,67 @@ mod tests {
             None,
         );
         assert_eq!(raw_up.direction, EventDirection::Down);
+        assert_eq!(raw_up.reason, "raw_score_contrarian_fallback_v7");
         assert!(raw_up.flipped);
 
-        let trend_up_features = json!({
-            "momentum10": 0.45,
-            "ema_short": 0.16,
-            "ema_mid": 0.02,
-            "breakout": 0.18,
+        let raw_down = calibrated_direction(
+            EventHorizon::OneHour,
+            -0.42,
+            EventDirection::Down,
+            &neutral_features,
+            None,
+        );
+        assert_eq!(raw_down.direction, EventDirection::Up);
+        assert!(raw_down.flipped);
+
+        let bottom_features = json!({
+            "momentum3": 0.25,
+            "momentum30": -0.35,
         });
-        let trend_up = calibrated_direction(
+        let bottom = calibrated_direction(
             EventHorizon::ThirtyMinutes,
-            0.36,
+            -0.40,
+            EventDirection::Down,
+            &bottom_features,
+            None,
+        );
+        assert_eq!(bottom.direction, EventDirection::Down);
+        assert_eq!(bottom.reason, "bottom_reversal_up_blocked_v8");
+        assert!(!bottom.flipped);
+
+        let top_features = json!({
+            "momentum3": -0.12,
+            "momentum30": 0.22,
+        });
+        let top = calibrated_direction(
+            EventHorizon::ThirtyMinutes,
+            0.40,
             EventDirection::Up,
-            &trend_up_features,
+            &top_features,
             None,
         );
-        assert_eq!(trend_up.direction, EventDirection::Up);
-        assert_eq!(trend_up.reason, "mid_confirmed_raw_up_trend_v4");
-        assert!(!trend_up.flipped);
+        assert_eq!(top.direction, EventDirection::Down);
+        assert_eq!(top.reason, "fast_top_reversal_down_v8");
+        assert!(top.flipped);
 
-        let strong_raw_down = calibrated_direction(
-            EventHorizon::OneHour,
-            -0.72,
-            EventDirection::Down,
-            &neutral_features,
-            None,
-        );
-        assert_eq!(strong_raw_down.direction, EventDirection::Down);
-        assert!(!strong_raw_down.flipped);
-
-        let moderate_raw_down = calibrated_direction(
-            EventHorizon::TenMinutes,
-            -0.32,
-            EventDirection::Down,
-            &neutral_features,
-            None,
-        );
-        assert_eq!(moderate_raw_down.direction, EventDirection::Down);
-        assert!(!moderate_raw_down.flipped);
-
-        let short_rebound_features = json!({
-            "snapshot_change_percent": -1.2,
-            "sentiment": 0.45,
-            "rsi_trend": -0.35,
-        });
-        let short_rebound = calibrated_direction(
-            EventHorizon::TenMinutes,
-            -0.18,
-            EventDirection::Down,
-            &short_rebound_features,
-            None,
-        );
-        assert_eq!(short_rebound.direction, EventDirection::Up);
-        assert!(short_rebound.flipped);
-
-        let mid_rebound_features = json!({
-            "snapshot_change_percent": -2.1,
-            "sentiment": 0.55,
-        });
-        let mid_rebound = calibrated_direction(
-            EventHorizon::ThirtyMinutes,
-            -0.22,
-            EventDirection::Down,
-            &mid_rebound_features,
-            None,
-        );
-        assert_eq!(mid_rebound.direction, EventDirection::Up);
-
-        let long_rebound_features = json!({
-            "snapshot_change_percent": -3.1,
-        });
-        let long_rebound = calibrated_direction(
-            EventHorizon::OneHour,
-            -0.22,
-            EventDirection::Down,
-            &long_rebound_features,
-            None,
-        );
-        assert_eq!(long_rebound.direction, EventDirection::Up);
-
-        let rolling_bias = DirectionRegimeBias {
-            direction: EventDirection::Up,
-            reason: "rolling_up_regime_v4",
-            sample_size: 80,
-            up_rate: 0.66,
-            score_strength: 0.32,
+        let commitment_bias = DirectionRegimeBias {
+            direction: EventDirection::Down,
+            reason: "rolling_down_commitment_v9",
+            sample_size: 8,
+            up_rate: 0.625,
+            long_sample_size: None,
+            long_up_rate: None,
+            score_strength: 0.25,
         };
-        let rolling_rebound = calibrated_direction(
+        let committed = calibrated_direction(
             EventHorizon::OneHour,
-            -0.22,
-            EventDirection::Down,
+            -0.10,
+            EventDirection::Up,
             &neutral_features,
-            Some(&rolling_bias),
+            Some(&commitment_bias),
         );
-        assert_eq!(rolling_rebound.direction, EventDirection::Up);
-        assert_eq!(rolling_rebound.reason, "rolling_up_regime_v4");
-        assert!(rolling_rebound.flipped);
+        assert_eq!(committed.direction, EventDirection::Down);
+        assert_eq!(committed.reason, "rolling_down_commitment_v9");
 
         let mut features = json!({"momentum10": 0.25});
         add_direction_training_fields(
@@ -1880,18 +2364,30 @@ mod tests {
         assert_eq!(features["final_direction"], "down");
         assert_eq!(features["direction_flipped"], true);
         assert!(features["factor_score"].as_f64().is_some());
+    }
 
-        let mut rolling_features = json!({});
-        add_direction_training_fields(
-            &mut rolling_features,
-            EventHorizon::OneHour,
-            -0.22,
-            EventDirection::Down,
-            &rolling_rebound,
-            0.32,
-        );
-        assert_eq!(rolling_features["regime_sample_size"], 80);
-        assert_eq!(rolling_features["regime_up_rate"], 0.66);
+    #[test]
+    fn direction_dataset_v10_2_keeps_full_volume() {
+        let strong_up = extreme_commitment_decision(&json!({
+            "regime_sample_size": 20,
+            "regime_up_rate": 0.80,
+        }));
+        assert!(strong_up.should_trade());
+        assert_eq!(strong_up.action.as_str(), "trade");
+
+        let strong_down = extreme_commitment_decision(&json!({
+            "regime_sample_size": 20,
+            "regime_up_rate": 0.20,
+        }));
+        assert!(strong_down.should_trade());
+
+        let middle = extreme_commitment_decision(&json!({
+            "regime_sample_size": 20,
+            "regime_up_rate": 0.55,
+        }));
+        assert!(middle.should_trade());
+        assert_eq!(middle.action.as_str(), "trade");
+        assert!(middle.reason.contains("balanced"));
     }
 
     #[test]
@@ -1943,6 +2439,65 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    fn sample_snapshot() -> MarketSnapshot {
+        MarketSnapshot {
+            symbol: "BTCUSDT".into(),
+            price: 103.0,
+            mark_price: 103.0,
+            long_short_ratio: 1.12,
+            funding_rate: 0.0001,
+            change_percent: 2.0,
+            ..Default::default()
+        }
+    }
+
+    fn cycle_prediction(
+        horizon: EventHorizon,
+        candles: &[Candle],
+        snapshot: &MarketSnapshot,
+        open_time: i64,
+        plan: &CyclePlan,
+    ) -> NewEventPrediction {
+        let symbol = if horizon == EventHorizon::ThirtyMinutes {
+            "ETHUSDT"
+        } else {
+            "BTCUSDT"
+        };
+        let mut prediction =
+            make_prediction(symbol, horizon, candles, snapshot, open_time, None).unwrap();
+        prediction.stake_amount = plan.stake_amount;
+        prediction.cycle_id = plan.cycle_id.clone();
+        prediction.cycle_number = plan.cycle_number;
+        prediction.cycle_order = plan.cycle_order;
+        add_cycle_fields(&mut prediction.features, plan);
+        prediction
+    }
+
+    fn settle_prediction(
+        log: &EventPredictionLog,
+        prediction: &NewEventPrediction,
+        should_win: bool,
+    ) {
+        let wins_with_higher_price = prediction.direction == EventDirection::Up;
+        let higher_price = if should_win {
+            wins_with_higher_price
+        } else {
+            !wins_with_higher_price
+        };
+        let price = if higher_price {
+            prediction.entry_price * 1.01
+        } else {
+            prediction.entry_price * 0.99
+        };
+        let mut prices = BTreeMap::new();
+        prices.insert(prediction.symbol.clone(), price);
+        assert_eq!(
+            log.settle_due_with_prices(prediction.close_time + 1, &prices)
+                .unwrap(),
+            1
+        );
     }
 
     fn assert_close(actual: f64, expected: f64) {
