@@ -270,3 +270,10 @@ Append one compact entry after each event prediction review. Keep raw ticket dat
 - Visibility: cycle numbers in the dashboard cards, full order lists, and ticket detail dialog are clickable. The cycle dialog queries SQLite by the full cycle ID and displays every order in cycle order, including stake, result, settlement return, and cumulative cycle PnL.
 - Reliability: schema version 2 adds a `(cycle_id, cycle_order)` index so cycle lookup remains fast as history grows. Legacy rows remain labelled as old gameplay and do not expose a cycle link.
 - Verification: all 41 Rust tests pass, including a database test proving that settled and open tickets from the complete selected cycle are returned in order without mixing tickets from another cycle, plus a version-1-to-2 migration test that confirms ticket rows are not rewritten.
+
+## 2026-08-12 Five-Parallel-Slot Rule Correction
+
+- User clarification: “five tickets” means five independent slots opened together, each starting at 5 USDT, so a new cycle starts with 25 USDT total exposure rather than one 5-USDT serial chain.
+- Lifecycle: each winning or tied slot advances to its next round independently; a losing slot stops; winning slots have no five-round cap; only when all five slots have lost does the symbol/horizon start a new numbered cycle with five fresh 5-USDT slots.
+- Compatibility boundary: preserve all `event_reinvest_cycle_v1` tickets as historical data and let any open v1 ticket settle naturally before `event_reinvest_batch5_v2` starts for the same symbol/horizon. Store the new slot number separately so cycle history can be read as round then slot.
+- Verification: all 43 Rust tests pass. A migration of the 75,529-row live-database backup changed schema v2 to v3 with no ticket loss or row rewrite, `quick_check=ok`, and zero duplicate slot orders/open slots. The release client started as `0.4.0-event-batch5-v2`; once the two 10m legacy tickets settled, BTC and ETH each opened exactly five 5-USDT slot-1 tickets with no duplicates, while the still-open legacy 30m/60m tickets continued blocking those horizons as designed.

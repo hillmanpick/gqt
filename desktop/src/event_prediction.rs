@@ -20,9 +20,9 @@ pub const EVENT_STAKE_USDT: f64 = 5.0;
 pub const EVENT_TEN_MINUTE_PROFIT_RATE: f64 = 0.80;
 pub const EVENT_DEFAULT_PROFIT_RATE: f64 = 0.85;
 pub const EVENT_SUPPORTED_SYMBOLS: [&str; 2] = ["BTCUSDT", "ETHUSDT"];
-pub const EVENT_STRATEGY_NAME: &str = "event_reinvest_cycle_v1";
-pub const EVENT_CYCLE_MAX_ORDERS: i64 = 5;
-const EVENT_SCHEMA_VERSION: i64 = 2;
+pub const EVENT_STRATEGY_NAME: &str = "event_reinvest_batch5_v2";
+pub const EVENT_CYCLE_SLOTS: i64 = 5;
+const EVENT_SCHEMA_VERSION: i64 = 3;
 const EVENT_EXPERT_HISTORY_LIMIT: i64 = 400;
 const EVENT_EXPERT_MIN_SAMPLES: usize = 8;
 const EVENT_UP_COMMITMENT_RATE: f64 = 0.65;
@@ -159,6 +159,7 @@ impl EventStrategyDecision {
         }
     }
 
+    #[cfg(test)]
     fn should_trade(&self) -> bool {
         self.action == EventSignalAction::Trade
     }
@@ -184,6 +185,7 @@ pub struct EventPredictionTicket {
     pub cycle_id: String,
     pub cycle_number: i64,
     pub cycle_order: i64,
+    pub cycle_slot: Option<i64>,
     pub cycle_balance_after: Option<f64>,
     pub review: String,
 }
@@ -248,6 +250,7 @@ struct NewEventPrediction {
     cycle_id: String,
     cycle_number: i64,
     cycle_order: i64,
+    cycle_slot: i64,
     features: Value,
 }
 
@@ -256,6 +259,7 @@ struct CyclePlan {
     cycle_id: String,
     cycle_number: i64,
     cycle_order: i64,
+    cycle_slot: i64,
     stake_amount: f64,
 }
 
@@ -273,6 +277,7 @@ struct DueTicket {
     cycle_id: String,
     cycle_number: i64,
     cycle_order: i64,
+    cycle_slot: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -303,6 +308,28 @@ struct EventBankroll {
     open_exposure: f64,
     equity: f64,
     available_balance: f64,
+}
+
+fn event_cycle_id(symbol: &str, horizon: EventHorizon, cycle_number: i64) -> String {
+    format!(
+        "{}-{}m-C{:06}",
+        symbol.to_ascii_uppercase(),
+        horizon.minutes(),
+        cycle_number
+    )
+}
+
+fn initial_cycle_plans(symbol: &str, horizon: EventHorizon, cycle_number: i64) -> Vec<CyclePlan> {
+    let cycle_id = event_cycle_id(symbol, horizon, cycle_number);
+    (1..=EVENT_CYCLE_SLOTS)
+        .map(|cycle_slot| CyclePlan {
+            cycle_id: cycle_id.clone(),
+            cycle_number,
+            cycle_order: 1,
+            cycle_slot,
+            stake_amount: EVENT_STAKE_USDT,
+        })
+        .collect()
 }
 
 pub struct EventPredictionLog {
@@ -345,10 +372,9 @@ impl EventPredictionLog {
                 cycle_id TEXT,
                 cycle_number INTEGER,
                 cycle_order INTEGER,
+                cycle_slot INTEGER,
                 cycle_balance_after REAL
              );
-             CREATE UNIQUE INDEX IF NOT EXISTS unique_event_prediction_round
-             ON event_prediction_tickets(symbol, horizon_minutes, open_time);
              CREATE INDEX IF NOT EXISTS event_prediction_status_close
              ON event_prediction_tickets(status, close_time);
              CREATE INDEX IF NOT EXISTS event_prediction_symbol_horizon
@@ -428,9 +454,9 @@ impl EventPredictionLog {
             "INSERT OR IGNORE INTO event_prediction_tickets
              (id, created_at, symbol, horizon_minutes, open_time, close_time, direction,
               confidence, score, stake_amount, entry_price, status, features_json,
-              cycle_id, cycle_number, cycle_order)
+              cycle_id, cycle_number, cycle_order, cycle_slot)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open', ?12,
-                     ?13, ?14, ?15)",
+                     ?13, ?14, ?15, ?16)",
             params![
                 prediction.id,
                 now,
@@ -447,6 +473,7 @@ impl EventPredictionLog {
                 prediction.cycle_id,
                 prediction.cycle_number,
                 prediction.cycle_order,
+                prediction.cycle_slot,
             ],
         )?;
         Ok(changed == 1)
@@ -491,81 +518,121 @@ impl EventPredictionLog {
         Ok(changed == 1)
     }
 
-    fn cycle_plan(&self, symbol: &str, horizon: EventHorizon) -> Result<Option<CyclePlan>> {
-        let open_count = self.connection.query_row(
+    fn cycle_plans(&self, symbol: &str, horizon: EventHorizon) -> Result<Vec<CyclePlan>> {
+        let legacy_open_count = self.connection.query_row(
             "SELECT COUNT(*)
                FROM event_prediction_tickets
               WHERE status = 'open'
                 AND symbol = ?1
-                AND horizon_minutes = ?2",
+                AND horizon_minutes = ?2
+                AND cycle_slot IS NULL",
             params![symbol, horizon.minutes()],
             |row| row.get::<_, i64>(0),
         )?;
-        if open_count > 0 {
-            return Ok(None);
+        if legacy_open_count > 0 {
+            return Ok(Vec::new());
         }
 
-        let last = self.connection.query_row(
-            "SELECT cycle_number, cycle_order, COALESCE(result, ''), stake_amount,
+        let active_cycle_number = self.connection.query_row(
+            "SELECT COALESCE(MAX(cycle_number), 0)
+               FROM event_prediction_tickets
+              WHERE symbol = ?1
+                AND horizon_minutes = ?2
+                AND cycle_slot IS NOT NULL",
+            params![symbol, horizon.minutes()],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if active_cycle_number == 0 {
+            let historical_max = self.connection.query_row(
+                "SELECT COALESCE(MAX(cycle_number), 0)
+                   FROM event_prediction_tickets
+                  WHERE symbol = ?1
+                    AND horizon_minutes = ?2",
+                params![symbol, horizon.minutes()],
+                |row| row.get::<_, i64>(0),
+            )?;
+            return Ok(initial_cycle_plans(symbol, horizon, historical_max + 1));
+        }
+        let cycle_number = active_cycle_number;
+
+        let mut statement = self.connection.prepare(
+            "SELECT cycle_slot, cycle_order, status, COALESCE(result, ''), stake_amount,
                     COALESCE(cycle_balance_after, 0.0)
                FROM event_prediction_tickets
               WHERE symbol = ?1
                 AND horizon_minutes = ?2
-                AND cycle_number IS NOT NULL
-              ORDER BY cycle_number DESC, cycle_order DESC, created_at DESC
-              LIMIT 1",
-            params![symbol, horizon.minutes()],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, f64>(3)?,
-                    row.get::<_, f64>(4)?,
-                ))
-            },
-        );
-
-        let (cycle_number, cycle_order, stake_amount) = match last {
-            Ok((last_cycle, last_order, result, last_stake, balance_after)) => {
-                if result == "win" && last_order < EVENT_CYCLE_MAX_ORDERS {
-                    let next_stake = if balance_after > 0.0 {
-                        balance_after
-                    } else {
-                        event_settlement_return("win", horizon.minutes(), last_stake)
-                    };
-                    (last_cycle, last_order + 1, next_stake)
-                } else if result == "tie" && last_order < EVENT_CYCLE_MAX_ORDERS {
-                    (last_cycle, last_order + 1, last_stake)
-                } else {
-                    (last_cycle + 1, 1, EVENT_STAKE_USDT)
-                }
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => (1, 1, EVENT_STAKE_USDT),
-            Err(error) => return Err(error).context("Failed to recover event reinvestment cycle"),
-        };
-        let cycle_id = format!(
-            "{}-{}m-C{:06}",
-            symbol.to_ascii_uppercase(),
-            horizon.minutes(),
-            cycle_number
-        );
-        if !stake_amount.is_finite() || stake_amount <= 0.0 {
-            bail!("invalid event cycle stake: {stake_amount}");
+                AND cycle_number = ?3
+                AND cycle_slot IS NOT NULL
+              ORDER BY cycle_slot ASC, cycle_order DESC, created_at DESC",
+        )?;
+        let mut latest = BTreeMap::new();
+        for row in statement.query_map(params![symbol, horizon.minutes(), cycle_number], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, f64>(4)?,
+                row.get::<_, f64>(5)?,
+            ))
+        })? {
+            let row = row?;
+            latest.entry(row.0).or_insert(row);
         }
-        Ok(Some(CyclePlan {
-            cycle_id,
-            cycle_number,
-            cycle_order,
-            stake_amount,
-        }))
+
+        let all_lost = (1..=EVENT_CYCLE_SLOTS).all(|slot| {
+            latest
+                .get(&slot)
+                .is_some_and(|row| row.2 == "settled" && row.3 == "loss")
+        });
+        if all_lost {
+            return Ok(initial_cycle_plans(symbol, horizon, cycle_number + 1));
+        }
+
+        let cycle_id = event_cycle_id(symbol, horizon, cycle_number);
+        let mut plans = Vec::new();
+        for slot in 1..=EVENT_CYCLE_SLOTS {
+            let Some(last) = latest.get(&slot) else {
+                plans.push(CyclePlan {
+                    cycle_id: cycle_id.clone(),
+                    cycle_number,
+                    cycle_order: 1,
+                    cycle_slot: slot,
+                    stake_amount: EVENT_STAKE_USDT,
+                });
+                continue;
+            };
+            if last.2 == "open" || last.3 == "loss" {
+                continue;
+            }
+            let stake_amount = if last.3 == "win" {
+                if last.5 > 0.0 {
+                    last.5
+                } else {
+                    event_settlement_return("win", horizon.minutes(), last.4)
+                }
+            } else {
+                last.4
+            };
+            if !stake_amount.is_finite() || stake_amount <= 0.0 {
+                bail!("invalid event cycle stake: {stake_amount}");
+            }
+            plans.push(CyclePlan {
+                cycle_id: cycle_id.clone(),
+                cycle_number,
+                cycle_order: last.1 + 1,
+                cycle_slot: slot,
+                stake_amount,
+            });
+        }
+        Ok(plans)
     }
 
     fn due_tickets(&self, now: i64) -> Result<Vec<DueTicket>> {
         let mut statement = self.connection.prepare(
             "SELECT id, symbol, horizon_minutes, close_time, direction, entry_price, stake_amount,
                     confidence, score, COALESCE(cycle_id, ''), COALESCE(cycle_number, 0),
-                    COALESCE(cycle_order, 0)
+                    COALESCE(cycle_order, 0), COALESCE(cycle_slot, 0)
              FROM event_prediction_tickets
              WHERE status = 'open'
                AND close_time <= ?1
@@ -586,6 +653,7 @@ impl EventPredictionLog {
                 cycle_id: row.get(9)?,
                 cycle_number: row.get(10)?,
                 cycle_order: row.get(11)?,
+                cycle_slot: row.get(12)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -643,7 +711,7 @@ impl EventPredictionLog {
                 None
             };
             let review = format!(
-                "{}: {} {}m stake {:.2} USDT, return {:.2} USDT, pnl {:+.2} USDT, cycle {} order {}/{}, entry {:.8}, expiry {:.8}, move {:+.4}%, confidence {:.1}%, score {:+.3}, settled {}s late",
+                "{}: {} {}m stake {:.2} USDT, return {:.2} USDT, pnl {:+.2} USDT, cycle {} slot {} order {}, entry {:.8}, expiry {:.8}, move {:+.4}%, confidence {:.1}%, score {:+.3}, settled {}s late",
                 result,
                 ticket.direction,
                 ticket.horizon_minutes,
@@ -655,8 +723,8 @@ impl EventPredictionLog {
                 } else {
                     &ticket.cycle_id
                 },
+                ticket.cycle_slot,
                 ticket.cycle_order,
-                EVENT_CYCLE_MAX_ORDERS,
                 ticket.entry_price,
                 price,
                 move_percent,
@@ -1000,7 +1068,7 @@ impl EventPredictionLog {
                     confidence, score, stake_amount, entry_price, expiry_price, status,
                     COALESCE(result, ''), move_percent, virtual_pnl,
                     COALESCE(cycle_id, ''), COALESCE(cycle_number, 0),
-                    COALESCE(cycle_order, 0), cycle_balance_after, COALESCE(review, '')
+                    COALESCE(cycle_order, 0), cycle_slot, cycle_balance_after, COALESCE(review, '')
              FROM event_prediction_tickets
              WHERE status = 'open'
                AND symbol IN ('BTCUSDT', 'ETHUSDT')
@@ -1021,7 +1089,7 @@ impl EventPredictionLog {
                     confidence, score, stake_amount, entry_price, expiry_price, status,
                     COALESCE(result, ''), move_percent, virtual_pnl,
                     COALESCE(cycle_id, ''), COALESCE(cycle_number, 0),
-                    COALESCE(cycle_order, 0), cycle_balance_after, COALESCE(review, '')
+                    COALESCE(cycle_order, 0), cycle_slot, cycle_balance_after, COALESCE(review, '')
              FROM event_prediction_tickets
              WHERE status = 'settled'
                AND symbol IN ('BTCUSDT', 'ETHUSDT')
@@ -1045,10 +1113,10 @@ impl EventPredictionLog {
                     confidence, score, stake_amount, entry_price, expiry_price, status,
                     COALESCE(result, ''), move_percent, virtual_pnl,
                     COALESCE(cycle_id, ''), COALESCE(cycle_number, 0),
-                    COALESCE(cycle_order, 0), cycle_balance_after, COALESCE(review, '')
+                    COALESCE(cycle_order, 0), cycle_slot, cycle_balance_after, COALESCE(review, '')
              FROM event_prediction_tickets
              WHERE cycle_id = ?1
-             ORDER BY cycle_order ASC, created_at ASC, open_time ASC",
+             ORDER BY cycle_order ASC, cycle_slot ASC, created_at ASC, open_time ASC",
         )?;
         let rows = statement.query_map([cycle_id], ticket_from_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1076,8 +1144,9 @@ fn ticket_from_row(row: &Row<'_>) -> rusqlite::Result<EventPredictionTicket> {
         cycle_id: row.get(15)?,
         cycle_number: row.get(16)?,
         cycle_order: row.get(17)?,
-        cycle_balance_after: row.get(18)?,
-        review: row.get(19)?,
+        cycle_slot: row.get(18)?,
+        cycle_balance_after: row.get(19)?,
+        review: row.get(20)?,
     })
 }
 
@@ -1222,14 +1291,13 @@ fn migrate_schema(connection: &mut Connection) -> Result<()> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("Failed to start event prediction schema migration")?;
+    let columns = {
+        let mut statement = transaction.prepare("PRAGMA table_info(event_prediction_tickets)")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
     if schema_version < 1 {
-        let columns = {
-            let mut statement =
-                transaction.prepare("PRAGMA table_info(event_prediction_tickets)")?;
-            statement
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
         if !columns.iter().any(|column| column == "stake_amount") {
             transaction.execute(
                 "ALTER TABLE event_prediction_tickets
@@ -1254,18 +1322,32 @@ fn migrate_schema(connection: &mut Connection) -> Result<()> {
         }
         migrate_payout_model(&transaction)?;
     }
+    if !columns.iter().any(|column| column == "cycle_slot") {
+        transaction.execute(
+            "ALTER TABLE event_prediction_tickets ADD COLUMN cycle_slot INTEGER",
+            [],
+        )?;
+    }
     ensure_cycle_indexes_can_be_created(&transaction)?;
     transaction.execute_batch(
-        "CREATE INDEX IF NOT EXISTS event_prediction_cycle
-         ON event_prediction_tickets(symbol, horizon_minutes, cycle_number, cycle_order);
+        "DROP INDEX IF EXISTS unique_event_prediction_round;
+         DROP INDEX IF EXISTS event_prediction_cycle;
+         DROP INDEX IF EXISTS unique_event_prediction_cycle_order;
+         DROP INDEX IF EXISTS unique_event_prediction_open_cycle_chain;
+         DROP INDEX IF EXISTS event_prediction_cycle_id;
+         CREATE UNIQUE INDEX IF NOT EXISTS unique_event_prediction_round_slot
+         ON event_prediction_tickets(symbol, horizon_minutes, open_time, cycle_slot)
+         WHERE cycle_slot IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS event_prediction_cycle
+         ON event_prediction_tickets(symbol, horizon_minutes, cycle_number, cycle_order, cycle_slot);
          CREATE UNIQUE INDEX IF NOT EXISTS unique_event_prediction_cycle_order
-         ON event_prediction_tickets(symbol, horizon_minutes, cycle_number, cycle_order)
-         WHERE cycle_number IS NOT NULL AND cycle_order IS NOT NULL;
-         CREATE UNIQUE INDEX IF NOT EXISTS unique_event_prediction_open_cycle_chain
-         ON event_prediction_tickets(symbol, horizon_minutes)
-         WHERE status = 'open' AND cycle_number IS NOT NULL;
+         ON event_prediction_tickets(symbol, horizon_minutes, cycle_number, cycle_order, cycle_slot)
+         WHERE cycle_number IS NOT NULL AND cycle_order IS NOT NULL AND cycle_slot IS NOT NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS unique_event_prediction_open_cycle_slot
+         ON event_prediction_tickets(symbol, horizon_minutes, cycle_slot)
+         WHERE status = 'open' AND cycle_number IS NOT NULL AND cycle_slot IS NOT NULL;
          CREATE INDEX IF NOT EXISTS event_prediction_cycle_id
-         ON event_prediction_tickets(cycle_id, cycle_order);",
+         ON event_prediction_tickets(cycle_id, cycle_order, cycle_slot);",
     )?;
     transaction.pragma_update(None, "user_version", EVENT_SCHEMA_VERSION)?;
     transaction
@@ -1279,8 +1361,8 @@ fn ensure_cycle_indexes_can_be_created(connection: &Connection) -> Result<()> {
         "SELECT EXISTS(
             SELECT 1
               FROM event_prediction_tickets
-             WHERE cycle_number IS NOT NULL AND cycle_order IS NOT NULL
-             GROUP BY symbol, horizon_minutes, cycle_number, cycle_order
+             WHERE cycle_number IS NOT NULL AND cycle_order IS NOT NULL AND cycle_slot IS NOT NULL
+             GROUP BY symbol, horizon_minutes, cycle_number, cycle_order, cycle_slot
             HAVING COUNT(*) > 1
          )",
         [],
@@ -1293,15 +1375,15 @@ fn ensure_cycle_indexes_can_be_created(connection: &Connection) -> Result<()> {
         "SELECT EXISTS(
             SELECT 1
               FROM event_prediction_tickets
-             WHERE status = 'open' AND cycle_number IS NOT NULL
-             GROUP BY symbol, horizon_minutes
+             WHERE status = 'open' AND cycle_number IS NOT NULL AND cycle_slot IS NOT NULL
+             GROUP BY symbol, horizon_minutes, cycle_slot
             HAVING COUNT(*) > 1
          )",
         [],
         |row| row.get::<_, bool>(0),
     )?;
     if duplicate_open_chain {
-        bail!("multiple open event prediction tickets exist in one cycle chain");
+        bail!("multiple open event prediction tickets exist in one cycle slot");
     }
     Ok(())
 }
@@ -1406,9 +1488,9 @@ fn create_symbol_predictions(
     let snapshot = market::fetch_snapshot(client, symbol)?;
     let mut summary = EventCreationSummary::default();
     for horizon in horizons {
-        let cycle_plan = log.cycle_plan(symbol, *horizon)?;
+        let cycle_plans = log.cycle_plans(symbol, *horizon)?;
         let regime_bias = log.recent_expert_bias(symbol, *horizon, now)?;
-        let mut prediction = make_prediction(
+        let base_prediction = make_prediction(
             symbol,
             *horizon,
             &candles,
@@ -1416,37 +1498,53 @@ fn create_symbol_predictions(
             open_time,
             regime_bias.as_ref(),
         )?;
-        let state_decision = extreme_commitment_decision(&prediction.features);
-        let decision = if let Some(plan) = cycle_plan.as_ref() {
+        let state_decision = extreme_commitment_decision(&base_prediction.features);
+        summary.evaluated += 1;
+        if cycle_plans.is_empty() {
+            let decision = EventStrategyDecision::observe(format!(
+                "batch_waiting_for_settlement_{}",
+                state_decision.reason
+            ));
+            let _ = log.record_signal(&base_prediction, &decision, now)?;
+            summary.directions.push(EventPredictionRunDirection {
+                symbol: base_prediction.symbol.clone(),
+                horizon_minutes: base_prediction.horizon.minutes(),
+                open_time: base_prediction.open_time,
+                close_time: base_prediction.close_time,
+                direction: base_prediction.direction.as_str().into(),
+                confidence: base_prediction.confidence,
+                created: false,
+            });
+            continue;
+        }
+        let signal_decision =
+            EventStrategyDecision::trade(format!("{}_batch5_available", state_decision.reason));
+        let _ = log.record_signal(&base_prediction, &signal_decision, now)?;
+        let mut any_created = false;
+        for plan in cycle_plans {
+            let mut prediction = base_prediction.clone();
+            prediction.id = format!(
+                "{}-S{}-O{}",
+                prediction.id, plan.cycle_slot, plan.cycle_order
+            );
             prediction.stake_amount = plan.stake_amount;
             prediction.cycle_id = plan.cycle_id.clone();
             prediction.cycle_number = plan.cycle_number;
             prediction.cycle_order = plan.cycle_order;
-            add_cycle_fields(&mut prediction.features, plan);
-            EventStrategyDecision::trade(format!(
-                "{}_cycle_{}_order_{}",
-                state_decision.reason, plan.cycle_number, plan.cycle_order
-            ))
-        } else {
-            EventStrategyDecision::observe(format!(
-                "chain_waiting_for_settlement_{}",
-                state_decision.reason
-            ))
-        };
-        summary.evaluated += 1;
-        let _ = log.record_signal(&prediction, &decision, now)?;
-        let created = decision.should_trade() && log.record_prediction(&prediction, now)?;
-        if created {
-            summary.created += 1;
+            prediction.cycle_slot = plan.cycle_slot;
+            add_cycle_fields(&mut prediction.features, &plan);
+            let created = log.record_prediction(&prediction, now)?;
+            summary.created += usize::from(created);
+            any_created |= created;
         }
         summary.directions.push(EventPredictionRunDirection {
-            symbol: prediction.symbol.clone(),
-            horizon_minutes: prediction.horizon.minutes(),
-            open_time: prediction.open_time,
-            close_time: prediction.close_time,
-            direction: prediction.direction.as_str().into(),
-            confidence: prediction.confidence,
-            created,
+            symbol: base_prediction.symbol.clone(),
+            horizon_minutes: base_prediction.horizon.minutes(),
+            open_time: base_prediction.open_time,
+            close_time: base_prediction.close_time,
+            direction: base_prediction.direction.as_str().into(),
+            confidence: base_prediction.confidence,
+            created: any_created,
         });
     }
     Ok(summary)
@@ -1477,7 +1575,8 @@ fn add_cycle_fields(features: &mut Value, plan: &CyclePlan) {
         object.insert("cycle_id".into(), json!(plan.cycle_id));
         object.insert("cycle_number".into(), json!(plan.cycle_number));
         object.insert("cycle_order".into(), json!(plan.cycle_order));
-        object.insert("cycle_max_orders".into(), json!(EVENT_CYCLE_MAX_ORDERS));
+        object.insert("cycle_slot".into(), json!(plan.cycle_slot));
+        object.insert("cycle_slots".into(), json!(EVENT_CYCLE_SLOTS));
         object.insert("cycle_stake_amount".into(), json!(plan.stake_amount));
     }
 }
@@ -1539,6 +1638,7 @@ fn make_prediction(
         cycle_id: String::new(),
         cycle_number: 0,
         cycle_order: 0,
+        cycle_slot: 0,
         features,
     })
 }
@@ -2028,83 +2128,100 @@ mod tests {
     }
 
     #[test]
-    fn reinvestment_cycle_compounds_win_and_resets_after_loss() {
+    fn batch5_first_cycle_opens_five_slots_at_five_usdt() {
         let root = std::env::temp_dir().join(format!("gqt-event-cycle-{}", rand::random::<u64>()));
         fs::create_dir_all(&root).unwrap();
         let log = EventPredictionLog::open(&root.join("events.sqlite")).unwrap();
         let candles = sample_candles();
         let snapshot = sample_snapshot();
         let horizon = EventHorizon::TenMinutes;
-        let mut open_time = 1_700_100_000;
-
-        let first = log.cycle_plan("BTCUSDT", horizon).unwrap().unwrap();
-        assert_eq!(first.cycle_number, 1);
-        assert_eq!(first.cycle_order, 1);
-        assert_close(first.stake_amount, 5.0);
-        let first_prediction = cycle_prediction(horizon, &candles, &snapshot, open_time, &first);
-        assert!(log.record_prediction(&first_prediction, open_time).unwrap());
-        assert!(log.cycle_plan("BTCUSDT", horizon).unwrap().is_none());
-        settle_prediction(&log, &first_prediction, true);
-
-        open_time += horizon.seconds() + 60;
-        let second = log.cycle_plan("BTCUSDT", horizon).unwrap().unwrap();
-        assert_eq!(second.cycle_number, 1);
-        assert_eq!(second.cycle_order, 2);
-        assert_close(second.stake_amount, 9.0);
-        let second_prediction = cycle_prediction(horizon, &candles, &snapshot, open_time, &second);
-        assert!(
-            log.record_prediction(&second_prediction, open_time)
-                .unwrap()
-        );
-        settle_prediction(&log, &second_prediction, false);
-
-        let reset = log.cycle_plan("BTCUSDT", horizon).unwrap().unwrap();
-        assert_eq!(reset.cycle_number, 2);
-        assert_eq!(reset.cycle_order, 1);
-        assert_close(reset.stake_amount, 5.0);
-
-        let settled = log.settled_recent(10).unwrap();
-        let second_ticket = settled
-            .iter()
-            .find(|ticket| ticket.cycle_order == 2)
-            .unwrap();
-        assert_eq!(second_ticket.result, "loss");
-        assert_close(second_ticket.cycle_balance_after.unwrap(), 0.0);
-        let first_ticket = settled
-            .iter()
-            .find(|ticket| ticket.cycle_order == 1)
-            .unwrap();
-        assert_close(first_ticket.cycle_balance_after.unwrap(), 9.0);
+        let plans = log.cycle_plans("BTCUSDT", horizon).unwrap();
+        assert_eq!(plans.len(), 5);
+        for (index, plan) in plans.iter().enumerate() {
+            assert_eq!(plan.cycle_number, 1);
+            assert_eq!(plan.cycle_order, 1);
+            assert_eq!(plan.cycle_slot, index as i64 + 1);
+            assert_close(plan.stake_amount, 5.0);
+            let prediction = cycle_prediction(horizon, &candles, &snapshot, 1_700_100_000, plan);
+            assert!(
+                log.record_prediction(&prediction, prediction.open_time)
+                    .unwrap()
+            );
+        }
+        assert_eq!(log.open_count().unwrap(), 5);
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn reinvestment_cycle_stops_after_five_orders() {
+    fn batch5_slots_advance_or_stop_independently_and_have_no_order_limit() {
         let root = std::env::temp_dir().join(format!("gqt-event-cycle-{}", rand::random::<u64>()));
         fs::create_dir_all(&root).unwrap();
         let log = EventPredictionLog::open(&root.join("events.sqlite")).unwrap();
         let candles = sample_candles();
         let snapshot = sample_snapshot();
         let horizon = EventHorizon::ThirtyMinutes;
-        let mut open_time = 1_700_200_000;
-        let mut expected_stake = 5.0;
-
-        for order in 1..=EVENT_CYCLE_MAX_ORDERS {
-            let plan = log.cycle_plan("ETHUSDT", horizon).unwrap().unwrap();
-            assert_eq!(plan.cycle_number, 1);
-            assert_eq!(plan.cycle_order, order);
-            assert_close(plan.stake_amount, expected_stake);
-            let prediction = cycle_prediction(horizon, &candles, &snapshot, open_time, &plan);
-            assert!(log.record_prediction(&prediction, open_time).unwrap());
-            settle_prediction(&log, &prediction, true);
-            expected_stake = event_settlement_return("win", horizon.minutes(), expected_stake);
-            open_time += horizon.seconds() + 60;
+        let mut plans = log.cycle_plans("ETHUSDT", horizon).unwrap();
+        for plan in &plans {
+            let prediction = cycle_prediction(horizon, &candles, &snapshot, 1_700_200_000, plan);
+            assert!(
+                log.record_prediction(&prediction, prediction.open_time)
+                    .unwrap()
+            );
         }
+        settle_slot(&log, 1, "win", 9.25);
+        settle_slot(&log, 2, "tie", 5.0);
+        settle_slot(&log, 3, "loss", 0.0);
+        plans = log.cycle_plans("ETHUSDT", horizon).unwrap();
+        assert_eq!(
+            plans.iter().map(|p| p.cycle_slot).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_close(plans[0].stake_amount, 9.25);
+        assert_close(plans[1].stake_amount, 5.0);
+        for order in 2..=7 {
+            let plan = log
+                .cycle_plans("ETHUSDT", horizon)
+                .unwrap()
+                .into_iter()
+                .find(|p| p.cycle_slot == 1)
+                .unwrap();
+            assert_eq!(plan.cycle_order, order);
+            let prediction =
+                cycle_prediction(horizon, &candles, &snapshot, 1_700_200_000 + order, &plan);
+            assert!(
+                log.record_prediction(&prediction, prediction.open_time)
+                    .unwrap()
+            );
+            settle_slot(&log, 1, "tie", plan.stake_amount);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
 
-        let next = log.cycle_plan("ETHUSDT", horizon).unwrap().unwrap();
-        assert_eq!(next.cycle_number, 2);
-        assert_eq!(next.cycle_order, 1);
-        assert_close(next.stake_amount, 5.0);
+    #[test]
+    fn batch5_starts_next_cycle_only_after_all_five_slots_lose() {
+        let root =
+            std::env::temp_dir().join(format!("gqt-event-all-loss-{}", rand::random::<u64>()));
+        fs::create_dir_all(&root).unwrap();
+        let log = EventPredictionLog::open(&root.join("events.sqlite")).unwrap();
+        let candles = sample_candles();
+        let snapshot = sample_snapshot();
+        let horizon = EventHorizon::TenMinutes;
+        for plan in log.cycle_plans("BTCUSDT", horizon).unwrap() {
+            let prediction = cycle_prediction(horizon, &candles, &snapshot, 1_700_250_000, &plan);
+            assert!(
+                log.record_prediction(&prediction, prediction.open_time)
+                    .unwrap()
+            );
+        }
+        for slot in 1..EVENT_CYCLE_SLOTS {
+            settle_slot(&log, slot, "loss", 0.0);
+        }
+        assert!(log.cycle_plans("BTCUSDT", horizon).unwrap().is_empty());
+        settle_slot(&log, EVENT_CYCLE_SLOTS, "loss", 0.0);
+        let next = log.cycle_plans("BTCUSDT", horizon).unwrap();
+        assert_eq!(next.len(), 5);
+        assert!(next.iter().all(|plan| plan.cycle_number == 2));
+        assert!(next.iter().all(|plan| plan.cycle_order == 1));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2125,32 +2242,31 @@ mod tests {
             .unwrap();
 
         assert!(
-            log.cycle_plan("BTCUSDT", EventHorizon::TenMinutes)
+            log.cycle_plans("BTCUSDT", EventHorizon::TenMinutes)
                 .unwrap()
-                .is_none()
+                .is_empty()
         );
         let mut prices = BTreeMap::new();
         prices.insert("BTCUSDT".into(), 101.0);
         assert_eq!(log.settle_due_with_prices(661, &prices).unwrap(), 1);
-        let first = log
-            .cycle_plan("BTCUSDT", EventHorizon::TenMinutes)
-            .unwrap()
-            .unwrap();
-        assert_eq!(first.cycle_number, 1);
-        assert_eq!(first.cycle_order, 1);
-        assert_close(first.stake_amount, 5.0);
+        assert_eq!(
+            log.cycle_plans("BTCUSDT", EventHorizon::TenMinutes)
+                .unwrap()
+                .len(),
+            5
+        );
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn database_prevents_two_open_tickets_in_one_cycle_chain() {
+    fn database_prevents_two_open_tickets_in_one_cycle_slot() {
         let root = std::env::temp_dir().join(format!("gqt-event-lock-{}", rand::random::<u64>()));
         fs::create_dir_all(&root).unwrap();
         let log = EventPredictionLog::open(&root.join("events.sqlite")).unwrap();
         let candles = sample_candles();
         let snapshot = sample_snapshot();
         let horizon = EventHorizon::OneHour;
-        let plan = log.cycle_plan("BTCUSDT", horizon).unwrap().unwrap();
+        let plan = log.cycle_plans("BTCUSDT", horizon).unwrap().remove(0);
         let first = cycle_prediction(horizon, &candles, &snapshot, 1_700_300_000, &plan);
         let second = cycle_prediction(horizon, &candles, &snapshot, 1_700_300_060, &plan);
 
@@ -2166,12 +2282,13 @@ mod tests {
             std::env::temp_dir().join(format!("gqt-event-cycle-view-{}", rand::random::<u64>()));
         fs::create_dir_all(&root).unwrap();
         let log = EventPredictionLog::open(&root.join("events.sqlite")).unwrap();
-        for (id, cycle_id, cycle_number, cycle_order, open_time, status, result) in [
-            ("cycle-2", "BTCUSDT-10m-C000001", 1, 2, 200, "open", None),
+        for (id, cycle_id, cycle_number, cycle_order, cycle_slot, open_time, status, result) in [
+            ("cycle-2", "BTCUSDT-10m-C000001", 1, 2, 2, 200, "open", None),
             (
                 "other-cycle",
                 "BTCUSDT-10m-C000002",
                 2,
+                1,
                 1,
                 300,
                 "settled",
@@ -2182,9 +2299,20 @@ mod tests {
                 "BTCUSDT-10m-C000001",
                 1,
                 1,
+                2,
                 100,
                 "settled",
                 Some("win"),
+            ),
+            (
+                "cycle-1-slot-1",
+                "BTCUSDT-10m-C000001",
+                1,
+                1,
+                1,
+                101,
+                "settled",
+                Some("tie"),
             ),
         ] {
             log.connection
@@ -2192,15 +2320,17 @@ mod tests {
                     "INSERT INTO event_prediction_tickets
                      (id, created_at, symbol, horizon_minutes, open_time, close_time, direction,
                       confidence, score, stake_amount, entry_price, status, result, virtual_pnl,
-                      features_json, cycle_id, cycle_number, cycle_order, cycle_balance_after)
+                      features_json, cycle_id, cycle_number, cycle_order, cycle_slot,
+                      cycle_balance_after)
                      VALUES (?1, ?2, 'BTCUSDT', 10, ?2, ?2 + 600, 'up', 0.6, 0.2,
-                             5.0, 100.0, ?6, ?7, 4.0, '{}', ?3, ?4, ?5, 9.0)",
+                             5.0, 100.0, ?7, ?8, 4.0, '{}', ?3, ?4, ?5, ?6, 9.0)",
                     params![
                         id,
                         open_time,
                         cycle_id,
                         cycle_number,
                         cycle_order,
+                        cycle_slot,
                         status,
                         result
                     ],
@@ -2209,13 +2339,17 @@ mod tests {
         }
 
         let tickets = log.cycle_tickets("BTCUSDT-10m-C000001").unwrap();
-        assert_eq!(tickets.len(), 2);
-        assert_eq!(tickets[0].id, "cycle-1");
+        assert_eq!(tickets.len(), 3);
+        assert_eq!(tickets[0].id, "cycle-1-slot-1");
         assert_eq!(tickets[0].cycle_order, 1);
+        assert_eq!(tickets[0].cycle_slot, Some(1));
         assert_eq!(tickets[0].status, "settled");
-        assert_eq!(tickets[1].id, "cycle-2");
-        assert_eq!(tickets[1].cycle_order, 2);
-        assert_eq!(tickets[1].status, "open");
+        assert_eq!(tickets[1].id, "cycle-1");
+        assert_eq!(tickets[1].cycle_slot, Some(2));
+        assert_eq!(tickets[2].id, "cycle-2");
+        assert_eq!(tickets[2].cycle_order, 2);
+        assert_eq!(tickets[2].cycle_slot, Some(2));
+        assert_eq!(tickets[2].status, "open");
         assert!(log.cycle_tickets("   ").is_err());
         let _ = fs::remove_dir_all(root);
     }
@@ -2291,9 +2425,9 @@ mod tests {
         let log = EventPredictionLog::open(&path).unwrap();
         assert_eq!(log.legacy_open_count().unwrap(), 1);
         assert!(
-            log.cycle_plan("BTCUSDT", EventHorizon::TenMinutes)
+            log.cycle_plans("BTCUSDT", EventHorizon::TenMinutes)
                 .unwrap()
-                .is_none()
+                .is_empty()
         );
         assert_eq!(
             log.connection
@@ -2355,7 +2489,7 @@ mod tests {
         assert!(
             indexes
                 .iter()
-                .any(|name| name == "unique_event_prediction_open_cycle_chain")
+                .any(|name| name == "unique_event_prediction_open_cycle_slot")
         );
         assert!(
             indexes
@@ -2430,6 +2564,73 @@ mod tests {
             .unwrap();
         assert!(has_lookup_index);
         drop(log);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn schema_v2_to_v3_keeps_history_null_and_new_batch_follows_historical_cycle() {
+        let root =
+            std::env::temp_dir().join(format!("gqt-event-migration-v2-{}", rand::random::<u64>()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("events.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE event_prediction_tickets (
+                id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, symbol TEXT NOT NULL,
+                horizon_minutes INTEGER NOT NULL, open_time INTEGER NOT NULL,
+                close_time INTEGER NOT NULL, direction TEXT NOT NULL, confidence REAL NOT NULL,
+                score REAL NOT NULL, stake_amount REAL NOT NULL DEFAULT 5.0,
+                entry_price REAL NOT NULL, expiry_price REAL, status TEXT NOT NULL, result TEXT,
+                move_percent REAL, virtual_pnl REAL, features_json TEXT NOT NULL, review TEXT,
+                settled_at INTEGER, cycle_id TEXT, cycle_number INTEGER, cycle_order INTEGER,
+                cycle_balance_after REAL
+             );
+             CREATE TABLE event_prediction_signals (
+                id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, symbol TEXT NOT NULL,
+                horizon_minutes INTEGER NOT NULL, open_time INTEGER NOT NULL,
+                close_time INTEGER NOT NULL, direction TEXT NOT NULL, confidence REAL NOT NULL,
+                score REAL NOT NULL, stake_amount REAL NOT NULL DEFAULT 5.0,
+                entry_price REAL NOT NULL, action TEXT NOT NULL, strategy TEXT NOT NULL,
+                skip_reason TEXT, status TEXT NOT NULL, result TEXT, expiry_price REAL,
+                move_percent REAL, virtual_pnl REAL, features_json TEXT NOT NULL, review TEXT,
+                settled_at INTEGER
+             );
+             INSERT INTO event_prediction_tickets
+             (id, created_at, symbol, horizon_minutes, open_time, close_time, direction,
+              confidence, score, stake_amount, entry_price, status, result, features_json,
+              cycle_id, cycle_number, cycle_order, cycle_balance_after)
+             VALUES ('v1-history', 1, 'BTCUSDT', 10, 60, 660, 'up', 0.5, 0.1, 5.0,
+                     100.0, 'settled', 'loss', '{}', 'BTCUSDT-10m-C000007', 7, 1, 0.0);
+             CREATE TABLE migration_v2_update_counter (updates INTEGER NOT NULL);
+             INSERT INTO migration_v2_update_counter VALUES (0);
+             CREATE TRIGGER count_v2_ticket_updates AFTER UPDATE ON event_prediction_tickets
+             BEGIN UPDATE migration_v2_update_counter SET updates = updates + 1; END;
+             PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let log = EventPredictionLog::open(&path).unwrap();
+        assert_eq!(
+            log.connection
+                .query_row(
+                    "SELECT updates FROM migration_v2_update_counter",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert!(log.connection.query_row(
+            "SELECT cycle_slot IS NULL FROM event_prediction_tickets WHERE id = 'v1-history'",
+            [], |row| row.get::<_, bool>(0)
+        ).unwrap());
+        let plans = log
+            .cycle_plans("BTCUSDT", EventHorizon::TenMinutes)
+            .unwrap();
+        assert_eq!(plans.len(), 5);
+        assert!(plans.iter().all(|plan| plan.cycle_number == 8));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2630,30 +2831,35 @@ mod tests {
         prediction.cycle_id = plan.cycle_id.clone();
         prediction.cycle_number = plan.cycle_number;
         prediction.cycle_order = plan.cycle_order;
+        prediction.cycle_slot = plan.cycle_slot;
+        prediction.id = format!(
+            "{}-S{}-O{}",
+            prediction.id, plan.cycle_slot, plan.cycle_order
+        );
         add_cycle_fields(&mut prediction.features, plan);
         prediction
     }
 
-    fn settle_prediction(
-        log: &EventPredictionLog,
-        prediction: &NewEventPrediction,
-        should_win: bool,
-    ) {
-        let wins_with_higher_price = prediction.direction == EventDirection::Up;
-        let higher_price = if should_win {
-            wins_with_higher_price
-        } else {
-            !wins_with_higher_price
-        };
-        let price = if higher_price {
-            prediction.entry_price * 1.01
-        } else {
-            prediction.entry_price * 0.99
-        };
-        let mut prices = BTreeMap::new();
-        prices.insert(prediction.symbol.clone(), price);
+    fn settle_slot(log: &EventPredictionLog, cycle_slot: i64, result: &str, balance_after: f64) {
+        let stake = log
+            .connection
+            .query_row(
+                "SELECT stake_amount FROM event_prediction_tickets
+              WHERE status = 'open' AND cycle_slot = ?1",
+                [cycle_slot],
+                |row| row.get::<_, f64>(0),
+            )
+            .unwrap();
+        let pnl = balance_after - stake;
         assert_eq!(
-            log.settle_due_with_prices(prediction.close_time + 1, &prices)
+            log.connection
+                .execute(
+                    "UPDATE event_prediction_tickets
+                SET status = 'settled', result = ?1, virtual_pnl = ?2,
+                    cycle_balance_after = ?3, settled_at = close_time
+              WHERE status = 'open' AND cycle_slot = ?4",
+                    params![result, pnl, balance_after, cycle_slot],
+                )
                 .unwrap(),
             1
         );

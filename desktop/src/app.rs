@@ -34,7 +34,7 @@ use crate::{
 };
 
 const AI_TIMEFRAMES: [&str; 6] = ["1m", "5m", "15m", "1h", "4h", "1d"];
-const BUILD_LABEL: &str = "0.4.0-event-cycle-v1.1";
+const BUILD_LABEL: &str = "0.4.0-event-batch5-v2";
 const RELAY_DEFAULT_MODEL: &str = "gpt-5.6-luna";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1571,7 +1571,7 @@ impl GqtApp {
                 ui.label(
                     RichText::new(
                         format!(
-                            "仅 BTC/ETH；10m / 30m / 1h 各自串行运行；每周期最多 5 单，赢后本金和利润全部复投，输后以 5U 开启新周期；当前策略 {}",
+                            "仅 BTC/ETH；10m / 30m / 1h 各自运行；每周期 5 条线，单线起始 5U、周期初始投入 25U；按轮次复投；当前策略 {}",
                             event_prediction::EVENT_STRATEGY_NAME
                         ),
                     )
@@ -1625,16 +1625,22 @@ impl GqtApp {
         ui.columns(4, |cols| {
             metric(
                 &mut cols[0],
-                "虚拟本金",
-                &format_event_money(self.event_prediction_starting_bankroll),
-                "事件预测虚拟资金无限",
+                "周期初始投入",
+                &format!(
+                    "{:.2} USDT",
+                    self.event_prediction_stake_amount * event_prediction::EVENT_CYCLE_SLOTS as f64
+                ),
+                &format!(
+                    "5 条线 × 单线 5U；虚拟本金 {}",
+                    format_event_money(self.event_prediction_starting_bankroll)
+                ),
                 theme::YELLOW,
             );
             metric(
                 &mut cols[1],
-                "周期起始本金",
+                "单线起始本金",
                 &format!("{:.2} USDT", self.event_prediction_stake_amount),
-                "每个新周期首单 5U；赢后将本单回报全额复投",
+                "周期初始投入 25U（5 条线 × 5U）；赢后该线回报全额复投",
                 theme::TEXT,
             );
             metric(
@@ -2641,34 +2647,41 @@ impl GqtApp {
             return;
         };
 
-        let settled = cycle
-            .tickets
+        let mut tickets = cycle.tickets.clone();
+        tickets.sort_by(|left, right| {
+            left.cycle_order
+                .cmp(&right.cycle_order)
+                .then_with(|| {
+                    left.cycle_slot
+                        .unwrap_or_default()
+                        .cmp(&right.cycle_slot.unwrap_or_default())
+                })
+                .then_with(|| left.open_time.cmp(&right.open_time))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let settled = tickets
             .iter()
             .filter(|ticket| ticket.status == "settled")
             .count();
-        let wins = cycle
-            .tickets
+        let wins = tickets
             .iter()
             .filter(|ticket| ticket.result == "win")
             .count();
-        let losses = cycle
-            .tickets
+        let losses = tickets
             .iter()
             .filter(|ticket| ticket.result == "loss")
             .count();
-        let ties = cycle
-            .tickets
+        let ties = tickets
             .iter()
             .filter(|ticket| ticket.result == "tie")
             .count();
-        let pnl = cycle
-            .tickets
+        let pnl = tickets
             .iter()
             .filter_map(|ticket| ticket.virtual_pnl)
             .sum::<f64>();
         let context = format!(
-            "完整周期共 {} 单，已结算 {}；{} 胜 / {} 负 / {} 平；累计盈亏 {:+.2} USDT",
-            cycle.tickets.len(),
+            "完整周期共 {} 笔，按轮次、线路排序；已结算 {}；{} 胜 / {} 负 / {} 平；累计盈亏 {:+.2} USDT",
+            tickets.len(),
             settled,
             wins,
             losses,
@@ -2696,7 +2709,7 @@ impl GqtApp {
                     &scroll_id,
                     &cycle.cycle_id,
                     &context,
-                    &cycle.tickets,
+                    &tickets,
                     "该周期暂无订单",
                     (dialog_height - 125.0).max(220.0),
                     false,
@@ -2760,13 +2773,18 @@ impl GqtApp {
                 }
                 event_ticket_detail_row(
                     ui,
-                    "周期进度",
+                    "周期轮次",
                     &if ticket.cycle_order > 0 {
-                        format!(
-                            "第 {}/{} 单",
-                            ticket.cycle_order,
-                            event_prediction::EVENT_CYCLE_MAX_ORDERS
-                        )
+                        format!("第 {} 轮", ticket.cycle_order)
+                    } else {
+                        "--".into()
+                    },
+                );
+                event_ticket_detail_row(
+                    ui,
+                    "线路槽位",
+                    &if ticket.cycle_slot.is_some_and(|slot| slot > 0) {
+                        format!("{} 号线", ticket.cycle_slot.unwrap_or_default())
                     } else {
                         "--".into()
                     },
@@ -4419,7 +4437,7 @@ fn event_ticket_list_card(
                         "票据",
                         "交易对",
                         "周期",
-                        "周期编号 / 进度",
+                        "周期编号 / 轮次 / 线路",
                         "本单下注",
                         "本单回报",
                         "方向",
@@ -4532,7 +4550,7 @@ fn event_ticket_table(
                                 "交易对",
                                 "周期",
                                 "周期编号",
-                                "周期进度",
+                                "轮次 / 线路",
                                 "方向",
                                 "置信度",
                                 "分数",
@@ -4660,11 +4678,12 @@ fn compact_event_id(id: &str) -> String {
 
 fn format_event_cycle_step(ticket: &EventPredictionTicket) -> String {
     if ticket.cycle_order > 0 {
-        format!(
-            "第 {}/{} 单",
-            ticket.cycle_order,
-            event_prediction::EVENT_CYCLE_MAX_ORDERS
-        )
+        let slot = if ticket.cycle_slot.is_some_and(|slot| slot > 0) {
+            format!("{}号线", ticket.cycle_slot.unwrap_or_default())
+        } else {
+            "--号线".into()
+        };
+        format!("第 {} 轮 / {slot}", ticket.cycle_order)
     } else {
         "旧玩法".into()
     }

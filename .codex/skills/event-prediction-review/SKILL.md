@@ -24,7 +24,7 @@ Use this skill to review the GQT event prediction virtual-order log and propose 
 
 - Treat fewer than 50 settled tickets per horizon as exploratory; do not claim stable edge.
 - Binance-style event prediction in this project is scoped to `BTCUSDT` and `ETHUSDT` only.
-- The current event prediction bankroll is unlimited virtual capital. BTC/ETH each run independent serial chains for `10m`, `30m`, and `60m`. A chain starts at 5 USDT, reinvests the full settlement return after a win, resets to 5 USDT after a loss, and starts a new numbered cycle after at most five tickets. A tie returns the stake and advances to the next ticket in the same cycle. Active `10m` wins return principal plus 80% profit; active `30m` and `60m` wins return principal plus 85% profit. Open exposure is tracked for visibility.
+- The current event prediction bankroll is unlimited virtual capital. BTC/ETH each run independent `10m`, `30m`, and `60m` cycles. Every numbered cycle starts five parallel slots at 5 USDT each (25 USDT initial exposure). Each slot reinvests its full settlement return after a win, keeps the same stake after a tie, and stops after a loss. Winning slots have no round limit; a new numbered cycle starts with another five 5-USDT slots only after all five slots have stopped. Active `10m` wins return principal plus 80% profit; active `30m` and `60m` wins return principal plus 85% profit. Open exposure is tracked for visibility.
 - Prefer settled tickets over open tickets. Open tickets are useful for operational checks only.
 - Separate late settlements from on-time settlements when the review text shows large `settled ...s late` values.
 - Do not delete or rewrite raw SQLite records during review.
