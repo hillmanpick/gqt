@@ -264,3 +264,9 @@ Append one compact entry after each event prediction review. Keep raw ticket dat
 - Payout flow: a win reinvests the full settlement return into the next ticket (10m `5.00 -> 9.00`; 30m/60m `5.00 -> 9.25`), a loss ends the cycle and resets the next cycle to 5 USDT, and a tie advances with the unchanged stake. Five completed tickets always close the cycle and reset the next one to 5 USDT.
 - Visibility: ticket rows persist cycle ID, cycle number, order number, stake, and settlement return. The history card, full history list, and detail dialog show the cycle progress and compounding amounts; the full list is responsive and has explicit close/Escape handling.
 - Verification: all 39 Rust tests pass, including win compounding, loss reset, one-open-ticket gating, five-ticket termination, and one-time schema migration. The release client migrated the live database to schema version 1 with all 75,467 ticket rows preserved, no duplicate cycle orders/open chains, and legacy open tickets left to settle naturally before each chain starts `C000001` at 5 USDT.
+
+## 2026-08-12 Clickable Cycle History
+
+- Visibility: cycle numbers in the dashboard cards, full order lists, and ticket detail dialog are clickable. The cycle dialog queries SQLite by the full cycle ID and displays every order in cycle order, including stake, result, settlement return, and cumulative cycle PnL.
+- Reliability: schema version 2 adds a `(cycle_id, cycle_order)` index so cycle lookup remains fast as history grows. Legacy rows remain labelled as old gameplay and do not expose a cycle link.
+- Verification: all 41 Rust tests pass, including a database test proving that settled and open tickets from the complete selected cycle are returned in order without mixing tickets from another cycle, plus a version-1-to-2 migration test that confirms ticket rows are not rewritten.

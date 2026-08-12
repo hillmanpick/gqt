@@ -34,7 +34,7 @@ use crate::{
 };
 
 const AI_TIMEFRAMES: [&str; 6] = ["1m", "5m", "15m", "1h", "4h", "1d"];
-const BUILD_LABEL: &str = "0.4.0-event-cycle-v1";
+const BUILD_LABEL: &str = "0.4.0-event-cycle-v1.1";
 const RELAY_DEFAULT_MODEL: &str = "gpt-5.6-luna";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +168,7 @@ pub struct GqtApp {
     event_prediction_manual_60m: bool,
     event_prediction_order_dialog: Option<EventOrderKind>,
     event_prediction_ticket_dialog: Option<EventPredictionTicket>,
+    event_prediction_cycle_dialog: Option<EventPredictionCycleDialog>,
     event_prediction_direction_dialog: Option<Vec<EventPredictionRunDirection>>,
     event_prediction_direction_dialog_pending: bool,
     toast: Option<(String, bool, Instant)>,
@@ -197,6 +198,10 @@ enum TaskEvent {
     Simulation(Result<SimulationAccount, String>),
     AiDecision(Result<AiDecisionSummary, String>),
     EventPrediction(Result<event_prediction::EventPredictionSummary, String>),
+    EventPredictionCycle {
+        cycle_id: String,
+        result: Result<Vec<EventPredictionTicket>, String>,
+    },
 }
 
 struct AiDecisionSummary {
@@ -220,6 +225,32 @@ enum LiveAction {
 enum EventOrderKind {
     Open,
     Settled,
+}
+
+#[derive(Clone)]
+struct EventPredictionCycleView {
+    cycle_id: String,
+    tickets: Vec<EventPredictionTicket>,
+}
+
+#[derive(Clone)]
+enum EventPredictionCycleDialog {
+    Loading { cycle_id: String },
+    Ready(EventPredictionCycleView),
+}
+
+impl EventPredictionCycleDialog {
+    fn cycle_id(&self) -> &str {
+        match self {
+            Self::Loading { cycle_id } => cycle_id,
+            Self::Ready(cycle) => &cycle.cycle_id,
+        }
+    }
+}
+
+enum EventTicketAction {
+    Ticket(EventPredictionTicket),
+    Cycle(String),
 }
 
 impl GqtApp {
@@ -373,6 +404,7 @@ impl GqtApp {
             event_prediction_manual_60m: true,
             event_prediction_order_dialog: None,
             event_prediction_ticket_dialog: None,
+            event_prediction_cycle_dialog: None,
             event_prediction_direction_dialog: None,
             event_prediction_direction_dialog_pending: false,
             toast: None,
@@ -567,6 +599,31 @@ impl GqtApp {
                         Err(error) => {
                             self.event_prediction_status = error.clone();
                             self.toast(error, true);
+                        }
+                    }
+                }
+                TaskEvent::EventPredictionCycle { cycle_id, result } => {
+                    let is_current = self
+                        .event_prediction_cycle_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.cycle_id() == cycle_id);
+                    if !is_current {
+                        continue;
+                    }
+                    match result {
+                        Ok(tickets) if !tickets.is_empty() => {
+                            self.event_prediction_cycle_dialog =
+                                Some(EventPredictionCycleDialog::Ready(
+                                    EventPredictionCycleView { cycle_id, tickets },
+                                ));
+                        }
+                        Ok(_) => {
+                            self.event_prediction_cycle_dialog = None;
+                            self.toast(format!("周期 {cycle_id} 暂无订单"), true);
+                        }
+                        Err(error) => {
+                            self.event_prediction_cycle_dialog = None;
+                            self.toast(format!("读取周期 {cycle_id} 失败：{error}"), true);
                         }
                     }
                 }
@@ -1640,7 +1697,7 @@ impl GqtApp {
             event_metric(&mut cols[3], "历史 1h", &all_stat60);
         });
         ui.add_space(18.0);
-        if let Some(ticket) = event_ticket_list_card(
+        if let Some(action) = event_ticket_list_card(
             ui,
             "未结算票据",
             "按到期时间排序，最先需要复盘的排前面",
@@ -1649,10 +1706,10 @@ impl GqtApp {
             EventOrderKind::Open,
             &mut self.event_prediction_order_dialog,
         ) {
-            self.event_prediction_ticket_dialog = Some(ticket);
+            self.handle_event_ticket_action(action);
         }
         ui.add_space(14.0);
-        if let Some(ticket) = event_ticket_list_card(
+        if let Some(action) = event_ticket_list_card(
             ui,
             "历史已结算",
             "最近 80 条已结算虚拟订单，胜/负/平都在这里看",
@@ -1661,7 +1718,7 @@ impl GqtApp {
             EventOrderKind::Settled,
             &mut self.event_prediction_order_dialog,
         ) {
-            self.event_prediction_ticket_dialog = Some(ticket);
+            self.handle_event_ticket_action(action);
         }
     }
 
@@ -2333,7 +2390,38 @@ impl GqtApp {
         self.render_event_prediction_run_dialog(ctx);
         self.render_event_prediction_direction_dialog(ctx);
         self.render_event_prediction_order_dialog(ctx);
+        self.render_event_prediction_cycle_dialog(ctx);
         self.render_event_prediction_ticket_dialog(ctx);
+    }
+
+    fn handle_event_ticket_action(&mut self, action: EventTicketAction) {
+        match action {
+            EventTicketAction::Ticket(ticket) => {
+                self.event_prediction_cycle_dialog = None;
+                self.event_prediction_ticket_dialog = Some(ticket);
+            }
+            EventTicketAction::Cycle(cycle_id) => self.request_event_prediction_cycle(cycle_id),
+        }
+    }
+
+    fn request_event_prediction_cycle(&mut self, cycle_id: String) {
+        let cycle_id = cycle_id.trim().to_string();
+        if cycle_id.is_empty() {
+            return;
+        }
+        let path = self.workspace.event_predictions.clone();
+        let sender = self.task_sender.clone();
+        self.event_prediction_order_dialog = None;
+        self.event_prediction_ticket_dialog = None;
+        self.event_prediction_cycle_dialog = Some(EventPredictionCycleDialog::Loading {
+            cycle_id: cycle_id.clone(),
+        });
+        thread::spawn(move || {
+            let result = event_prediction::EventPredictionLog::open(&path)
+                .and_then(|log| log.cycle_tickets(&cycle_id))
+                .map_err(|error| error.to_string());
+            let _ = sender.send(TaskEvent::EventPredictionCycle { cycle_id, result });
+        });
     }
 
     fn render_event_prediction_run_dialog(&mut self, ctx: &egui::Context) {
@@ -2468,14 +2556,14 @@ impl GqtApp {
         let (title, context, tickets, scroll_id, empty_text) = match kind {
             EventOrderKind::Open => (
                 "未结算票据大列表",
-                "当前策略最近 80 条未结算票据；点票据编号看完整详情",
+                "当前策略最近 80 条未结算票据；点票据编号看详情，点周期编号看整组订单",
                 &self.event_prediction_recent,
                 "event-prediction-open-dialog-scroll",
                 "暂无未结算票据",
             ),
             EventOrderKind::Settled => (
                 "历史已结算大列表",
-                "当前策略最近 80 条已结算虚拟订单；点票据编号看完整详情",
+                "当前策略最近 80 条已结算虚拟订单；点票据编号看详情，点周期编号看整组订单",
                 &self.event_prediction_history,
                 "event-prediction-history-dialog-scroll",
                 "暂无历史已结算票据",
@@ -2483,7 +2571,7 @@ impl GqtApp {
         };
         let mut open = true;
         let mut close = false;
-        let mut selected_ticket = None;
+        let mut selected_action = None;
         let content_rect = ctx.content_rect();
         let dialog_width = (content_rect.width() - 32.0).clamp(280.0, 1180.0);
         let dialog_height = (content_rect.height() - 32.0).clamp(280.0, 760.0);
@@ -2496,7 +2584,7 @@ impl GqtApp {
             .max_height(dialog_height)
             .open(&mut open)
             .show(ctx, |ui| {
-                selected_ticket = event_ticket_table(
+                selected_action = event_ticket_table(
                     ui,
                     scroll_id,
                     title,
@@ -2504,6 +2592,7 @@ impl GqtApp {
                     tickets,
                     empty_text,
                     (dialog_height - 125.0).max(220.0),
+                    true,
                 );
                 ui.add_space(8.0);
                 if ui.add(theme::secondary_button("关闭")).clicked() {
@@ -2511,14 +2600,121 @@ impl GqtApp {
                 }
             });
 
-        if let Some(ticket) = selected_ticket {
-            self.event_prediction_ticket_dialog = Some(ticket);
+        if let Some(action) = selected_action {
             self.event_prediction_order_dialog = None;
+            self.handle_event_ticket_action(action);
             return;
         }
         let escape_pressed = ctx.input(|input| input.key_pressed(egui::Key::Escape));
         if close || !open || escape_pressed {
             self.event_prediction_order_dialog = None;
+        }
+    }
+
+    fn render_event_prediction_cycle_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.event_prediction_cycle_dialog.clone() else {
+            return;
+        };
+
+        if let EventPredictionCycleDialog::Loading { cycle_id } = dialog {
+            let mut open = true;
+            let mut close = false;
+            egui::Window::new(format!("正在读取周期 {cycle_id}"))
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.spinner();
+                    ui.label("正在从完整历史中读取这个周期的全部订单…");
+                    if ui.add(theme::secondary_button("取消")).clicked() {
+                        close = true;
+                    }
+                });
+            let escape_pressed = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+            if close || !open || escape_pressed {
+                self.event_prediction_cycle_dialog = None;
+            }
+            return;
+        }
+        let EventPredictionCycleDialog::Ready(cycle) = dialog else {
+            return;
+        };
+
+        let settled = cycle
+            .tickets
+            .iter()
+            .filter(|ticket| ticket.status == "settled")
+            .count();
+        let wins = cycle
+            .tickets
+            .iter()
+            .filter(|ticket| ticket.result == "win")
+            .count();
+        let losses = cycle
+            .tickets
+            .iter()
+            .filter(|ticket| ticket.result == "loss")
+            .count();
+        let ties = cycle
+            .tickets
+            .iter()
+            .filter(|ticket| ticket.result == "tie")
+            .count();
+        let pnl = cycle
+            .tickets
+            .iter()
+            .filter_map(|ticket| ticket.virtual_pnl)
+            .sum::<f64>();
+        let context = format!(
+            "完整周期共 {} 单，已结算 {}；{} 胜 / {} 负 / {} 平；累计盈亏 {:+.2} USDT",
+            cycle.tickets.len(),
+            settled,
+            wins,
+            losses,
+            ties,
+            pnl
+        );
+        let mut open = true;
+        let mut close = false;
+        let mut selected_action = None;
+        let scroll_id = format!("event-prediction-cycle-dialog-scroll-{}", cycle.cycle_id);
+        let content_rect = ctx.content_rect();
+        let dialog_width = (content_rect.width() - 32.0).clamp(280.0, 1180.0);
+        let dialog_height = (content_rect.height() - 32.0).clamp(280.0, 760.0);
+        egui::Window::new(format!("周期订单 {}", cycle.cycle_id))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(dialog_width)
+            .max_width(dialog_width)
+            .max_height(dialog_height)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                selected_action = event_ticket_table(
+                    ui,
+                    &scroll_id,
+                    &cycle.cycle_id,
+                    &context,
+                    &cycle.tickets,
+                    "该周期暂无订单",
+                    (dialog_height - 125.0).max(220.0),
+                    false,
+                );
+                ui.add_space(8.0);
+                if ui.add(theme::secondary_button("关闭")).clicked() {
+                    close = true;
+                }
+            });
+
+        if let Some(EventTicketAction::Ticket(ticket)) = selected_action {
+            self.event_prediction_cycle_dialog = None;
+            self.event_prediction_ticket_dialog = Some(ticket);
+            return;
+        }
+        let escape_pressed = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        if close || !open || escape_pressed {
+            self.event_prediction_cycle_dialog = None;
         }
     }
 
@@ -2530,6 +2726,7 @@ impl GqtApp {
         let mut open = true;
         let mut close = false;
         let content_rect = ctx.content_rect();
+        let mut selected_cycle = None;
         let dialog_width = (content_rect.width() - 32.0).clamp(280.0, 540.0);
         let dialog_height = (content_rect.height() - 32.0).clamp(280.0, 760.0);
         egui::Window::new(format!("订单详情 {}", compact_event_id(&ticket.id)))
@@ -2557,15 +2754,10 @@ impl GqtApp {
                 event_ticket_detail_row(ui, "完整票据 ID", &ticket.id);
                 event_ticket_detail_row(ui, "交易对", &ticket.symbol);
                 event_ticket_detail_row(ui, "周期", &format!("{}m", ticket.horizon_minutes));
-                event_ticket_detail_row(
-                    ui,
-                    "周期编号",
-                    &if ticket.cycle_id.is_empty() {
-                        "旧玩法".into()
-                    } else {
-                        ticket.cycle_id.clone()
-                    },
-                );
+                if event_ticket_cycle_detail_row(ui, &ticket) {
+                    close = true;
+                    selected_cycle = Some(ticket.cycle_id.clone());
+                }
                 event_ticket_detail_row(
                     ui,
                     "周期进度",
@@ -2651,6 +2843,11 @@ impl GqtApp {
             });
 
         let escape_pressed = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        if let Some(cycle_id) = selected_cycle {
+            self.event_prediction_ticket_dialog = None;
+            self.request_event_prediction_cycle(cycle_id);
+            return;
+        }
         if close || !open || escape_pressed {
             self.event_prediction_ticket_dialog = None;
         }
@@ -4186,8 +4383,8 @@ fn event_ticket_list_card(
     empty_text: &str,
     kind: EventOrderKind,
     order_dialog: &mut Option<EventOrderKind>,
-) -> Option<EventPredictionTicket> {
-    let mut selected_ticket = None;
+) -> Option<EventTicketAction> {
+    let mut selected_action = None;
     Frame::NONE
         .fill(theme::SURFACE)
         .stroke(Stroke::new(1.0, theme::BORDER))
@@ -4222,7 +4419,7 @@ fn event_ticket_list_card(
                         "票据",
                         "交易对",
                         "周期",
-                        "周期进度",
+                        "周期编号 / 进度",
                         "本单下注",
                         "本单回报",
                         "方向",
@@ -4239,11 +4436,14 @@ fn event_ticket_list_card(
                             .add(theme::secondary_button(compact_event_id(&ticket.id)))
                             .clicked()
                         {
-                            selected_ticket = Some(ticket.clone());
+                            selected_action = Some(EventTicketAction::Ticket(ticket.clone()));
                         }
                         ui.label(RichText::new(&ticket.symbol).strong());
                         ui.label(format!("{}m", ticket.horizon_minutes));
-                        ui.label(format_event_cycle_step(ticket));
+                        if event_cycle_button(ui, ticket, true).clicked() {
+                            selected_action =
+                                Some(EventTicketAction::Cycle(ticket.cycle_id.clone()));
+                        }
                         ui.label(format!("{:.2}", ticket.stake_amount));
                         ui.label(
                             ticket
@@ -4283,7 +4483,7 @@ fn event_ticket_list_card(
                 );
             }
         });
-    selected_ticket
+    selected_action
 }
 
 fn event_ticket_table(
@@ -4294,8 +4494,9 @@ fn event_ticket_table(
     tickets: &[EventPredictionTicket],
     empty_text: &str,
     max_height: f32,
-) -> Option<EventPredictionTicket> {
-    let mut selected_ticket = None;
+    cycle_links: bool,
+) -> Option<EventTicketAction> {
+    let mut selected_action = None;
     Frame::NONE
         .fill(theme::SURFACE)
         .stroke(Stroke::new(1.0, theme::BORDER))
@@ -4354,11 +4555,19 @@ fn event_ticket_table(
                                     .add(theme::secondary_button(compact_event_id(&ticket.id)))
                                     .clicked()
                                 {
-                                    selected_ticket = Some(ticket.clone());
+                                    selected_action =
+                                        Some(EventTicketAction::Ticket(ticket.clone()));
                                 }
                                 ui.label(RichText::new(&ticket.symbol).strong());
                                 ui.label(format!("{}m", ticket.horizon_minutes));
-                                ui.label(format_event_cycle_id(ticket));
+                                if cycle_links {
+                                    if event_cycle_button(ui, ticket, false).clicked() {
+                                        selected_action =
+                                            Some(EventTicketAction::Cycle(ticket.cycle_id.clone()));
+                                    }
+                                } else {
+                                    ui.label(format_event_cycle_id(ticket));
+                                }
                                 ui.label(format_event_cycle_step(ticket));
                                 ui.colored_label(
                                     prediction_direction_color(&ticket.direction),
@@ -4404,7 +4613,43 @@ fn event_ticket_table(
                         });
                 });
         });
-    selected_ticket
+    selected_action
+}
+
+fn event_cycle_button(
+    ui: &mut Ui,
+    ticket: &EventPredictionTicket,
+    include_step: bool,
+) -> egui::Response {
+    if ticket.cycle_id.is_empty() || ticket.cycle_number <= 0 {
+        ui.add_enabled(false, theme::secondary_button("旧玩法"))
+    } else {
+        let label = if include_step {
+            format!(
+                "{} · {}",
+                format_event_cycle_id(ticket),
+                format_event_cycle_step(ticket)
+            )
+        } else {
+            format_event_cycle_id(ticket)
+        };
+        ui.add(theme::secondary_button(label).sense(Sense::click()))
+            .on_hover_text(format!("查看周期 {} 的全部订单", ticket.cycle_id))
+    }
+}
+
+fn event_ticket_cycle_detail_row(ui: &mut Ui, ticket: &EventPredictionTicket) -> bool {
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("周期编号").color(theme::MUTED));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if event_cycle_button(ui, ticket, false).clicked() {
+                clicked = true;
+            }
+        });
+    });
+    ui.separator();
+    clicked
 }
 
 fn compact_event_id(id: &str) -> String {

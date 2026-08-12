@@ -22,7 +22,7 @@ pub const EVENT_DEFAULT_PROFIT_RATE: f64 = 0.85;
 pub const EVENT_SUPPORTED_SYMBOLS: [&str; 2] = ["BTCUSDT", "ETHUSDT"];
 pub const EVENT_STRATEGY_NAME: &str = "event_reinvest_cycle_v1";
 pub const EVENT_CYCLE_MAX_ORDERS: i64 = 5;
-const EVENT_SCHEMA_VERSION: i64 = 1;
+const EVENT_SCHEMA_VERSION: i64 = 2;
 const EVENT_EXPERT_HISTORY_LIMIT: i64 = 400;
 const EVENT_EXPERT_MIN_SAMPLES: usize = 8;
 const EVENT_UP_COMMITMENT_RATE: f64 = 0.65;
@@ -1034,6 +1034,26 @@ impl EventPredictionLog {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("Failed to read settled event predictions")
     }
+
+    pub fn cycle_tickets(&self, cycle_id: &str) -> Result<Vec<EventPredictionTicket>> {
+        let cycle_id = cycle_id.trim();
+        if cycle_id.is_empty() {
+            bail!("event prediction cycle id is empty");
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT id, symbol, horizon_minutes, open_time, close_time, direction,
+                    confidence, score, stake_amount, entry_price, expiry_price, status,
+                    COALESCE(result, ''), move_percent, virtual_pnl,
+                    COALESCE(cycle_id, ''), COALESCE(cycle_number, 0),
+                    COALESCE(cycle_order, 0), cycle_balance_after, COALESCE(review, '')
+             FROM event_prediction_tickets
+             WHERE cycle_id = ?1
+             ORDER BY cycle_order ASC, created_at ASC, open_time ASC",
+        )?;
+        let rows = statement.query_map([cycle_id], ticket_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to read event prediction cycle tickets")
+    }
 }
 
 fn ticket_from_row(row: &Row<'_>) -> rusqlite::Result<EventPredictionTicket> {
@@ -1202,33 +1222,38 @@ fn migrate_schema(connection: &mut Connection) -> Result<()> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("Failed to start event prediction schema migration")?;
-    let columns = {
-        let mut statement = transaction.prepare("PRAGMA table_info(event_prediction_tickets)")?;
-        statement
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    if !columns.iter().any(|column| column == "stake_amount") {
-        transaction.execute(
-            "ALTER TABLE event_prediction_tickets
-             ADD COLUMN stake_amount REAL NOT NULL DEFAULT 5.0",
-            [],
-        )?;
-    }
-    for (column, definition) in [
-        ("cycle_id", "TEXT"),
-        ("cycle_number", "INTEGER"),
-        ("cycle_order", "INTEGER"),
-        ("cycle_balance_after", "REAL"),
-    ] {
-        if !columns.iter().any(|existing| existing == column) {
+    if schema_version < 1 {
+        let columns = {
+            let mut statement =
+                transaction.prepare("PRAGMA table_info(event_prediction_tickets)")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if !columns.iter().any(|column| column == "stake_amount") {
             transaction.execute(
-                &format!("ALTER TABLE event_prediction_tickets ADD COLUMN {column} {definition}"),
+                "ALTER TABLE event_prediction_tickets
+                 ADD COLUMN stake_amount REAL NOT NULL DEFAULT 5.0",
                 [],
             )?;
         }
+        for (column, definition) in [
+            ("cycle_id", "TEXT"),
+            ("cycle_number", "INTEGER"),
+            ("cycle_order", "INTEGER"),
+            ("cycle_balance_after", "REAL"),
+        ] {
+            if !columns.iter().any(|existing| existing == column) {
+                transaction.execute(
+                    &format!(
+                        "ALTER TABLE event_prediction_tickets ADD COLUMN {column} {definition}"
+                    ),
+                    [],
+                )?;
+            }
+        }
+        migrate_payout_model(&transaction)?;
     }
-    migrate_payout_model(&transaction)?;
     ensure_cycle_indexes_can_be_created(&transaction)?;
     transaction.execute_batch(
         "CREATE INDEX IF NOT EXISTS event_prediction_cycle
@@ -1238,7 +1263,9 @@ fn migrate_schema(connection: &mut Connection) -> Result<()> {
          WHERE cycle_number IS NOT NULL AND cycle_order IS NOT NULL;
          CREATE UNIQUE INDEX IF NOT EXISTS unique_event_prediction_open_cycle_chain
          ON event_prediction_tickets(symbol, horizon_minutes)
-         WHERE status = 'open' AND cycle_number IS NOT NULL;",
+         WHERE status = 'open' AND cycle_number IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS event_prediction_cycle_id
+         ON event_prediction_tickets(cycle_id, cycle_order);",
     )?;
     transaction.pragma_update(None, "user_version", EVENT_SCHEMA_VERSION)?;
     transaction
@@ -2134,6 +2161,66 @@ mod tests {
     }
 
     #[test]
+    fn cycle_ticket_query_returns_every_order_in_cycle_order() {
+        let root =
+            std::env::temp_dir().join(format!("gqt-event-cycle-view-{}", rand::random::<u64>()));
+        fs::create_dir_all(&root).unwrap();
+        let log = EventPredictionLog::open(&root.join("events.sqlite")).unwrap();
+        for (id, cycle_id, cycle_number, cycle_order, open_time, status, result) in [
+            ("cycle-2", "BTCUSDT-10m-C000001", 1, 2, 200, "open", None),
+            (
+                "other-cycle",
+                "BTCUSDT-10m-C000002",
+                2,
+                1,
+                300,
+                "settled",
+                Some("win"),
+            ),
+            (
+                "cycle-1",
+                "BTCUSDT-10m-C000001",
+                1,
+                1,
+                100,
+                "settled",
+                Some("win"),
+            ),
+        ] {
+            log.connection
+                .execute(
+                    "INSERT INTO event_prediction_tickets
+                     (id, created_at, symbol, horizon_minutes, open_time, close_time, direction,
+                      confidence, score, stake_amount, entry_price, status, result, virtual_pnl,
+                      features_json, cycle_id, cycle_number, cycle_order, cycle_balance_after)
+                     VALUES (?1, ?2, 'BTCUSDT', 10, ?2, ?2 + 600, 'up', 0.6, 0.2,
+                             5.0, 100.0, ?6, ?7, 4.0, '{}', ?3, ?4, ?5, 9.0)",
+                    params![
+                        id,
+                        open_time,
+                        cycle_id,
+                        cycle_number,
+                        cycle_order,
+                        status,
+                        result
+                    ],
+                )
+                .unwrap();
+        }
+
+        let tickets = log.cycle_tickets("BTCUSDT-10m-C000001").unwrap();
+        assert_eq!(tickets.len(), 2);
+        assert_eq!(tickets[0].id, "cycle-1");
+        assert_eq!(tickets[0].cycle_order, 1);
+        assert_eq!(tickets[0].status, "settled");
+        assert_eq!(tickets[1].id, "cycle-2");
+        assert_eq!(tickets[1].cycle_order, 2);
+        assert_eq!(tickets[1].status, "open");
+        assert!(log.cycle_tickets("   ").is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn schema_migration_runs_once_and_preserves_legacy_open_tickets() {
         let root =
             std::env::temp_dir().join(format!("gqt-event-migration-{}", rand::random::<u64>()));
@@ -2270,6 +2357,78 @@ mod tests {
                 .iter()
                 .any(|name| name == "unique_event_prediction_open_cycle_chain")
         );
+        assert!(
+            indexes
+                .iter()
+                .any(|name| name == "event_prediction_cycle_id")
+        );
+        drop(log);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn schema_version_one_adds_cycle_lookup_index_without_rewriting_tickets() {
+        let root =
+            std::env::temp_dir().join(format!("gqt-event-migration-v1-{}", rand::random::<u64>()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("events.sqlite");
+        let log = EventPredictionLog::open(&path).unwrap();
+        log.connection
+            .execute(
+                "INSERT INTO event_prediction_tickets
+                 (id, created_at, symbol, horizon_minutes, open_time, close_time, direction,
+                  confidence, score, stake_amount, entry_price, status, result, virtual_pnl,
+                  features_json, cycle_id, cycle_number, cycle_order, cycle_balance_after)
+                 VALUES ('v1-cycle', 1, 'BTCUSDT', 10, 60, 660, 'up', 0.5, 0.1,
+                         5.0, 100.0, 'settled', 'win', 4.0, '{}',
+                         'BTCUSDT-10m-C000001', 1, 1, 9.0)",
+                [],
+            )
+            .unwrap();
+        log.connection
+            .execute_batch(
+                "DROP INDEX event_prediction_cycle_id;
+                 PRAGMA user_version = 1;
+                 CREATE TABLE migration_v1_update_counter (updates INTEGER NOT NULL);
+                 INSERT INTO migration_v1_update_counter VALUES (0);
+                 CREATE TRIGGER count_v1_ticket_updates
+                 AFTER UPDATE ON event_prediction_tickets
+                 BEGIN
+                    UPDATE migration_v1_update_counter SET updates = updates + 1;
+                 END;",
+            )
+            .unwrap();
+        drop(log);
+
+        let log = EventPredictionLog::open(&path).unwrap();
+        assert_eq!(
+            log.connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            EVENT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            log.connection
+                .query_row(
+                    "SELECT updates FROM migration_v1_update_counter",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        let has_lookup_index = log
+            .connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_index_list('event_prediction_tickets')
+                     WHERE name = 'event_prediction_cycle_id'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap();
+        assert!(has_lookup_index);
         drop(log);
         let _ = fs::remove_dir_all(root);
     }
