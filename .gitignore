@@ -3,6 +3,12 @@ data/
 node_modules/
 desktop/target/
 desktop/dist/
+vendor/
+vnpy_gqt/.venv/
+vnpy_gqt/build/
+vnpy_gqt/results/
+vnpy_gqt/src/*.egg-info/
+.vntrader/
 *.log
 __pycache__/
 *.pyc
