@@ -9,6 +9,8 @@ mod exchange;
 mod market;
 mod model;
 mod network;
+mod scanner;
+mod sentiment;
 mod store;
 mod theme;
 mod trading;

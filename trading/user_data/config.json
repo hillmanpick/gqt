@@ -12,6 +12,11 @@
   "trading_mode": "futures",
   "margin_mode": "isolated",
   "gqt_strategy_profile": "aggressive",
+  "gqt_continuous_dry_run_entries": true,
+  "gqt_execution_mode": "paper",
+  "gqt_major_leverage_cap": 50,
+  "gqt_alt_leverage_cap": 5,
+  "gqt_sentiment_required": true,
   "gqt_max_stake_amount": 120,
   "gqt_risk_reward_ratio": 1,
   "gqt_ai_risk_sizing": false,
@@ -79,10 +84,12 @@
     "key": "",
     "secret": "",
     "ccxt_config": {
-      "enableRateLimit": true
+      "enableRateLimit": true,
+      "httpsProxy": "http://host.docker.internal:7890"
     },
     "ccxt_async_config": {
-      "enableRateLimit": true
+      "enableRateLimit": true,
+      "httpsProxy": "http://host.docker.internal:7890"
     },
     "pair_whitelist": [
       "BTC/USDT:USDT"

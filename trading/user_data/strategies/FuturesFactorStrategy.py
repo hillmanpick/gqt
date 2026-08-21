@@ -15,6 +15,11 @@ PROFILE_ALIASES = {
     "default": "balanced",
 }
 
+MAJOR_BASES = {
+    "BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "TRX", "AVAX", "LINK",
+    "DOT", "LTC", "BCH", "TON", "NEAR", "UNI", "ATOM", "ETC", "FIL", "APT", "SUI",
+}
+
 PROFILE_DEFAULTS = {
     "conservative": {
         "minimum_long_score": 0.68,
@@ -247,12 +252,30 @@ class FuturesFactorStrategy(IStrategy):
         profile_value = self._profile().get(name, fallback)
         return self._bool(self._settings().get(name), self._bool(profile_value, fallback))
 
+    def _continuous_dry_run_entries_enabled(self) -> bool:
+        runtime_config = getattr(self, "config", {})
+        return (
+            isinstance(runtime_config, dict)
+            and runtime_config.get("dry_run") is True
+            and self._profile_bool("gqt_continuous_dry_run_entries", False)
+        )
+
     def _cost_leverage(self) -> float:
         requested = self._profile_float(
             "gqt_compound_leverage",
             self._float_setting("leverage", 2.0),
         )
-        return max(1.0, requested)
+        return max(1.0, min(requested, 50.0))
+
+    def _execution_mode(self) -> str:
+        return str(self._settings().get("gqt_execution_mode", "paper")).strip().lower()
+
+    def _leverage_cap(self, pair: str) -> float:
+        symbol = pair.replace("/", "").replace(":USDT", "").upper()
+        base = symbol[:-4] if symbol.endswith("USDT") else symbol
+        setting = "gqt_major_leverage_cap" if base in MAJOR_BASES else "gqt_alt_leverage_cap"
+        fallback = 50.0 if base in MAJOR_BASES else 5.0
+        return max(1.0, min(self._float_setting(setting, fallback), fallback))
 
     def _round_trip_cost_floor(self) -> float:
         fee_rate = max(0.0, self._profile_float("gqt_fee_rate", 0.0005))
@@ -772,6 +795,24 @@ class FuturesFactorStrategy(IStrategy):
 
         dataframe.loc[long_conditions, ["enter_long", "enter_tag"]] = (1, "alpha_compound_long")
         dataframe.loc[short_conditions, ["enter_short", "enter_tag"]] = (1, "alpha_compound_short")
+
+        if self._continuous_dry_run_entries_enabled():
+            latest_index = dataframe.index[-1]
+            latest_factor = dataframe.at[latest_index, "factor_score"]
+            latest_volume = dataframe.at[latest_index, "volume"]
+            if (
+                np.isfinite(latest_factor)
+                and np.isfinite(latest_volume)
+                and latest_volume > 0
+                and dataframe.at[latest_index, "enter_long"] != 1
+                and dataframe.at[latest_index, "enter_short"] != 1
+            ):
+                if latest_factor >= 0:
+                    dataframe.at[latest_index, "enter_long"] = 1
+                    dataframe.at[latest_index, "enter_tag"] = "dry_run_continuous_factor_long"
+                else:
+                    dataframe.at[latest_index, "enter_short"] = 1
+                    dataframe.at[latest_index, "enter_tag"] = "dry_run_continuous_factor_short"
         return dataframe
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -830,6 +871,10 @@ class FuturesFactorStrategy(IStrategy):
         time_in_force: str, current_time: datetime, entry_tag: str | None,
         side: str, **kwargs,
     ) -> bool:
+        if self._execution_mode() == "recommend":
+            return False
+        if not bool(getattr(self, "config", {}).get("dry_run", True)) and self._execution_mode() != "live":
+            return False
         return not self._daily_target_reached(current_time)
 
     def custom_stake_amount(
@@ -935,4 +980,4 @@ class FuturesFactorStrategy(IStrategy):
             "gqt_compound_leverage",
             self._float_setting("leverage", 2.0),
         )
-        return max(1.0, min(requested, max_leverage))
+        return max(1.0, min(requested, self._leverage_cap(pair), max_leverage))

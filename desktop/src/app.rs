@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::{Datelike, Local, TimeZone};
+use chrono::{Datelike, Local, TimeZone, Utc};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use directories::ProjectDirs;
 use eframe::egui::{
@@ -28,6 +28,7 @@ use crate::{
         FuturesPosition, Interval, MarginMode, MarketCommand, MarketEvent, MarketSnapshot, Page,
         SecretStatus, SimulationAccount, StrategyProfile,
     },
+    scanner::{self, ScannerCommand, ScannerEvent, UniverseSnapshot},
     store::SecretStore,
     theme,
     trading::TradingWorkspace,
@@ -117,6 +118,11 @@ pub struct GqtApp {
     market_error: String,
     market_commands: Sender<MarketCommand>,
     market_events: Receiver<MarketEvent>,
+    scanner_commands: Sender<ScannerCommand>,
+    scanner_events: Receiver<ScannerEvent>,
+    scanner_snapshot: UniverseSnapshot,
+    scanner_connected: bool,
+    scanner_error: String,
     strategy_source: String,
     strategy_state: String,
     stake_amount: f64,
@@ -293,6 +299,8 @@ impl GqtApp {
             symbol: initial_symbol.clone(),
             interval: Interval::FifteenMinutes,
         });
+        let (scanner_commands, scanner_events) =
+            scanner::start_worker(workspace.root.join("user_data"));
         let (task_sender, task_receiver) = mpsc::channel();
         let (docker_available, bot_state) = workspace.docker_state();
         let dry_run = workspace.dry_run().unwrap_or(true);
@@ -349,6 +357,11 @@ impl GqtApp {
             market_error: String::new(),
             market_commands,
             market_events,
+            scanner_commands,
+            scanner_events,
+            scanner_snapshot: UniverseSnapshot::default(),
+            scanner_connected: false,
+            scanner_error: String::new(),
             strategy_source,
             strategy_state: "未修改".into(),
             stake_amount,
@@ -435,6 +448,16 @@ impl GqtApp {
                 }
                 MarketEvent::Connection(connected) => self.market_connected = connected,
                 MarketEvent::Error(error) => self.market_error = error,
+            }
+        }
+        while let Ok(event) = self.scanner_events.try_recv() {
+            match event {
+                ScannerEvent::Snapshot(snapshot) => {
+                    self.scanner_snapshot = snapshot;
+                    self.scanner_error.clear();
+                }
+                ScannerEvent::Connection(connected) => self.scanner_connected = connected,
+                ScannerEvent::Error(error) => self.scanner_error = error,
             }
         }
         while let Ok(event) = self.task_receiver.try_recv() {
@@ -1895,8 +1918,146 @@ impl GqtApp {
                 });
             });
         });
+        ui.add_space(14.0);
+        self.render_scanner_panel(ui);
         if !self.market_error.is_empty() && !self.market_connected {
             ui.colored_label(theme::RED, &self.market_error);
+        }
+    }
+
+    fn render_scanner_panel(&mut self, ui: &mut Ui) {
+        let snapshot = &self.scanner_snapshot;
+        ui.horizontal(|ui| {
+            section_title(
+                ui,
+                "全市场扫描",
+                &format!("{} 个 USDT 永续", snapshot.total_symbols),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.colored_label(
+                    if self.scanner_connected {
+                        theme::GREEN
+                    } else {
+                        theme::RED
+                    },
+                    if self.scanner_connected {
+                        "● 扫描中"
+                    } else {
+                        "● 扫描断开"
+                    },
+                );
+            });
+        });
+        if !snapshot.recommendations.is_empty() {
+            ui.add_space(6.0);
+            let heading = if snapshot.sentiment_configured {
+                format!(
+                    "推荐候选（已接入 {} 条舆情事件）",
+                    snapshot.sentiment_events
+                )
+            } else {
+                "推荐候选（未配置新闻/X API，当前只展示行情候选）".into()
+            };
+            ui.label(RichText::new(heading).color(theme::MUTED));
+            for recommendation in snapshot.recommendations.iter().take(5) {
+                Frame::NONE
+                    .fill(Color32::from_rgb(12, 16, 19))
+                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .corner_radius(3)
+                    .inner_margin(Margin::same(9))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&recommendation.symbol).strong());
+                            ui.colored_label(
+                                if recommendation.side == "LONG" {
+                                    theme::GREEN
+                                } else {
+                                    theme::RED
+                                },
+                                &recommendation.side,
+                            );
+                            ui.label(format!(
+                                "评分 {:.0} · 置信度 {:.0}%",
+                                recommendation.score,
+                                recommendation.confidence * 100.0
+                            ));
+                            ui.label(format!(
+                                "{} 杠杆上限 {}x / 建议 {}x",
+                                recommendation.category,
+                                recommendation.leverage_cap,
+                                recommendation.suggested_leverage
+                            ));
+                        });
+                        ui.label(RichText::new(&recommendation.reason).color(theme::MUTED));
+                        ui.label(
+                            RichText::new(format!(
+                                "触发：{} · 止损 {:.2}% · 止盈 {:.2}% · {}",
+                                recommendation.trigger,
+                                recommendation.stop_loss_percent,
+                                recommendation.take_profit_percent,
+                                recommendation.status
+                            ))
+                            .color(theme::MUTED),
+                        );
+                    });
+                ui.add_space(4.0);
+            }
+        } else {
+            let message = if snapshot.sentiment_configured {
+                "当前没有通过行情和舆情双重门槛的候选，不强行推荐。"
+            } else {
+                "当前没有可执行推荐；配置合规新闻/X API 后才会启用舆情确认。"
+            };
+            ui.label(RichText::new(message).color(theme::MUTED));
+        }
+        if !snapshot.headlines.is_empty() {
+            ui.add_space(8.0);
+            ui.label(RichText::new("最新舆情事件").color(theme::MUTED));
+            for headline in snapshot.headlines.iter().take(5) {
+                ui.horizontal_wrapped(|ui| {
+                    let sentiment_color = if headline.sentiment > 0.15 {
+                        theme::GREEN
+                    } else if headline.sentiment < -0.15 {
+                        theme::RED
+                    } else {
+                        theme::MUTED
+                    };
+                    ui.colored_label(sentiment_color, &headline.symbol);
+                    ui.label(format!(
+                        "{} · {} · {}",
+                        headline.event_type,
+                        headline.source,
+                        format_scanner_time(headline.published_at)
+                    ));
+                    if headline.url.starts_with("http://") || headline.url.starts_with("https://") {
+                        ui.hyperlink_to("来源", &headline.url);
+                    }
+                    ui.label(&headline.title);
+                });
+            }
+        }
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!(
+                "候选池 {} 个 · 数据质量 {:.0}% · 舆情来源 {} · 内部时间 UTC，界面按 UTC+8 显示",
+                snapshot.candidates.len(),
+                snapshot.data_quality * 100.0,
+                if snapshot.sentiment_configured {
+                    "已配置"
+                } else {
+                    "未配置"
+                }
+            ))
+            .color(theme::MUTED),
+        );
+        if !snapshot.sentiment_error.is_empty() {
+            ui.colored_label(
+                theme::RED,
+                format!("舆情源暂不可用：{}", snapshot.sentiment_error),
+            );
+        }
+        if !self.scanner_error.is_empty() {
+            ui.colored_label(theme::RED, &self.scanner_error);
         }
     }
 
@@ -3831,6 +3992,20 @@ fn format_event_time(timestamp: i64) -> String {
         .unwrap_or_else(|| "--".into())
 }
 
+fn format_scanner_time(timestamp: i64) -> String {
+    if timestamp <= 0 {
+        return "--".into();
+    }
+    Utc.timestamp_opt(timestamp, 0)
+        .single()
+        .map(|time| {
+            (time + chrono::Duration::hours(8))
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "--".into())
+}
+
 impl eframe::App for GqtApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
@@ -3877,6 +4052,7 @@ impl eframe::App for GqtApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         let _ = self.market_commands.send(MarketCommand::Stop);
+        let _ = self.scanner_commands.send(ScannerCommand::Stop);
     }
 }
 

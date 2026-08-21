@@ -815,6 +815,10 @@ fn ensure_compound_defaults(config: &mut Value) -> Result<()> {
     root.entry("gqt_compound_pyramid_stake_ratio")
         .or_insert(json!(0.45));
     root.entry("gqt_compound_leverage").or_insert(json!(2));
+    root.entry("gqt_execution_mode").or_insert(json!("paper"));
+    root.entry("gqt_major_leverage_cap").or_insert(json!(50));
+    root.entry("gqt_alt_leverage_cap").or_insert(json!(5));
+    root.entry("gqt_sentiment_required").or_insert(json!(true));
     root.entry("gqt_fee_rate").or_insert(json!(0.0005));
     root.entry("gqt_slippage_rate").or_insert(json!(0.0002));
     root.entry("gqt_min_net_profit").or_insert(json!(0.006));
@@ -853,19 +857,36 @@ fn ensure_ccxt_proxy(config: &mut Value, proxy: Option<&str>) -> Result<()> {
     let root = config
         .as_object_mut()
         .context("Freqtrade config root is invalid")?;
+
     for key in ["ccxt_config", "ccxt_async_config"] {
-        let ccxt = root.entry(key).or_insert_with(|| json!({}));
+        if root.get(key).is_some_and(|value| !value.is_object()) {
+            bail!("legacy {key} config is invalid");
+        }
+    }
+    let legacy_ccxt = ["ccxt_config", "ccxt_async_config"].map(|key| (key, root.remove(key)));
+    let exchange = root
+        .entry("exchange")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("exchange config is invalid")?;
+
+    for (key, legacy) in legacy_ccxt {
+        let ccxt = exchange.entry(key).or_insert_with(|| json!({}));
         let ccxt = ccxt
             .as_object_mut()
             .with_context(|| format!("{key} config is invalid"))?;
+        if let Some(Value::Object(legacy)) = legacy {
+            for (legacy_key, legacy_value) in legacy {
+                if !ccxt.contains_key(&legacy_key) {
+                    ccxt.insert(legacy_key, legacy_value);
+                }
+            }
+        }
+        ccxt.remove("httpProxy");
+        ccxt.remove("httpsProxy");
+        ccxt.remove("aiohttpProxy");
         if let Some(proxy) = proxy {
-            ccxt.insert("httpProxy".into(), json!(proxy));
             ccxt.insert("httpsProxy".into(), json!(proxy));
-            ccxt.insert("aiohttpProxy".into(), json!(proxy));
-        } else {
-            ccxt.remove("httpProxy");
-            ccxt.remove("httpsProxy");
-            ccxt.remove("aiohttpProxy");
         }
     }
     Ok(())
@@ -1040,6 +1061,98 @@ mod tests {
     }
 
     #[test]
+    fn stores_ccxt_proxy_under_exchange_and_migrates_legacy_values() {
+        let mut config = json!({
+            "exchange": {
+                "name": "binance",
+                "ccxt_config": {"enableRateLimit": true},
+                "ccxt_async_config": {"enableRateLimit": true}
+            },
+            "ccxt_config": {
+                "legacyOption": "keep-me",
+                "httpProxy": "http://old-proxy:7890"
+            },
+            "ccxt_async_config": {
+                "legacyAsyncOption": "keep-me-too",
+                "aiohttpProxy": "http://old-proxy:7890"
+            }
+        });
+
+        ensure_ccxt_proxy(&mut config, Some("http://host.docker.internal:7890")).unwrap();
+
+        assert!(config.get("ccxt_config").is_none());
+        assert!(config.get("ccxt_async_config").is_none());
+        assert_eq!(config["exchange"]["ccxt_config"]["enableRateLimit"], true);
+        assert_eq!(config["exchange"]["ccxt_config"]["legacyOption"], "keep-me");
+        assert_eq!(
+            config["exchange"]["ccxt_config"]["httpsProxy"],
+            "http://host.docker.internal:7890"
+        );
+        assert!(config["exchange"]["ccxt_config"].get("httpProxy").is_none());
+        assert!(
+            config["exchange"]["ccxt_config"]
+                .get("aiohttpProxy")
+                .is_none()
+        );
+        assert_eq!(
+            config["exchange"]["ccxt_async_config"]["legacyAsyncOption"],
+            "keep-me-too"
+        );
+        assert_eq!(
+            config["exchange"]["ccxt_async_config"]["httpsProxy"],
+            "http://host.docker.internal:7890"
+        );
+        assert!(
+            config["exchange"]["ccxt_async_config"]
+                .get("httpProxy")
+                .is_none()
+        );
+        assert!(
+            config["exchange"]["ccxt_async_config"]
+                .get("aiohttpProxy")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn removes_only_ccxt_proxy_values_when_proxy_is_unavailable() {
+        let mut config = json!({
+            "exchange": {
+                "name": "binance",
+                "ccxt_config": {
+                    "enableRateLimit": true,
+                    "customOption": 7,
+                    "httpProxy": "http://old-proxy:7890",
+                    "httpsProxy": "http://old-proxy:7890",
+                    "aiohttpProxy": "http://old-proxy:7890"
+                },
+                "ccxt_async_config": {
+                    "enableRateLimit": true,
+                    "customAsyncOption": 9,
+                    "httpProxy": "http://old-proxy:7890",
+                    "httpsProxy": "http://old-proxy:7890",
+                    "aiohttpProxy": "http://old-proxy:7890"
+                }
+            }
+        });
+
+        ensure_ccxt_proxy(&mut config, None).unwrap();
+
+        assert_eq!(config["exchange"]["name"], "binance");
+        for key in ["ccxt_config", "ccxt_async_config"] {
+            assert_eq!(config["exchange"][key]["enableRateLimit"], true);
+            assert!(config["exchange"][key].get("httpProxy").is_none());
+            assert!(config["exchange"][key].get("httpsProxy").is_none());
+            assert!(config["exchange"][key].get("aiohttpProxy").is_none());
+        }
+        assert_eq!(config["exchange"]["ccxt_config"]["customOption"], 7);
+        assert_eq!(
+            config["exchange"]["ccxt_async_config"]["customAsyncOption"],
+            9
+        );
+    }
+
+    #[test]
     fn migrates_legacy_two_symbol_ai_whitelist() {
         let root = std::env::temp_dir().join(format!("gqt-ai-migrate-{}", rand::random::<u64>()));
         let user_data = root.join("user_data");
@@ -1074,7 +1187,10 @@ mod tests {
                 .len(),
             1
         );
-        assert_eq!(config["exchange"]["pair_whitelist"], json!(["BTC/USDT:USDT"]));
+        assert_eq!(
+            config["exchange"]["pair_whitelist"],
+            json!(["BTC/USDT:USDT"])
+        );
         let _ = fs::remove_dir_all(root);
     }
 
