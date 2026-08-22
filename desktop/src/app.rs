@@ -954,7 +954,12 @@ impl GqtApp {
                 Page::Account => self.render_account(ui),
                 Page::PositionHistory => self.render_position_history(ui),
                 Page::EventPrediction => self.render_event_prediction(ui),
-                Page::Market => self.render_market(ui),
+                Page::Market => {
+                    ScrollArea::vertical()
+                        .id_salt("market-page-scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| self.render_market(ui));
+                }
                 Page::Strategy => self.render_strategy(ui),
                 Page::Backtest => self.render_backtest(ui),
                 Page::Data => self.render_data(ui),
