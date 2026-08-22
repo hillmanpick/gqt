@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     thread,
     time::Duration,
@@ -59,6 +59,8 @@ pub struct UniverseSnapshot {
     pub losers: Vec<MarketCandidate>,
     #[serde(default)]
     pub hot: Vec<MarketCandidate>,
+    #[serde(default)]
+    pub rising: Vec<MarketCandidate>,
 }
 
 impl Default for UniverseSnapshot {
@@ -77,6 +79,7 @@ impl Default for UniverseSnapshot {
             gainers: Vec::new(),
             losers: Vec::new(),
             hot: Vec::new(),
+            rising: Vec::new(),
         }
     }
 }
@@ -192,6 +195,7 @@ fn run_worker(
     };
     let mut known_symbols = HashSet::new();
     let mut last_universe_refresh = 0_i64;
+    let mut price_history: HashMap<String, VecDeque<f64>> = HashMap::new();
     let sentiment_config = SentimentFetchConfig::from_env();
     let sentiment_store = SentimentStore::open(&data_root.join("sentiment.sqlite")).ok();
     let mut sentiment_events: Vec<SentimentEvent> = sentiment_store
@@ -213,6 +217,7 @@ fn run_worker(
             &client,
             &mut known_symbols,
             &mut last_universe_refresh,
+            &mut price_history,
             &sentiment_config,
             sentiment_store.as_ref(),
             &mut sentiment_events,
@@ -255,6 +260,7 @@ fn scan_once(
     client: &Client,
     known_symbols: &mut HashSet<String>,
     last_universe_refresh: &mut i64,
+    price_history: &mut HashMap<String, VecDeque<f64>>,
     sentiment_config: &SentimentFetchConfig,
     sentiment_store: Option<&SentimentStore>,
     sentiment_events: &mut Vec<SentimentEvent>,
@@ -326,6 +332,33 @@ fn scan_once(
             })
         })
         .collect::<Vec<_>>();
+    for candidate in &candidates {
+        let history = price_history.entry(candidate.symbol.clone()).or_default();
+        history.push_back(candidate.price);
+        while history.len() > 6 {
+            history.pop_front();
+        }
+    }
+    let mut rising = candidates
+        .iter()
+        .filter(|candidate| {
+            price_history.get(&candidate.symbol).is_some_and(|history| {
+                history.len() >= 3
+                    && history
+                        .iter()
+                        .zip(history.iter().skip(1))
+                        .all(|(previous, current)| current > previous)
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    rising.sort_by(|left, right| {
+        right
+            .change_percent
+            .partial_cmp(&left.change_percent)
+            .unwrap_or(Ordering::Equal)
+    });
+    rising.truncate(10);
     let mut gainers = candidates.clone();
     gainers.sort_by(|left, right| {
         right
@@ -431,6 +464,7 @@ fn scan_once(
         gainers,
         losers,
         hot,
+        rising,
     })
 }
 

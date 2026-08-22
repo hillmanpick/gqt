@@ -123,6 +123,7 @@ pub struct GqtApp {
     scanner_snapshot: UniverseSnapshot,
     scanner_connected: bool,
     scanner_error: String,
+    scanner_search: String,
     strategy_source: String,
     strategy_state: String,
     stake_amount: f64,
@@ -362,6 +363,7 @@ impl GqtApp {
             scanner_snapshot: UniverseSnapshot::default(),
             scanner_connected: false,
             scanner_error: String::new(),
+            scanner_search: String::new(),
             strategy_source,
             strategy_state: "未修改".into(),
             stake_amount,
@@ -1931,12 +1933,17 @@ impl GqtApp {
     }
 
     fn render_scanner_panel(&mut self, ui: &mut Ui) {
-        let snapshot = &self.scanner_snapshot;
+        let snapshot = self.scanner_snapshot.clone();
+        let mut selected_symbol = None;
         ui.horizontal(|ui| {
             section_title(
                 ui,
                 "全市场扫描",
-                &format!("{} 个 USDT 永续", snapshot.total_symbols),
+                &format!(
+                    "{} 个 USDT 永续 · 更新 {}",
+                    snapshot.total_symbols,
+                    format_scanner_time_with_zone(snapshot.updated_at)
+                ),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.colored_label(
@@ -2049,15 +2056,47 @@ impl GqtApp {
                     RichText::new("按综合评分排序，持仓量仅对前 12 个高流动性合约请求")
                         .color(theme::MUTED),
                 );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add_enabled(
+                            !self.scanner_search.is_empty(),
+                            theme::secondary_button("清除"),
+                        )
+                        .clicked()
+                    {
+                        self.scanner_search.clear();
+                    }
+                    ui.add_sized(
+                        [210.0, 30.0],
+                        TextEdit::singleline(&mut self.scanner_search)
+                            .hint_text("搜索 BTC、ETH 或合约代码"),
+                    );
+                    ui.label(RichText::new("搜索").color(theme::MUTED));
+                });
             });
+            let query = self.scanner_search.trim().to_ascii_uppercase();
+            let filtered_candidates = snapshot
+                .candidates
+                .iter()
+                .filter(|candidate| query.is_empty() || candidate.symbol.contains(&query))
+                .collect::<Vec<_>>();
+            ui.label(
+                RichText::new(format!(
+                    "显示 {} / {} 个 · 点击交易对切换上方 K 线",
+                    filtered_candidates.len(),
+                    snapshot.candidates.len()
+                ))
+                .color(theme::MUTED),
+            );
             ScrollArea::both()
                 .id_salt("scanner-market-table")
                 .max_height(390.0)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    ui.set_min_width(980.0);
                     egui::Grid::new("scanner-market-grid")
                         .striped(true)
-                        .min_col_width(72.0)
+                        .min_col_width(92.0)
                         .show(ui, |ui| {
                             for heading in [
                                 "交易对",
@@ -2072,8 +2111,16 @@ impl GqtApp {
                                 ui.label(RichText::new(heading).strong().color(theme::MUTED));
                             }
                             ui.end_row();
-                            for candidate in &snapshot.candidates {
-                                ui.label(RichText::new(&candidate.symbol).strong());
+                            for candidate in filtered_candidates {
+                                if ui
+                                    .selectable_label(
+                                        self.symbol == candidate.symbol,
+                                        RichText::new(&candidate.symbol).strong(),
+                                    )
+                                    .clicked()
+                                {
+                                    selected_symbol = Some(candidate.symbol.clone());
+                                }
                                 ui.label(&candidate.category);
                                 ui.label(format_price(candidate.price));
                                 let change_color = if candidate.change_percent > 0.0 {
@@ -2113,7 +2160,7 @@ impl GqtApp {
                         });
                 });
         }
-        self.render_scanner_rankings(ui, snapshot);
+        self.render_scanner_rankings(ui, &snapshot);
         ui.add_space(4.0);
         ui.label(
             RichText::new(format!(
@@ -2137,9 +2184,15 @@ impl GqtApp {
         if !self.scanner_error.is_empty() {
             ui.colored_label(theme::RED, &self.scanner_error);
         }
+        if let Some(symbol) = selected_symbol
+            && self.symbol != symbol
+        {
+            self.symbol = symbol;
+            self.select_market();
+        }
     }
 
-    fn render_scanner_rankings(&self, ui: &mut Ui, snapshot: &UniverseSnapshot) {
+    fn render_scanner_rankings(&mut self, ui: &mut Ui, snapshot: &UniverseSnapshot) {
         ui.add_space(10.0);
         ui.label(RichText::new("市场榜单").color(theme::MUTED));
         ui.columns(3, |columns| {
@@ -2175,6 +2228,34 @@ impl GqtApp {
                     });
             }
         });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("持续上涨监测").strong().color(theme::GREEN));
+            ui.label(RichText::new("最近至少 3 次扫描价格连续上升").color(theme::MUTED));
+        });
+        if snapshot.rising.is_empty() {
+            ui.label(RichText::new("正在积累连续上涨样本...").color(theme::MUTED));
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                for row in snapshot.rising.iter().take(10) {
+                    if ui
+                        .selectable_label(
+                            self.symbol == row.symbol,
+                            format!(
+                                "{} {} {:+.2}%",
+                                row.symbol,
+                                format_price(row.price),
+                                row.change_percent
+                            ),
+                        )
+                        .clicked()
+                    {
+                        self.symbol = row.symbol.clone();
+                        self.select_market();
+                    }
+                }
+            });
+        }
     }
 
     fn render_strategy(&mut self, ui: &mut Ui) {
@@ -4132,6 +4213,20 @@ fn compact_scanner_volume(value: f64) -> String {
     } else {
         format!("{value:.0}")
     }
+}
+
+fn format_scanner_time_with_zone(timestamp: i64) -> String {
+    if timestamp <= 0 {
+        return "-- UTC+8".into();
+    }
+    Utc.timestamp_opt(timestamp, 0)
+        .single()
+        .map(|time| {
+            (time + chrono::Duration::hours(8))
+                .format("%m-%d %H:%M:%S UTC+8")
+                .to_string()
+        })
+        .unwrap_or_else(|| "-- UTC+8".into())
 }
 
 impl eframe::App for GqtApp {
