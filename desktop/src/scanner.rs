@@ -53,6 +53,12 @@ pub struct UniverseSnapshot {
     pub sentiment_updated_at: i64,
     pub sentiment_error: String,
     pub headlines: Vec<SentimentHeadline>,
+    #[serde(default)]
+    pub gainers: Vec<MarketCandidate>,
+    #[serde(default)]
+    pub losers: Vec<MarketCandidate>,
+    #[serde(default)]
+    pub hot: Vec<MarketCandidate>,
 }
 
 impl Default for UniverseSnapshot {
@@ -68,6 +74,9 @@ impl Default for UniverseSnapshot {
             sentiment_updated_at: 0,
             sentiment_error: String::new(),
             headlines: Vec::new(),
+            gainers: Vec::new(),
+            losers: Vec::new(),
+            hot: Vec::new(),
         }
     }
 }
@@ -317,15 +326,42 @@ fn scan_once(
             })
         })
         .collect::<Vec<_>>();
+    let mut gainers = candidates.clone();
+    gainers.sort_by(|left, right| {
+        right
+            .change_percent
+            .partial_cmp(&left.change_percent)
+            .unwrap_or(Ordering::Equal)
+    });
+    gainers.truncate(10);
+
+    let mut losers = candidates.clone();
+    losers.sort_by(|left, right| {
+        left.change_percent
+            .partial_cmp(&right.change_percent)
+            .unwrap_or(Ordering::Equal)
+    });
+    losers.truncate(10);
+
+    let mut hot = candidates.clone();
+    hot.sort_by(|left, right| {
+        let left_hot =
+            left.quote_volume.max(1.0).log10() * 0.55 + left.change_percent.abs().min(50.0) * 0.45;
+        let right_hot = right.quote_volume.max(1.0).log10() * 0.55
+            + right.change_percent.abs().min(50.0) * 0.45;
+        right_hot.partial_cmp(&left_hot).unwrap_or(Ordering::Equal)
+    });
+    hot.truncate(10);
+
     candidates.sort_by(|left, right| {
         right
             .market_score
             .partial_cmp(&left.market_score)
             .unwrap_or(Ordering::Equal)
     });
-    candidates.truncate(40);
 
-    // Enrich only the most liquid candidates to stay within Binance request weight.
+    // Keep the full universe in the snapshot. Enrich only the most liquid rows
+    // to stay within Binance request weight while still exposing every ticker.
     for candidate in candidates.iter_mut().take(12) {
         if let Ok(open_interest) = fetch_open_interest(client, &candidate.symbol) {
             candidate.open_interest = open_interest;
@@ -392,6 +428,9 @@ fn scan_once(
         sentiment_updated_at: *last_sentiment_fetch,
         sentiment_error,
         headlines,
+        gainers,
+        losers,
+        hot,
     })
 }
 

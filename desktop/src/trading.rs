@@ -132,7 +132,7 @@ impl TradingWorkspace {
             });
         } else if config["strategy"].as_str() == Some("AiSignalStrategy") {
             config["strategy"] = json!("FuturesFactorStrategy");
-            config["timeframe"] = json!("15m");
+            config["timeframe"] = json!("5m");
             config["margin_mode"] = json!("isolated");
         }
         write_json_atomic(&self.config, &config).context("无法同步 Freqtrade 交易白名单")?;
@@ -819,6 +819,10 @@ fn ensure_compound_defaults(config: &mut Value) -> Result<()> {
     root.entry("gqt_major_leverage_cap").or_insert(json!(50));
     root.entry("gqt_alt_leverage_cap").or_insert(json!(5));
     root.entry("gqt_sentiment_required").or_insert(json!(true));
+    root.entry("gqt_paper_data_collection")
+        .or_insert(json!(true));
+    root.entry("gqt_paper_collection_hold_minutes")
+        .or_insert(json!(3));
     root.entry("gqt_fee_rate").or_insert(json!(0.0005));
     root.entry("gqt_slippage_rate").or_insert(json!(0.0002));
     root.entry("gqt_min_net_profit").or_insert(json!(0.006));

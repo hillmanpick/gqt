@@ -152,7 +152,7 @@ class FuturesFactorStrategy(IStrategy):
 
     INTERFACE_VERSION = 3
     can_short = True
-    timeframe = "15m"
+    timeframe = "5m"
     process_only_new_candles = False
     startup_candle_count = 320
 
@@ -175,6 +175,8 @@ class FuturesFactorStrategy(IStrategy):
 
     @property
     def protections(self) -> list[dict]:
+        if self._paper_data_collection_enabled():
+            return []
         return [
             {
                 "method": "CooldownPeriod",
@@ -258,6 +260,16 @@ class FuturesFactorStrategy(IStrategy):
             isinstance(runtime_config, dict)
             and runtime_config.get("dry_run") is True
             and self._profile_bool("gqt_continuous_dry_run_entries", False)
+        )
+
+    def _paper_data_collection_enabled(self) -> bool:
+        runtime_config = getattr(self, "config", {})
+        return (
+            isinstance(runtime_config, dict)
+            and runtime_config.get("dry_run") is True
+            and str(self._settings().get("gqt_execution_mode", "paper")).strip().lower()
+            == "paper"
+            and self._profile_bool("gqt_paper_data_collection", True)
         )
 
     def _cost_leverage(self) -> float:
@@ -462,6 +474,8 @@ class FuturesFactorStrategy(IStrategy):
         return (equity + extra_profit_abs - start_balance) / start_balance
 
     def _daily_target_reached(self, current_time: datetime, extra_profit_abs: float = 0.0) -> bool:
+        if self._paper_data_collection_enabled():
+            return False
         if not self._profile_bool("gqt_daily_profit_lock_enabled", True):
             return False
         state = self._daily_lock_state(current_time)
@@ -933,6 +947,17 @@ class FuturesFactorStrategy(IStrategy):
         extra_profit = self._trade_profit_abs(trade, current_profit)
         if force_exit and self._daily_target_reached(current_time, extra_profit):
             return "daily_profit_target_lock"
+
+        if self._paper_data_collection_enabled():
+            open_date = getattr(trade, "open_date_utc", None)
+            if open_date is not None:
+                open_date = self._as_utc(open_date)
+                hold_minutes = max(
+                    1.0,
+                    self._profile_float("gqt_paper_collection_hold_minutes", 3.0),
+                )
+                if (self._as_utc(current_time) - open_date).total_seconds() >= hold_minutes * 60.0:
+                    return "paper_data_collection_roll"
 
         take_profit = self._take_profit_target()
         stop_loss = self._profile_float("gqt_compound_stop_loss", 0.014)

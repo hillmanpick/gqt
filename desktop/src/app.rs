@@ -2036,6 +2036,79 @@ impl GqtApp {
                 });
             }
         }
+        if !snapshot.candidates.is_empty() {
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("全币种行情").color(theme::MUTED));
+                ui.label(
+                    RichText::new("按综合评分排序，持仓量仅对前 12 个高流动性合约请求")
+                        .color(theme::MUTED),
+                );
+            });
+            ScrollArea::both()
+                .id_salt("scanner-market-table")
+                .max_height(390.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui::Grid::new("scanner-market-grid")
+                        .striped(true)
+                        .min_col_width(72.0)
+                        .show(ui, |ui| {
+                            for heading in [
+                                "交易对",
+                                "分类",
+                                "价格",
+                                "24h涨跌",
+                                "成交额",
+                                "资金费率",
+                                "舆情",
+                                "评分",
+                            ] {
+                                ui.label(RichText::new(heading).strong().color(theme::MUTED));
+                            }
+                            ui.end_row();
+                            for candidate in &snapshot.candidates {
+                                ui.label(RichText::new(&candidate.symbol).strong());
+                                ui.label(&candidate.category);
+                                ui.label(format_price(candidate.price));
+                                let change_color = if candidate.change_percent > 0.0 {
+                                    theme::GREEN
+                                } else if candidate.change_percent < 0.0 {
+                                    theme::RED
+                                } else {
+                                    theme::MUTED
+                                };
+                                ui.colored_label(
+                                    change_color,
+                                    format!("{:+.2}%", candidate.change_percent),
+                                );
+                                ui.label(compact_scanner_volume(candidate.quote_volume));
+                                ui.label(format!("{:+.4}%", candidate.funding_rate * 100.0));
+                                let sentiment_color = if candidate.sentiment_score > 0.15 {
+                                    theme::GREEN
+                                } else if candidate.sentiment_score < -0.15 {
+                                    theme::RED
+                                } else {
+                                    theme::MUTED
+                                };
+                                ui.colored_label(
+                                    sentiment_color,
+                                    if candidate.sentiment_event_count == 0 {
+                                        "--".into()
+                                    } else {
+                                        format!(
+                                            "{} {:.2}",
+                                            candidate.sentiment_label, candidate.sentiment_score
+                                        )
+                                    },
+                                );
+                                ui.label(format!("{:.1}", candidate.market_score));
+                                ui.end_row();
+                            }
+                        });
+                });
+        }
+        self.render_scanner_rankings(ui, snapshot);
         ui.add_space(4.0);
         ui.label(
             RichText::new(format!(
@@ -2059,6 +2132,43 @@ impl GqtApp {
         if !self.scanner_error.is_empty() {
             ui.colored_label(theme::RED, &self.scanner_error);
         }
+    }
+
+    fn render_scanner_rankings(&self, ui: &mut Ui, snapshot: &UniverseSnapshot) {
+        ui.add_space(10.0);
+        ui.label(RichText::new("市场榜单").color(theme::MUTED));
+        ui.columns(3, |columns| {
+            let sections = [
+                ("涨幅榜", &snapshot.gainers, theme::GREEN),
+                ("跌幅榜", &snapshot.losers, theme::RED),
+                ("热门榜", &snapshot.hot, theme::YELLOW),
+            ];
+            for (column, (title, rows, accent)) in columns.iter_mut().zip(sections) {
+                Frame::NONE
+                    .fill(Color32::from_rgb(12, 16, 19))
+                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .corner_radius(3)
+                    .inner_margin(Margin::same(8))
+                    .show(column, |ui| {
+                        ui.label(RichText::new(title).strong().color(accent));
+                        for row in rows.iter().take(10) {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&row.symbol).strong());
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.colored_label(
+                                        if row.change_percent >= 0.0 {
+                                            theme::GREEN
+                                        } else {
+                                            theme::RED
+                                        },
+                                        format!("{:+.2}%", row.change_percent),
+                                    );
+                                });
+                            });
+                        }
+                    });
+            }
+        });
     }
 
     fn render_strategy(&mut self, ui: &mut Ui) {
@@ -4004,6 +4114,18 @@ fn format_scanner_time(timestamp: i64) -> String {
                 .to_string()
         })
         .unwrap_or_else(|| "--".into())
+}
+
+fn compact_scanner_volume(value: f64) -> String {
+    if value >= 1_000_000_000.0 {
+        format!("{:.1}B", value / 1_000_000_000.0)
+    } else if value >= 1_000_000.0 {
+        format!("{:.1}M", value / 1_000_000.0)
+    } else if value >= 1_000.0 {
+        format!("{:.1}K", value / 1_000.0)
+    } else {
+        format!("{value:.0}")
+    }
 }
 
 impl eframe::App for GqtApp {

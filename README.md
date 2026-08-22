@@ -15,6 +15,7 @@ GQT Trader 是面向 Binance USDT-M 永续合约的 Windows 原生量化客户�
 - Docker、Python、回测和日志任务均以 Windows 隐藏后台进程运行
 - Freqtrade 数据同步、回测、策略启动、停止、日志与 Dry-run 异常恢复
 - 全币种 USDT 永续扫描、新闻/X 舆情去重、来源可信度、时间衰减与综合推荐
+- 全币种行情表、涨幅榜、跌幅榜和热门榜
 - 模拟盘与实盘模式切换；启用和启动实盘均需在客户端二次确认
 - 模拟与实盘分别使用独立 SQLite 交易数据库，成交记录不会混合
 - 仓位、最大持仓数和爆仓缓冲风控
@@ -60,6 +61,7 @@ cargo build --release --manifest-path desktop\Cargo.toml
 - Binance Key 应关闭提现权限，并只授予合约交易所需权限。
 - `desktop/target/`、`desktop/dist/`、交易数据库、日志和回测结果不会提交到 Git。
 - 自动恢复只作用于 Dry-run Freqtrade 容器，不会切换为实盘。
+- 模拟盘数据采集模式仅在 `dry_run=true` 时生效，会使用短周期和小额模拟仓位持续收集开平仓样本；实盘不会启用该模式。
 - Freqtrade 旧配置会自动迁移到当前 schema；实盘模式不会自动恢复或静默启动。
 
 ## 实时新闻与舆情

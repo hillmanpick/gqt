@@ -3,7 +3,7 @@
   "strategy": "FuturesFactorStrategy",
   "max_open_trades": 5,
   "stake_currency": "USDT",
-  "stake_amount": 120,
+  "stake_amount": 20,
   "tradable_balance_ratio": 0.9,
   "fiat_display_currency": "USD",
   "dry_run": true,
@@ -17,7 +17,9 @@
   "gqt_major_leverage_cap": 50,
   "gqt_alt_leverage_cap": 5,
   "gqt_sentiment_required": true,
-  "gqt_max_stake_amount": 120,
+  "gqt_max_stake_amount": 20,
+  "gqt_paper_data_collection": true,
+  "gqt_paper_collection_hold_minutes": 3,
   "gqt_risk_reward_ratio": 1,
   "gqt_ai_risk_sizing": false,
   "gqt_compound_enabled": true,
@@ -42,7 +44,7 @@
   },
   "stoploss": -0.045,
   "trailing_stop": false,
-  "timeframe": "15m",
+  "timeframe": "5m",
   "unfilledtimeout": {
     "entry": 4,
     "exit": 4,
@@ -92,7 +94,16 @@
       "httpsProxy": "http://host.docker.internal:7890"
     },
     "pair_whitelist": [
-      "BTC/USDT:USDT"
+      "BTC/USDT:USDT",
+      "ETH/USDT:USDT",
+      "BNB/USDT:USDT",
+      "SOL/USDT:USDT",
+      "XRP/USDT:USDT",
+      "DOGE/USDT:USDT",
+      "ADA/USDT:USDT",
+      "AVAX/USDT:USDT",
+      "LINK/USDT:USDT",
+      "SUI/USDT:USDT"
     ],
     "pair_blacklist": []
   },
