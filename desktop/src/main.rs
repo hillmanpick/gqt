@@ -21,7 +21,11 @@ use std::sync::Arc;
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
+        // Ignore stale native window geometry (for example a minimized `0x0`
+        // state) so the client always opens at a usable size.
+        persist_window: false,
         viewport: egui::ViewportBuilder::default()
+            .with_app_id("gqt-trader-v2")
             .with_title("GQT Trader")
             .with_icon(app_icon())
             .with_inner_size([1440.0, 900.0])

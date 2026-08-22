@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::{Datelike, Local, TimeZone, Utc};
+use chrono::{Datelike, FixedOffset, TimeZone, Utc};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use directories::ProjectDirs;
 use eframe::egui::{
@@ -64,14 +64,15 @@ impl EquityRange {
     }
 
     fn cutoff(self) -> i64 {
-        let now = Local::now();
+        let zone = utc8_offset();
+        let now = Utc::now().with_timezone(&zone);
         match self {
-            EquityRange::Today => Local
+            EquityRange::Today => zone
                 .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
                 .single()
                 .map(|time| time.timestamp())
                 .unwrap_or_else(|| now.timestamp() - 24 * 60 * 60),
-            EquityRange::Month => Local
+            EquityRange::Month => zone
                 .with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
                 .single()
                 .map(|time| time.timestamp())
@@ -915,8 +916,7 @@ impl GqtApp {
                             .corner_radius(5)
                             .inner_margin(Margin::symmetric(13, 7))
                             .show(ui, |ui| {
-                                ui.set_min_width(118.0);
-                                ui.vertical_centered(|ui| {
+                                ui.horizontal(|ui| {
                                     ui.label(
                                         RichText::new(if self.dry_run {
                                             "模拟盘"
@@ -931,6 +931,7 @@ impl GqtApp {
                                         })
                                         .strong(),
                                     );
+                                    ui.separator();
                                     ui.label(
                                         RichText::new(state_label)
                                             .size(11.0)
@@ -1940,7 +1941,7 @@ impl GqtApp {
                 ui,
                 "全市场扫描",
                 &format!(
-                    "{} 个 USDT 永续 · 更新 {}",
+                    "{} 个 Binance USDT 交易对 · 更新 {}",
                     snapshot.total_symbols,
                     format_scanner_time_with_zone(snapshot.updated_at)
                 ),
@@ -2051,28 +2052,34 @@ impl GqtApp {
         if !snapshot.candidates.is_empty() {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("全币种行情").color(theme::MUTED));
+                ui.label(RichText::new("全币种行情").strong());
                 ui.label(
-                    RichText::new("按综合评分排序，持仓量仅对前 12 个高流动性合约请求")
+                    RichText::new("按综合评分排序 · 点击交易对查看 K 线")
+                        .size(12.0)
                         .color(theme::MUTED),
                 );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .add_enabled(
-                            !self.scanner_search.is_empty(),
-                            theme::secondary_button("清除"),
-                        )
-                        .clicked()
-                    {
-                        self.scanner_search.clear();
-                    }
-                    ui.add_sized(
-                        [210.0, 30.0],
-                        TextEdit::singleline(&mut self.scanner_search)
-                            .hint_text("搜索 BTC、ETH 或合约代码"),
-                    );
-                    ui.label(RichText::new("搜索").color(theme::MUTED));
-                });
+            });
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("搜索").color(theme::MUTED));
+                ui.add_sized(
+                    [250.0, 30.0],
+                    TextEdit::singleline(&mut self.scanner_search).hint_text("BTC、ETH 或合约代码"),
+                );
+                if ui
+                    .add_enabled(
+                        !self.scanner_search.is_empty(),
+                        theme::secondary_button("清除"),
+                    )
+                    .clicked()
+                {
+                    self.scanner_search.clear();
+                }
+                ui.label(
+                    RichText::new("持仓量仅对前 12 个高流动性合约请求")
+                        .size(12.0)
+                        .color(theme::MUTED),
+                );
             });
             let query = self.scanner_search.trim().to_ascii_uppercase();
             let filtered_candidates = snapshot
@@ -2088,75 +2095,91 @@ impl GqtApp {
                 ))
                 .color(theme::MUTED),
             );
-            ScrollArea::both()
-                .id_salt("scanner-market-table")
-                .max_height(390.0)
-                .auto_shrink([false, false])
+            Frame::NONE
+                .fill(theme::SURFACE)
+                .stroke(Stroke::new(1.0, theme::BORDER))
+                .corner_radius(4)
+                .inner_margin(Margin::same(8))
                 .show(ui, |ui| {
-                    ui.set_min_width(980.0);
-                    egui::Grid::new("scanner-market-grid")
-                        .striped(true)
-                        .min_col_width(92.0)
+                    ScrollArea::both()
+                        .id_salt("scanner-market-table")
+                        .min_scrolled_height(210.0)
+                        .max_height(360.0)
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            for heading in [
-                                "交易对",
-                                "分类",
-                                "价格",
-                                "24h涨跌",
-                                "成交额",
-                                "资金费率",
-                                "舆情",
-                                "评分",
-                            ] {
-                                ui.label(RichText::new(heading).strong().color(theme::MUTED));
-                            }
-                            ui.end_row();
-                            for candidate in filtered_candidates {
-                                if ui
-                                    .selectable_label(
-                                        self.symbol == candidate.symbol,
-                                        RichText::new(&candidate.symbol).strong(),
-                                    )
-                                    .clicked()
-                                {
-                                    selected_symbol = Some(candidate.symbol.clone());
-                                }
-                                ui.label(&candidate.category);
-                                ui.label(format_price(candidate.price));
-                                let change_color = if candidate.change_percent > 0.0 {
-                                    theme::GREEN
-                                } else if candidate.change_percent < 0.0 {
-                                    theme::RED
-                                } else {
-                                    theme::MUTED
-                                };
-                                ui.colored_label(
-                                    change_color,
-                                    format!("{:+.2}%", candidate.change_percent),
-                                );
-                                ui.label(compact_scanner_volume(candidate.quote_volume));
-                                ui.label(format!("{:+.4}%", candidate.funding_rate * 100.0));
-                                let sentiment_color = if candidate.sentiment_score > 0.15 {
-                                    theme::GREEN
-                                } else if candidate.sentiment_score < -0.15 {
-                                    theme::RED
-                                } else {
-                                    theme::MUTED
-                                };
-                                ui.colored_label(
-                                    sentiment_color,
-                                    if candidate.sentiment_event_count == 0 {
-                                        "--".into()
-                                    } else {
-                                        format!(
-                                            "{} {:.2}",
-                                            candidate.sentiment_label, candidate.sentiment_score
-                                        )
-                                    },
-                                );
-                                ui.label(format!("{:.1}", candidate.market_score));
-                                ui.end_row();
-                            }
+                            ui.set_min_width(920.0);
+                            egui::Grid::new("scanner-market-grid")
+                                .striped(true)
+                                .min_col_width(92.0)
+                                .show(ui, |ui| {
+                                    for heading in [
+                                        "交易对",
+                                        "市场",
+                                        "分类",
+                                        "价格",
+                                        "24h涨跌",
+                                        "成交额",
+                                        "资金费率",
+                                        "舆情",
+                                        "评分",
+                                    ] {
+                                        ui.label(
+                                            RichText::new(heading).strong().color(theme::MUTED),
+                                        );
+                                    }
+                                    ui.end_row();
+                                    for candidate in filtered_candidates {
+                                        if ui
+                                            .selectable_label(
+                                                self.symbol == candidate.symbol,
+                                                RichText::new(&candidate.symbol).strong(),
+                                            )
+                                            .clicked()
+                                        {
+                                            selected_symbol = Some(candidate.symbol.clone());
+                                        }
+                                        ui.label(&candidate.market);
+                                        ui.label(&candidate.category);
+                                        ui.label(format_price(candidate.price));
+                                        let change_color = if candidate.change_percent > 0.0 {
+                                            theme::GREEN
+                                        } else if candidate.change_percent < 0.0 {
+                                            theme::RED
+                                        } else {
+                                            theme::MUTED
+                                        };
+                                        ui.colored_label(
+                                            change_color,
+                                            format!("{:+.2}%", candidate.change_percent),
+                                        );
+                                        ui.label(compact_scanner_volume(candidate.quote_volume));
+                                        ui.label(format!(
+                                            "{:+.4}%",
+                                            candidate.funding_rate * 100.0
+                                        ));
+                                        let sentiment_color = if candidate.sentiment_score > 0.15 {
+                                            theme::GREEN
+                                        } else if candidate.sentiment_score < -0.15 {
+                                            theme::RED
+                                        } else {
+                                            theme::MUTED
+                                        };
+                                        ui.colored_label(
+                                            sentiment_color,
+                                            if candidate.sentiment_event_count == 0 {
+                                                "--".into()
+                                            } else {
+                                                format!(
+                                                    "{} {:.2}",
+                                                    candidate.sentiment_label,
+                                                    candidate.sentiment_score
+                                                )
+                                            },
+                                        );
+                                        ui.label(format!("{:.1}", candidate.market_score));
+                                        ui.end_row();
+                                    }
+                                });
                         });
                 });
         }
@@ -2164,7 +2187,7 @@ impl GqtApp {
         ui.add_space(4.0);
         ui.label(
             RichText::new(format!(
-                "候选池 {} 个 · 数据质量 {:.0}% · 舆情来源 {} · 内部时间 UTC，界面按 UTC+8 显示",
+                "候选池 {} 个（U本位 + 现货） · 数据质量 {:.0}% · 舆情来源 {} · 时间 UTC+8",
                 snapshot.candidates.len(),
                 snapshot.data_quality * 100.0,
                 if snapshot.sentiment_configured {
@@ -2194,25 +2217,32 @@ impl GqtApp {
 
     fn render_scanner_rankings(&mut self, ui: &mut Ui, snapshot: &UniverseSnapshot) {
         ui.add_space(10.0);
-        ui.label(RichText::new("市场榜单").color(theme::MUTED));
-        ui.columns(3, |columns| {
-            let sections = [
-                ("涨幅榜", &snapshot.gainers, theme::GREEN),
-                ("跌幅榜", &snapshot.losers, theme::RED),
-                ("热门榜", &snapshot.hot, theme::YELLOW),
-            ];
-            for (column, (title, rows, accent)) in columns.iter_mut().zip(sections) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("市场榜单").strong());
+            ui.label(
+                RichText::new("按 24h 表现和成交活跃度排序")
+                    .size(12.0)
+                    .color(theme::MUTED),
+            );
+        });
+        let render_ranking =
+            |ui: &mut Ui, title: &str, rows: &[scanner::MarketCandidate], accent: Color32| {
                 Frame::NONE
-                    .fill(Color32::from_rgb(12, 16, 19))
+                    .fill(theme::SURFACE)
                     .stroke(Stroke::new(1.0, theme::BORDER))
-                    .corner_radius(3)
-                    .inner_margin(Margin::same(8))
-                    .show(column, |ui| {
+                    .corner_radius(4)
+                    .inner_margin(Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_min_height(226.0);
                         ui.label(RichText::new(title).strong().color(accent));
-                        for row in rows.iter().take(10) {
+                        ui.add_space(4.0);
+                        if rows.is_empty() {
+                            ui.label(RichText::new("暂无数据").color(theme::MUTED));
+                        }
+                        for row in rows.iter().take(7) {
                             ui.horizontal(|ui| {
+                                ui.set_min_width(ui.available_width());
                                 ui.label(RichText::new(&row.symbol).strong());
-                                ui.label(format_price(row.price));
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     ui.colored_label(
                                         if row.change_percent >= 0.0 {
@@ -2222,40 +2252,63 @@ impl GqtApp {
                                         },
                                         format!("{:+.2}%", row.change_percent),
                                     );
+                                    ui.add_space(10.0);
+                                    ui.label(
+                                        RichText::new(format_price(row.price)).color(theme::MUTED),
+                                    );
                                 });
                             });
                         }
                     });
-            }
+            };
+        ui.columns(2, |columns| {
+            render_ranking(&mut columns[0], "涨幅榜", &snapshot.gainers, theme::GREEN);
+            render_ranking(&mut columns[1], "跌幅榜", &snapshot.losers, theme::RED);
         });
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("持续上涨监测").strong().color(theme::GREEN));
-            ui.label(RichText::new("最近至少 3 次扫描价格连续上升").color(theme::MUTED));
-        });
-        if snapshot.rising.is_empty() {
-            ui.label(RichText::new("正在积累连续上涨样本...").color(theme::MUTED));
-        } else {
-            ui.horizontal_wrapped(|ui| {
-                for row in snapshot.rising.iter().take(10) {
-                    if ui
-                        .selectable_label(
-                            self.symbol == row.symbol,
-                            format!(
-                                "{} {} {:+.2}%",
-                                row.symbol,
-                                format_price(row.price),
-                                row.change_percent
-                            ),
-                        )
-                        .clicked()
-                    {
-                        self.symbol = row.symbol.clone();
-                        self.select_market();
+        ui.columns(2, |columns| {
+            render_ranking(&mut columns[0], "热门榜", &snapshot.hot, theme::YELLOW);
+            Frame::NONE
+                .fill(theme::SURFACE)
+                .stroke(Stroke::new(1.0, theme::BORDER))
+                .corner_radius(4)
+                .inner_margin(Margin::same(10))
+                .show(&mut columns[1], |ui| {
+                    ui.set_min_height(226.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("持续上涨监测").strong().color(theme::GREEN));
+                        ui.label(
+                            RichText::new("连续 3 次扫描上升")
+                                .size(12.0)
+                                .color(theme::MUTED),
+                        );
+                    });
+                    ui.add_space(4.0);
+                    if snapshot.rising.is_empty() {
+                        ui.label(RichText::new("正在积累连续上涨样本...").color(theme::MUTED));
+                    } else {
+                        ui.vertical(|ui| {
+                            for row in snapshot.rising.iter().take(7) {
+                                if ui
+                                    .selectable_label(
+                                        self.symbol == row.symbol,
+                                        format!(
+                                            "{}  {}  {:+.2}%",
+                                            row.symbol,
+                                            format_price(row.price),
+                                            row.change_percent
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    self.symbol = row.symbol.clone();
+                                    self.select_market();
+                                }
+                            }
+                        });
                     }
-                }
-            });
-        }
+                });
+        });
     }
 
     fn render_strategy(&mut self, ui: &mut Ui) {
@@ -4171,10 +4224,13 @@ fn save_equity_history(path: &PathBuf, points: &[EquityPoint]) -> std::io::Resul
 }
 
 fn format_equity_time(timestamp: i64) -> String {
-    Local
-        .timestamp_opt(timestamp, 0)
+    Utc.timestamp_opt(timestamp, 0)
         .single()
-        .map(|time| time.format("%m-%d %H:%M").to_string())
+        .map(|time| {
+            time.with_timezone(&utc8_offset())
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
         .unwrap_or_else(|| "--".into())
 }
 
@@ -4182,11 +4238,18 @@ fn format_event_time(timestamp: i64) -> String {
     if timestamp <= 0 {
         return "--".into();
     }
-    Local
-        .timestamp_opt(timestamp, 0)
+    Utc.timestamp_opt(timestamp, 0)
         .single()
-        .map(|time| time.format("%m-%d %H:%M").to_string())
+        .map(|time| {
+            time.with_timezone(&utc8_offset())
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
         .unwrap_or_else(|| "--".into())
+}
+
+fn utc8_offset() -> FixedOffset {
+    FixedOffset::east_opt(8 * 60 * 60).expect("UTC+8 is a valid fixed offset")
 }
 
 fn format_scanner_time(timestamp: i64) -> String {

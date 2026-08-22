@@ -22,6 +22,7 @@ use crate::{
 };
 
 const BINANCE_BASE: &str = "https://fapi.binance.com";
+const BINANCE_SPOT_BASE: &str = "https://api.binance.com";
 const POLL_INTERVAL: Duration = Duration::from_secs(15);
 const MAJOR_SYMBOLS: &[&str] = &[
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "TRXUSDT",
@@ -98,6 +99,8 @@ pub struct SentimentHeadline {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketCandidate {
     pub symbol: String,
+    #[serde(default)]
+    pub market: String,
     pub category: String,
     pub price: f64,
     pub change_percent: f64,
@@ -164,6 +167,7 @@ struct ExchangeSymbol {
     status: String,
     #[serde(rename = "quoteAsset")]
     quote_asset: String,
+    #[serde(default)]
     #[serde(rename = "contractType")]
     contract_type: String,
 }
@@ -194,6 +198,8 @@ fn run_worker(
         }
     };
     let mut known_symbols = HashSet::new();
+    let mut futures_symbols = HashSet::new();
+    let mut spot_symbols = HashSet::new();
     let mut last_universe_refresh = 0_i64;
     let mut price_history: HashMap<String, VecDeque<f64>> = HashMap::new();
     let sentiment_config = SentimentFetchConfig::from_env();
@@ -216,6 +222,8 @@ fn run_worker(
         match scan_once(
             &client,
             &mut known_symbols,
+            &mut futures_symbols,
+            &mut spot_symbols,
             &mut last_universe_refresh,
             &mut price_history,
             &sentiment_config,
@@ -259,6 +267,8 @@ fn persist_snapshot(data_root: &PathBuf, snapshot: &UniverseSnapshot) -> Result<
 fn scan_once(
     client: &Client,
     known_symbols: &mut HashSet<String>,
+    futures_symbols: &mut HashSet<String>,
+    spot_symbols: &mut HashSet<String>,
     last_universe_refresh: &mut i64,
     price_history: &mut HashMap<String, VecDeque<f64>>,
     sentiment_config: &SentimentFetchConfig,
@@ -288,10 +298,16 @@ fn scan_once(
         *last_sentiment_fetch = now;
     }
     if now - *last_universe_refresh > 600 || known_symbols.is_empty() {
-        *known_symbols = fetch_universe(client)?;
+        let (futures, spot) = fetch_universe(client)?;
+        *futures_symbols = futures;
+        *spot_symbols = spot;
+        known_symbols.clear();
+        known_symbols.extend(futures_symbols.iter().cloned());
+        known_symbols.extend(spot_symbols.iter().cloned());
         *last_universe_refresh = now;
     }
-    let tickers: Vec<Ticker> = get_json(client, "/fapi/v1/ticker/24hr")?;
+    let futures_tickers: Vec<Ticker> = get_json(client, "/fapi/v1/ticker/24hr")?;
+    let spot_tickers: Vec<Ticker> = get_spot_json("/api/v3/ticker/24hr", client)?;
     let premiums: Vec<Premium> = get_json(client, "/fapi/v1/premiumIndex")?;
     let funding: HashMap<String, f64> = premiums
         .into_iter()
@@ -302,19 +318,34 @@ fn scan_once(
                 .map(|value| (item.symbol, value))
         })
         .collect();
-    let mut candidates = tickers
-        .into_iter()
-        .filter(|item| known_symbols.contains(&item.symbol))
-        .filter_map(|item| {
+    let mut candidates = Vec::with_capacity(futures_tickers.len() + spot_tickers.len());
+    let mut append_candidate = |item: Ticker, is_futures: bool| {
+        if !(if is_futures {
+            futures_symbols.contains(&item.symbol)
+        } else {
+            spot_symbols.contains(&item.symbol) && !futures_symbols.contains(&item.symbol)
+        }) {
+            return;
+        }
+        if let Some(candidate) = (|| {
             let price = item.last_price.parse::<f64>().ok()?;
             let change_percent = item.change_percent.parse::<f64>().ok()?;
             let quote_volume = item.quote_volume.parse::<f64>().ok()?;
-            let funding_rate = funding.get(&item.symbol).copied().unwrap_or(0.0);
+            let funding_rate = if is_futures {
+                funding.get(&item.symbol).copied().unwrap_or(0.0)
+            } else {
+                0.0
+            };
             let category = category_for(&item.symbol, quote_volume);
             let market_score = market_score(change_percent, quote_volume, funding_rate);
             let aggregate = sentiment_for(&item.symbol, sentiment_events, now);
             Some(MarketCandidate {
                 symbol: item.symbol,
+                market: if is_futures {
+                    "U本位".into()
+                } else {
+                    "现货".into()
+                },
                 category,
                 price,
                 change_percent,
@@ -330,8 +361,16 @@ fn scan_once(
                 sentiment_source_count: aggregate.unique_sources,
                 updated_at: now,
             })
-        })
-        .collect::<Vec<_>>();
+        })() {
+            candidates.push(candidate);
+        }
+    };
+    for item in futures_tickers {
+        append_candidate(item, true);
+    }
+    for item in spot_tickers {
+        append_candidate(item, false);
+    }
     for candidate in &candidates {
         let history = price_history.entry(candidate.symbol.clone()).or_default();
         history.push_back(candidate.price);
@@ -395,7 +434,11 @@ fn scan_once(
 
     // Keep the full universe in the snapshot. Enrich only the most liquid rows
     // to stay within Binance request weight while still exposing every ticker.
-    for candidate in candidates.iter_mut().take(12) {
+    for candidate in candidates
+        .iter_mut()
+        .filter(|candidate| candidate.market == "U本位")
+        .take(12)
+    {
         if let Ok(open_interest) = fetch_open_interest(client, &candidate.symbol) {
             candidate.open_interest = open_interest;
         }
@@ -491,9 +534,9 @@ fn sentiment_for(symbol: &str, events: &[SentimentEvent], now: i64) -> Sentiment
     )
 }
 
-fn fetch_universe(client: &Client) -> Result<HashSet<String>> {
+fn fetch_universe(client: &Client) -> Result<(HashSet<String>, HashSet<String>)> {
     let info: ExchangeInfo = get_json(client, "/fapi/v1/exchangeInfo")?;
-    let symbols = info
+    let futures = info
         .symbols
         .into_iter()
         .filter(|item| {
@@ -504,7 +547,14 @@ fn fetch_universe(client: &Client) -> Result<HashSet<String>> {
         })
         .map(|item| item.symbol)
         .collect();
-    Ok(symbols)
+    let spot_info: ExchangeInfo = get_spot_json("/api/v3/exchangeInfo", client)?;
+    let spot = spot_info
+        .symbols
+        .into_iter()
+        .filter(|item| item.status == "TRADING" && !item.symbol.is_empty())
+        .map(|item| item.symbol)
+        .collect();
+    Ok((futures, spot))
 }
 
 fn fetch_open_interest(client: &Client, symbol: &str) -> Result<f64> {
@@ -515,6 +565,13 @@ fn fetch_open_interest(client: &Client, symbol: &str) -> Result<f64> {
 
 fn get_json<T: serde::de::DeserializeOwned>(client: &Client, path: &str) -> Result<T> {
     read_response(client.get(format!("{BINANCE_BASE}{path}")).send()?, path)
+}
+
+fn get_spot_json<T: serde::de::DeserializeOwned>(path: &str, client: &Client) -> Result<T> {
+    read_response(
+        client.get(format!("{BINANCE_SPOT_BASE}{path}")).send()?,
+        path,
+    )
 }
 
 fn get_json_with_query<T: serde::de::DeserializeOwned, const N: usize>(
@@ -563,6 +620,9 @@ fn market_score(change_percent: f64, quote_volume: f64, funding_rate: f64) -> f6
 }
 
 fn recommendation_for(candidate: &MarketCandidate) -> Option<Recommendation> {
+    if candidate.market != "U本位" {
+        return None;
+    }
     if candidate.quote_volume < 20_000_000.0 || candidate.change_percent.abs() < 0.35 {
         return None;
     }
@@ -659,6 +719,7 @@ mod tests {
         assert_eq!(
             recommendation_for(&MarketCandidate {
                 symbol: "ABCUSDT".into(),
+                market: "U本位".into(),
                 category: "山寨".into(),
                 price: 1.0,
                 change_percent: 3.0,
@@ -685,6 +746,7 @@ mod tests {
         assert!(
             recommendation_for(&MarketCandidate {
                 symbol: "BTCUSDT".into(),
+                market: "U本位".into(),
                 category: "主流".into(),
                 price: 1.0,
                 change_percent: 0.1,

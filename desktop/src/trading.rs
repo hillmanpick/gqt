@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::{Duration as ChronoDuration, NaiveDate};
+use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, NaiveDate, NaiveDateTime, Utc};
 use rand::{RngCore, rngs::OsRng};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
@@ -366,7 +366,9 @@ impl TradingWorkspace {
                     stake_amount: row.get::<_, Option<f64>>(3)?.unwrap_or_default(),
                     open_rate: row.get::<_, Option<f64>>(4)?.unwrap_or_default(),
                     leverage: row.get::<_, Option<f64>>(5)?.unwrap_or(1.0),
-                    open_date: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                    open_date: format_trade_time(
+                        &row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                    ),
                     tag: row.get(7)?,
                 })
             })?
@@ -553,8 +555,8 @@ fn recent_position_history(connection: &Connection, limit: usize) -> Result<Vec<
             open_rate: row.get::<_, Option<f64>>(5)?.unwrap_or_default(),
             close_rate: row.get(6)?,
             leverage: row.get::<_, Option<f64>>(7)?.unwrap_or(1.0),
-            open_date: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
-            close_date: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+            open_date: format_trade_time(&row.get::<_, Option<String>>(8)?.unwrap_or_default()),
+            close_date: format_trade_time(&row.get::<_, Option<String>>(9)?.unwrap_or_default()),
             tag: row.get(10)?,
             exit_reason: row.get(11)?,
             profit_abs: row.get::<_, Option<f64>>(12)?.unwrap_or_default(),
@@ -563,6 +565,29 @@ fn recent_position_history(connection: &Connection, limit: usize) -> Result<Vec<
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .context("无法读取仓位历史")
+}
+
+fn format_trade_time(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return String::new();
+    }
+    let zone = FixedOffset::east_opt(8 * 60 * 60).expect("UTC+8 is a valid fixed offset");
+    if let Ok(time) = DateTime::parse_from_rfc3339(value) {
+        return time
+            .with_timezone(&zone)
+            .format("%m-%d %H:%M:%S")
+            .to_string();
+    }
+    for format in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"] {
+        if let Ok(time) = NaiveDateTime::parse_from_str(value, format) {
+            return DateTime::<Utc>::from_naive_utc_and_offset(time, Utc)
+                .with_timezone(&zone)
+                .format("%m-%d %H:%M:%S")
+                .to_string();
+        }
+    }
+    value.to_string()
 }
 
 fn normalized_pairs(symbols: &[String]) -> Result<Vec<String>> {
