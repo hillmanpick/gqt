@@ -2159,6 +2159,7 @@ impl GqtApp {
                         for row in rows.iter().take(10) {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(&row.symbol).strong());
+                                ui.label(format_price(row.price));
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     ui.colored_label(
                                         if row.change_percent >= 0.0 {
