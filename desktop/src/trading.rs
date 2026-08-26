@@ -282,6 +282,23 @@ impl TradingWorkspace {
         api_key: &str,
         api_secret: &str,
     ) -> Result<String> {
+        // A container with the fixed name can have been started from another
+        // checkout (for example the repository's trading/ directory).  That
+        // silently splits the simulated account from the desktop workspace.
+        // Remove only that container when its bind mount is not this workspace;
+        // the SQLite files remain untouched on disk.
+        if start && !self.container_uses_workspace()? {
+            let output = background_command("docker")
+                .args(["rm", "-f", "binance-futures-factor"])
+                .output()
+                .context("无法移除指向其他工作区的交易容器")?;
+            if !output.status.success() {
+                bail!(
+                    "无法移除指向其他工作区的交易容器: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+        }
         let args: Vec<&str> = if start {
             let mut args = vec!["compose", "up", "-d"];
             if force_recreate {
@@ -322,6 +339,41 @@ impl TradingWorkspace {
             bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn container_uses_workspace(&self) -> Result<bool> {
+        let output = background_command("docker")
+            .args([
+                "inspect",
+                "--format",
+                "{{json .Mounts}}",
+                "binance-futures-factor",
+            ])
+            .output()
+            .context("无法检查交易容器挂载")?;
+        if !output.status.success() {
+            // No container yet: compose up will create the correctly mounted one.
+            return Ok(true);
+        }
+        let mounts: Value =
+            serde_json::from_slice(&output.stdout).context("交易容器挂载信息无效")?;
+        let expected = fs::canonicalize(&self.root)
+            .unwrap_or_else(|_| self.root.clone())
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        Ok(mounts.as_array().is_some_and(|items| {
+            items.iter().any(|mount| {
+                mount["Destination"].as_str() == Some("/freqtrade/user_data")
+                    && mount["Source"]
+                        .as_str()
+                        .map(|source| {
+                            source.replace('\\', "/").to_ascii_lowercase()
+                                == format!("{expected}/user_data")
+                        })
+                        .unwrap_or(false)
+            })
+        }))
     }
 
     pub fn simulation_account(&self) -> Result<SimulationAccount> {
