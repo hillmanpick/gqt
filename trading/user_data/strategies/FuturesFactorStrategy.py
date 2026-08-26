@@ -295,23 +295,36 @@ class FuturesFactorStrategy(IStrategy):
             return 0.0, 0.0, 0
         path = self._user_data / "sentiment.sqlite"
         try:
-            cutoff = int(self._as_utc(current_time).timestamp()) - 72 * 60 * 60
+            timestamp = int(self._as_utc(current_time).timestamp())
+            bucket = timestamp // 60
             base = pair.split("/", 1)[0].upper()
-            connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)
-            rows = connection.execute(
-                "SELECT symbol, payload_json FROM sentiment_events "
-                "WHERE published_at >= ? ORDER BY published_at DESC LIMIT 1500",
-                (cutoff,),
-            ).fetchall()
-            connection.close()
+            result_cache = getattr(self, "_sentiment_bias_cache", {})
+            cache_key = (base, bucket)
+            if cache_key in result_cache:
+                return result_cache[cache_key]
+            cached_rows = getattr(self, "_sentiment_rows_cache", None)
+            if cached_rows is None or cached_rows[0] != bucket:
+                cutoff = timestamp - 72 * 60 * 60
+                connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)
+                raw_rows = connection.execute(
+                    "SELECT symbol, payload_json FROM sentiment_events "
+                    "WHERE published_at >= ? ORDER BY published_at DESC LIMIT 1500",
+                    (cutoff,),
+                ).fetchall()
+                connection.close()
+                rows = []
+                for symbol, payload_json in raw_rows:
+                    try:
+                        rows.append((symbol, json.loads(payload_json)))
+                    except (TypeError, ValueError):
+                        continue
+                cached_rows = (bucket, rows)
+                setattr(self, "_sentiment_rows_cache", cached_rows)
+            rows = cached_rows[1]
             weighted = 0.0
             weight_total = 0.0
             count = 0
-            for symbol, payload_json in rows:
-                try:
-                    payload = json.loads(payload_json)
-                except (TypeError, ValueError):
-                    continue
+            for symbol, payload in rows:
                 symbols = {str(value).upper().replace("/", "").replace("USDT", "")
                            for value in payload.get("symbols", []) if value}
                 event_symbol = str(symbol or payload.get("symbol", "")).upper()
@@ -326,9 +339,15 @@ class FuturesFactorStrategy(IStrategy):
                 weight_total += weight
                 count += 1
             if weight_total <= 0.0:
-                return 0.0, 0.0, 0
+                result = (0.0, 0.0, 0)
+                result_cache[cache_key] = result
+                setattr(self, "_sentiment_bias_cache", result_cache)
+                return result
             quality = min(1.0, weight_total / 3.0)
-            return float(np.clip(weighted / weight_total, -1.0, 1.0)), quality, count
+            result = (float(np.clip(weighted / weight_total, -1.0, 1.0)), quality, count)
+            result_cache[cache_key] = result
+            setattr(self, "_sentiment_bias_cache", result_cache)
+            return result
         except (OSError, sqlite3.Error, TypeError, ValueError):
             return 0.0, 0.0, 0
 
