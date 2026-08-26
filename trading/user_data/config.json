@@ -17,6 +17,8 @@
   "gqt_major_leverage_cap": 50,
   "gqt_alt_leverage_cap": 5,
   "gqt_sentiment_required": true,
+  "gqt_sentiment_enabled": true,
+  "gqt_all_futures_symbols": true,
   "gqt_max_stake_amount": 20,
   "gqt_paper_data_collection": true,
   "gqt_paper_collection_hold_minutes": 3,
@@ -109,7 +111,11 @@
   },
   "pairlists": [
     {
-      "method": "StaticPairList"
+      "method": "VolumePairList",
+      "number_assets": 1000,
+      "sort_key": "quoteVolume",
+      "min_value": 0,
+      "refresh_period": 900
     }
   ],
   "api_server": {

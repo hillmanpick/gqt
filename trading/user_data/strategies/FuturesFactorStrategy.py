@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -282,6 +283,55 @@ class FuturesFactorStrategy(IStrategy):
     def _execution_mode(self) -> str:
         return str(self._settings().get("gqt_execution_mode", "paper")).strip().lower()
 
+    def _sentiment_bias(self, pair: str, current_time: datetime) -> tuple[float, float, int]:
+        """Read recent scanner sentiment and return (bias, quality, event_count).
+
+        The scanner stores normalized events in sentiment.sqlite.  Symbol-specific
+        events are preferred; global headlines are a weaker market-wide signal.
+        Missing or stale data is deliberately neutral so a feed outage cannot
+        create a directional trade by itself.
+        """
+        if not self._profile_bool("gqt_sentiment_enabled", True):
+            return 0.0, 0.0, 0
+        path = self._user_data / "sentiment.sqlite"
+        try:
+            cutoff = int(self._as_utc(current_time).timestamp()) - 72 * 60 * 60
+            base = pair.split("/", 1)[0].upper()
+            connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)
+            rows = connection.execute(
+                "SELECT symbol, payload_json FROM sentiment_events "
+                "WHERE published_at >= ? ORDER BY published_at DESC LIMIT 1500",
+                (cutoff,),
+            ).fetchall()
+            connection.close()
+            weighted = 0.0
+            weight_total = 0.0
+            count = 0
+            for symbol, payload_json in rows:
+                try:
+                    payload = json.loads(payload_json)
+                except (TypeError, ValueError):
+                    continue
+                symbols = {str(value).upper().replace("/", "").replace("USDT", "")
+                           for value in payload.get("symbols", []) if value}
+                event_symbol = str(symbol or payload.get("symbol", "")).upper()
+                specific = base in symbols or base in event_symbol
+                if not specific and (symbols or event_symbol):
+                    continue
+                sentiment = self._float(payload.get("sentiment"), 0.0)
+                confidence = self._float(payload.get("confidence"), 0.5)
+                credibility = self._float(payload.get("source_credibility"), 0.5)
+                weight = (2.0 if specific else 0.35) * max(0.1, confidence) * max(0.1, credibility)
+                weighted += sentiment * weight
+                weight_total += weight
+                count += 1
+            if weight_total <= 0.0:
+                return 0.0, 0.0, 0
+            quality = min(1.0, weight_total / 3.0)
+            return float(np.clip(weighted / weight_total, -1.0, 1.0)), quality, count
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            return 0.0, 0.0, 0
+
     def _leverage_cap(self, pair: str) -> float:
         symbol = pair.replace("/", "").replace(":USDT", "").upper()
         base = symbol[:-4] if symbol.endswith("USDT") else symbol
@@ -543,6 +593,12 @@ class FuturesFactorStrategy(IStrategy):
         low = dataframe["low"]
         volume = dataframe["volume"]
         typical = (high + low + close) / 3.0
+        sentiment_bias, sentiment_quality, sentiment_events = self._sentiment_bias(
+            str(metadata.get("pair", "")), self._dataframe_time(dataframe)
+        )
+        dataframe["sentiment_bias"] = sentiment_bias
+        dataframe["sentiment_quality"] = sentiment_quality
+        dataframe["sentiment_events"] = sentiment_events
 
         dataframe["ema_8"] = ta.EMA(dataframe, timeperiod=8)
         dataframe["ema_21"] = ta.EMA(dataframe, timeperiod=21)
@@ -734,6 +790,7 @@ class FuturesFactorStrategy(IStrategy):
                 (dataframe["volume_confirmation"], 0.10),
                 (dataframe["volatility_quality"], 0.07),
                 (self.bounded(dataframe["close_location"], -0.10, 0.90), 0.03),
+                (self.bounded(dataframe["sentiment_bias"], -0.10, 0.70), 0.10),
             ]
         )
         dataframe["short_score"] = self.weighted_score(
@@ -746,6 +803,7 @@ class FuturesFactorStrategy(IStrategy):
                 (dataframe["volume_confirmation"], 0.10),
                 (dataframe["volatility_quality"], 0.07),
                 (self.bounded(-dataframe["close_location"], -0.10, 0.90), 0.03),
+                (self.bounded(-dataframe["sentiment_bias"], -0.10, 0.70), 0.10),
             ]
         )
         dataframe["factor_score"] = dataframe["long_score"] - dataframe["short_score"]
@@ -794,6 +852,7 @@ class FuturesFactorStrategy(IStrategy):
             & (dataframe["rsi"].between(long_rsi_min, long_rsi_max))
             & (dataframe["atr_pct"].between(atr_min, atr_max))
             & (dataframe["close"] > dataframe["rolling_vwap"] * long_vwap_factor)
+            & ((dataframe["sentiment_quality"] < 0.35) | (dataframe["sentiment_bias"] >= -0.35))
         )
         short_conditions = (
             (dataframe["volume"] > 0)
@@ -805,6 +864,7 @@ class FuturesFactorStrategy(IStrategy):
             & (dataframe["rsi"].between(short_rsi_min, short_rsi_max))
             & (dataframe["atr_pct"].between(atr_min, atr_max))
             & (dataframe["close"] < dataframe["rolling_vwap"] * short_vwap_factor)
+            & ((dataframe["sentiment_quality"] < 0.35) | (dataframe["sentiment_bias"] <= 0.35))
         )
 
         dataframe.loc[long_conditions, ["enter_long", "enter_tag"]] = (1, "alpha_compound_long")

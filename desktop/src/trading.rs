@@ -86,13 +86,28 @@ impl TradingWorkspace {
     fn sync_ai_runtime_config(&self, ai_config: &AiTradingConfig) -> Result<()> {
         let pairs = normalized_pairs(&ai_config.symbol_whitelist)?;
         let mut config: Value = serde_json::from_str(&fs::read_to_string(&self.config)?)?;
+        let all_futures_symbols = config["gqt_all_futures_symbols"].as_bool().unwrap_or(false);
         let exchange = config
             .as_object_mut()
             .context("Freqtrade 配置根节点无效")?
             .entry("exchange")
             .or_insert_with(|| json!({}));
         let exchange = exchange.as_object_mut().context("exchange 配置无效")?;
-        exchange.insert("pair_whitelist".into(), json!(pairs));
+        if all_futures_symbols {
+            exchange.remove("pair_whitelist");
+            config["pairlists"] = json!([
+                {
+                    "method": "VolumePairList",
+                    "number_assets": 1000,
+                    "sort_key": "quoteVolume",
+                    "min_value": 0,
+                    "refresh_period": 900
+                }
+            ]);
+        } else {
+            exchange.insert("pair_whitelist".into(), json!(pairs));
+            config["pairlists"] = json!([{ "method": "StaticPairList" }]);
+        }
         ensure_order_book_pricing(&mut config)?;
         ensure_compound_defaults(&mut config)?;
         let docker_proxy = crate::network::configured_docker_proxy();
@@ -896,6 +911,8 @@ fn ensure_compound_defaults(config: &mut Value) -> Result<()> {
     root.entry("gqt_major_leverage_cap").or_insert(json!(50));
     root.entry("gqt_alt_leverage_cap").or_insert(json!(5));
     root.entry("gqt_sentiment_required").or_insert(json!(true));
+    root.entry("gqt_sentiment_enabled").or_insert(json!(true));
+    root.entry("gqt_all_futures_symbols").or_insert(json!(true));
     root.entry("gqt_paper_data_collection")
         .or_insert(json!(true));
     root.entry("gqt_paper_collection_hold_minutes")
@@ -1134,10 +1151,8 @@ mod tests {
         assert_eq!(config["timeframe"], "1h");
         assert_eq!(config["margin_mode"], "cross");
         assert_eq!(config["gqt_compound_leverage"], 50);
-        assert_eq!(
-            config["exchange"]["pair_whitelist"],
-            json!(["SOL/USDT:USDT", "DOGE/USDT:USDT"])
-        );
+        assert!(config["exchange"]["pair_whitelist"].is_null());
+        assert_eq!(config["pairlists"][0]["method"], "VolumePairList");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1261,17 +1276,8 @@ mod tests {
         assert!(!stored_ai.one_signal_per_candle);
         let config: Value =
             serde_json::from_str(&fs::read_to_string(&workspace.config).unwrap()).unwrap();
-        assert_eq!(
-            config["exchange"]["pair_whitelist"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            config["exchange"]["pair_whitelist"],
-            json!(["BTC/USDT:USDT"])
-        );
+        assert!(config["exchange"]["pair_whitelist"].is_null());
+        assert_eq!(config["pairlists"][0]["method"], "VolumePairList");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1296,8 +1302,8 @@ mod tests {
             .unwrap();
         drop(connection);
         let account = workspace.simulation_account().unwrap();
-        assert_eq!(account.wallet_balance, 1025.0);
-        assert_eq!(account.available_balance, 975.0);
+        assert_eq!(account.wallet_balance, 2025.0);
+        assert_eq!(account.available_balance, 1975.0);
         assert_eq!(account.closed_trades, 1);
         assert_eq!(account.open_trades[0].side, "空");
         assert_eq!(account.trade_history.len(), 2);
