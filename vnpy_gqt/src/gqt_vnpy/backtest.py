@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import statistics as stats
 from dataclasses import asdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import ResearchConfig
+from .config import ResearchConfig, StrategySettings
 from .data_import import storage_symbol
 from .walkforward import build_folds, evaluate_fold
 
@@ -24,10 +25,14 @@ def _vnpy_runtime():
     return Exchange, Interval, ConservativeBarBacktestingEngine, GqtUsdtTrendStrategy
 
 
-def _strategy_settings(config: ResearchConfig) -> dict[str, Any]:
+def _strategy_settings(
+    config: ResearchConfig,
+    strategy: StrategySettings | None = None,
+) -> dict[str, Any]:
+    strategy = strategy or config.strategy
     interval_value = {"15m": "1m", "1h": "1h", "4h": "1h"}[config.timeframe]
     return {
-        **asdict(config.strategy),
+        **asdict(strategy),
         "starting_capital": config.capital,
         "leverage": config.leverage,
         "risk_per_trade": config.risk_per_trade,
@@ -65,7 +70,13 @@ def _database_bounds(start: datetime, end: datetime, timeframe: str) -> tuple[da
     return query_start, query_end
 
 
-def _run_period(config: ResearchConfig, symbol: str, start: datetime, end: datetime) -> dict[str, Any]:
+def _run_period(
+    config: ResearchConfig,
+    symbol: str,
+    start: datetime,
+    end: datetime,
+    strategy: StrategySettings | None = None,
+) -> dict[str, Any]:
     if end <= start:
         raise ValueError("backtest end must be later than start")
     Exchange, Interval, BacktestingEngine, strategy_class = _vnpy_runtime()
@@ -85,7 +96,7 @@ def _run_period(config: ResearchConfig, symbol: str, start: datetime, end: datet
     )
     # vn.py expands end to 23:59:59. Restore the exact right-open fold bound.
     engine.end = query_end
-    engine.add_strategy(strategy_class, _strategy_settings(config))
+    engine.add_strategy(strategy_class, _strategy_settings(config, strategy))
     engine.load_data()
     evaluation_bars = list(engine.history_data)
     if not evaluation_bars:
@@ -117,6 +128,7 @@ def _run_period(config: ResearchConfig, symbol: str, start: datetime, end: datet
         float(completed["max_drawdown_percent"]),
         built_in_drawdown,
     )
+    completed["sharpe_ratio"] = _json_value(built_in.get("sharpe_ratio", 0.0)) or 0.0
     return {
         **{f"vnpy_{key}": _json_value(value) for key, value in built_in.items()},
         **completed,
@@ -146,6 +158,7 @@ def _closed_trade_statistics(
 
     entry = None
     outcomes: list[float] = []
+    gross_outcomes: list[float] = []
     total_commission = 0.0
     total_slippage = 0.0
     total_funding_stress = 0.0
@@ -168,6 +181,7 @@ def _closed_trade_statistics(
             * held_hours
             / 8.0
         )
+        gross_outcomes.append(gross)
         outcomes.append(gross - commission - slippage - funding_stress)
         total_commission += commission
         total_slippage += slippage
@@ -196,6 +210,8 @@ def _closed_trade_statistics(
 
     positive = sum(value for value in outcomes if value > 0)
     negative = abs(sum(value for value in outcomes if value < 0))
+    gross_positive = sum(value for value in gross_outcomes if value > 0)
+    gross_negative = abs(sum(value for value in gross_outcomes if value < 0))
     profit_factor_capped = negative == 0 and positive > 0
     profit_factor = positive / negative if negative > 0 else (999.0 if positive > 0 else 0.0)
     equity = capital
@@ -206,6 +222,16 @@ def _closed_trade_statistics(
         peak = max(peak, equity)
         if peak > 0:
             maximum_drawdown = max(maximum_drawdown, (peak - equity) / peak)
+    current_losses = 0
+    max_consecutive_losses = 0
+    for value in outcomes:
+        if value < 0:
+            current_losses += 1
+            max_consecutive_losses = max(max_consecutive_losses, current_losses)
+        else:
+            current_losses = 0
+    total_cost = total_commission + total_slippage + total_funding_stress
+    gross_total = sum(gross_outcomes)
     return {
         "total_trade_count": len(outcomes),
         "winning_trade_count": sum(value > 0 for value in outcomes),
@@ -215,10 +241,21 @@ def _closed_trade_statistics(
         "profit_factor_capped": profit_factor_capped,
         "expectancy": sum(outcomes) / len(outcomes) if outcomes else 0.0,
         "cost_adjusted_total_net_pnl": sum(outcomes),
+        "gross_total_pnl": gross_total,
+        "gross_profit": gross_positive,
+        "gross_loss": gross_negative,
+        "average_win": positive / max(sum(value > 0 for value in outcomes), 1),
+        "average_loss": negative / max(sum(value < 0 for value in outcomes), 1),
+        "payoff_ratio": (
+            positive / max(sum(value > 0 for value in outcomes), 1)
+        ) / max(negative / max(sum(value < 0 for value in outcomes), 1), 1e-12),
         "max_drawdown_percent": maximum_drawdown * 100.0,
+        "max_consecutive_losses": max_consecutive_losses,
         "total_commission": total_commission,
         "total_slippage": total_slippage,
         "total_funding_stress": total_funding_stress,
+        "total_cost": total_cost,
+        "cost_ratio": total_cost / max(gross_positive, 1e-12),
         "forced_exit_count": forced_exit_count,
         "unclosed_position_count": 0,
     }
@@ -232,6 +269,81 @@ def _json_value(value: Any) -> Any:
     if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
         return None
     return value
+
+
+def _candidate_strategies(config: ResearchConfig) -> list[StrategySettings]:
+    """Return a small, explicit candidate set; never search arbitrary parameters."""
+    candidates = [config.strategy, *config.candidate_strategies]
+    unique: list[StrategySettings] = []
+    for candidate in candidates:
+        if candidate not in unique:
+            unique.append(candidate)
+    return unique
+
+
+def _selection_score(statistics: dict[str, Any], config: ResearchConfig) -> float | None:
+    """Score training results with an edge/drawdown/cost trade-off.
+
+    This is deliberately not a return-maximizing objective. A candidate with a
+    large backtest return but poor stability or excessive costs is rejected
+    before it can be evaluated on the next, unseen fold.
+    """
+    trades = int(statistics.get("total_trade_count", 0) or 0)
+    profit_factor = float(statistics.get("profit_factor", 0) or 0)
+    drawdown = float(statistics.get("max_drawdown_percent", 100) or 100) / 100.0
+    expectancy = float(statistics.get("expectancy", 0) or 0)
+    if trades < config.selection_min_train_trades:
+        return None
+    if profit_factor < config.selection_min_profit_factor:
+        return None
+    if drawdown > config.selection_max_drawdown:
+        return None
+    normalized_expectancy = expectancy / max(config.capital, 1e-12)
+    sharpe = float(statistics.get("sharpe_ratio", 0) or 0)
+    cost_ratio = float(statistics.get("cost_ratio", 0) or 0)
+    return (
+        normalized_expectancy * math.sqrt(trades)
+        + 0.05 * max(-2.0, min(sharpe, 3.0))
+        - 0.50 * drawdown
+        - 0.05 * min(cost_ratio, 4.0)
+    )
+
+
+def _select_strategy(
+    config: ResearchConfig,
+    symbol: str,
+    train_start: datetime,
+    train_end: datetime,
+) -> tuple[StrategySettings, dict[str, Any]]:
+    candidates = _candidate_strategies(config)
+    reports: list[dict[str, Any]] = []
+    best_index: int | None = None
+    best_score = float("-inf")
+    for index, candidate in enumerate(candidates):
+        statistics = _run_period(config, symbol, train_start, train_end, candidate)
+        score = _selection_score(statistics, config)
+        reports.append(
+            {
+                "index": index,
+                "parameters": asdict(candidate),
+                "score": _json_value(score) if score is not None else None,
+                "statistics": statistics,
+            }
+        )
+        if score is not None and score > best_score:
+            best_index = index
+            best_score = score
+
+    # A failed training window must not cause a hidden parameter change. The
+    # baseline remains the deterministic fallback and the test gate will fail
+    # if it cannot demonstrate a positive out-of-sample edge.
+    if best_index is None:
+        best_index = 0
+    return candidates[best_index], {
+        "selected_index": best_index,
+        "selected_parameters": asdict(candidates[best_index]),
+        "candidates": reports,
+    }
 
 
 def run_research(config: ResearchConfig, start: datetime, end: datetime) -> dict[str, Any]:
@@ -250,17 +362,33 @@ def run_research(config: ResearchConfig, start: datetime, end: datetime) -> dict
     for symbol in config.symbols:
         fold_results = []
         for fold in folds:
-            statistics = _run_period(config, symbol, fold.test_start, fold.test_end)
+            selected_strategy, calibration = _select_strategy(
+                config,
+                symbol,
+                fold.train_start,
+                fold.train_end,
+            )
+            statistics = _run_period(
+                config,
+                symbol,
+                fold.test_start,
+                fold.test_end,
+                selected_strategy,
+            )
             passed, reasons = evaluate_fold(
                 statistics,
                 minimum_trades=config.minimum_test_trades,
                 minimum_profit_factor=config.minimum_profit_factor,
                 minimum_expectancy=config.minimum_expectancy,
                 maximum_drawdown=config.maximum_drawdown,
+                minimum_sharpe_ratio=config.minimum_sharpe_ratio,
+                maximum_cost_ratio=config.maximum_cost_ratio,
+                maximum_consecutive_losses=config.maximum_consecutive_losses,
             )
             fold_results.append(
                 {
                     **asdict(fold),
+                    "calibration": calibration,
                     "passed": passed,
                     "reasons": reasons,
                     "statistics": statistics,
@@ -271,11 +399,25 @@ def run_research(config: ResearchConfig, start: datetime, end: datetime) -> dict
             "folds": fold_results,
         }
 
+    config_payload = asdict(config)
+    experiment_id = hashlib.sha256(
+        json.dumps(config_payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()[:16]
     return {
+        "experiment_id": experiment_id,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "mode": config.mode,
         "timeframe": config.timeframe,
         "start": start.isoformat(),
         "end": end.isoformat(),
+        "assumptions": {
+            "fee_rate": config.fee_rate,
+            "slippage_bps": config.slippage_bps,
+            "funding_rate_8h_stress": config.funding_rate_8h_stress,
+            "leverage": config.leverage,
+            "risk_per_trade": config.risk_per_trade,
+            "embargo_days": config.embargo_days,
+        },
         "portfolio_eligible": all(item["eligible"] for item in symbols.values()),
         "symbols": symbols,
     }
@@ -284,7 +426,7 @@ def run_research(config: ResearchConfig, start: datetime, end: datetime) -> dict
 def write_result(result: dict[str, Any], output_dir: str | Path) -> Path:
     directory = Path(output_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     path = directory / f"walk-forward-{stamp}.json"
     path.write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
     return path

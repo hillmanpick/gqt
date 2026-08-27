@@ -60,6 +60,9 @@ def evaluate_fold(
     minimum_profit_factor: float,
     minimum_expectancy: float,
     maximum_drawdown: float,
+    minimum_sharpe_ratio: float | None = None,
+    maximum_cost_ratio: float | None = None,
+    maximum_consecutive_losses: int | None = None,
 ) -> tuple[bool, list[str]]:
     reasons: list[str] = []
     trades = int(statistics.get("total_trade_count", 0) or 0)
@@ -74,4 +77,20 @@ def evaluate_fold(
         reasons.append(f"expectancy {expectancy:.6f} <= {minimum_expectancy:.6f}")
     if drawdown > maximum_drawdown:
         reasons.append(f"drawdown {drawdown:.2%} > {maximum_drawdown:.2%}")
+    if minimum_sharpe_ratio is not None:
+        sharpe = float(
+            statistics.get("sharpe_ratio", statistics.get("vnpy_sharpe_ratio", 0)) or 0
+        )
+        if sharpe < minimum_sharpe_ratio:
+            reasons.append(f"sharpe {sharpe:.3f} < {minimum_sharpe_ratio:.3f}")
+    if maximum_cost_ratio is not None:
+        cost_ratio = float(statistics.get("cost_ratio", 0) or 0)
+        if cost_ratio > maximum_cost_ratio:
+            reasons.append(f"cost ratio {cost_ratio:.2%} > {maximum_cost_ratio:.2%}")
+    if maximum_consecutive_losses is not None:
+        consecutive_losses = int(statistics.get("max_consecutive_losses", 0) or 0)
+        if consecutive_losses > maximum_consecutive_losses:
+            reasons.append(
+                f"consecutive losses {consecutive_losses} > {maximum_consecutive_losses}"
+            )
     return not reasons, reasons

@@ -28,6 +28,21 @@ class ResearchConfigTests(unittest.TestCase):
         config = ResearchConfig.from_dict({"leverage": 1})
         self.assertEqual(config.symbols, ("BTCUSDT", "ETHUSDT"))
 
+    def test_candidate_parameters_are_explicit_and_validated(self) -> None:
+        config = ResearchConfig.from_dict(
+            {
+                "candidate_strategies": [
+                    {"fast_window": 16, "slow_window": 64, "breakout_window": 32}
+                ]
+            }
+        )
+        self.assertEqual(len(config.candidate_strategies), 1)
+        self.assertEqual(config.candidate_strategies[0].fast_window, 16)
+
+    def test_rejects_unknown_strategy_parameter(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unknown strategy settings"):
+            ResearchConfig.from_dict({"strategy": {"lookahead": 1}})
+
 
 if __name__ == "__main__":
     unittest.main()

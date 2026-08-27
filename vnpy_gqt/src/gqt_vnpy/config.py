@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,10 @@ class StrategySettings:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "StrategySettings":
+        allowed = {item.name for item in fields(cls)}
+        unknown = set(value) - allowed
+        if unknown:
+            raise ValueError(f"unknown strategy settings: {sorted(unknown)}")
         settings = cls(**value)
         if not 2 <= settings.fast_window < settings.slow_window:
             raise ValueError("fast_window must be at least 2 and below slow_window")
@@ -64,7 +68,14 @@ class ResearchConfig:
     minimum_profit_factor: float = 1.05
     minimum_expectancy: float = 0.0
     maximum_drawdown: float = 0.15
+    minimum_sharpe_ratio: float = 0.0
+    maximum_cost_ratio: float = 0.60
+    maximum_consecutive_losses: int = 12
+    selection_min_train_trades: int = 30
+    selection_min_profit_factor: float = 0.90
+    selection_max_drawdown: float = 0.25
     strategy: StrategySettings = field(default_factory=StrategySettings)
+    candidate_strategies: tuple[StrategySettings, ...] = ()
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "ResearchConfig":
@@ -74,6 +85,16 @@ class ResearchConfig:
             for item in value.get("symbols", ("BTCUSDT", "ETHUSDT"))
         )
         value["strategy"] = StrategySettings.from_dict(value.get("strategy", {}))
+        candidate_values = value.pop("candidate_strategies", ())
+        if not isinstance(candidate_values, (list, tuple)):
+            raise ValueError("candidate_strategies must be a list")
+        base = asdict(value["strategy"])
+        if any(not isinstance(candidate, dict) for candidate in candidate_values):
+            raise ValueError("each candidate strategy must be an object")
+        value["candidate_strategies"] = tuple(
+            StrategySettings.from_dict({**base, **candidate})
+            for candidate in candidate_values
+        )
         config = cls(**value)
         config.validate()
         return config
@@ -123,3 +144,20 @@ class ResearchConfig:
             raise ValueError("minimum_profit_factor must be at least 1")
         if not 0 < self.maximum_drawdown < 1:
             raise ValueError("maximum_drawdown must be between 0 and 1")
+        if self.minimum_sharpe_ratio < -5:
+            raise ValueError("minimum_sharpe_ratio is outside the research range")
+        if not 0 < self.maximum_cost_ratio <= 2:
+            raise ValueError("maximum_cost_ratio must be in (0, 2]")
+        if self.maximum_consecutive_losses < 1:
+            raise ValueError("maximum_consecutive_losses must be positive")
+        if self.selection_min_train_trades < 1:
+            raise ValueError("selection_min_train_trades must be positive")
+        if self.selection_min_profit_factor <= 0:
+            raise ValueError("selection_min_profit_factor must be positive")
+        if not 0 < self.selection_max_drawdown < 1:
+            raise ValueError("selection_max_drawdown must be between 0 and 1")
+        if len(self.candidate_strategies) > 12:
+            raise ValueError("at most 12 candidate strategies are allowed")
+        for candidate in self.candidate_strategies:
+            if candidate.slow_window + 2 > self.warmup_bars:
+                raise ValueError("warmup_bars must exceed every candidate slow window")

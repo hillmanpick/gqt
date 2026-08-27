@@ -89,3 +89,9 @@ fees, slippage, and funding stress included. CLI dates are interpreted as UTC;
 database queries are converted to vn.py's configured database timezone.
 
 Do not enable real trading based only on an in-sample backtest.
+
+The walk-forward runner selects only from the explicit candidate parameter set
+using the training window, then evaluates the selected set once on the unseen
+test window. Test eligibility also checks cost ratio, Sharpe, and consecutive
+losses. See [`docs/quant-research.md`](../docs/quant-research.md) for the
+research assumptions and the steps required before any live deployment.

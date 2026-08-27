@@ -21,6 +21,12 @@
   "minimum_profit_factor": 1.05,
   "minimum_expectancy": 0.0,
   "maximum_drawdown": 0.15,
+  "minimum_sharpe_ratio": 0.0,
+  "maximum_cost_ratio": 0.60,
+  "maximum_consecutive_losses": 12,
+  "selection_min_train_trades": 30,
+  "selection_min_profit_factor": 0.90,
+  "selection_max_drawdown": 0.25,
   "strategy": {
     "fast_window": 24,
     "slow_window": 96,
@@ -31,5 +37,23 @@
     "minimum_atr_percent": 0.002,
     "maximum_atr_percent": 0.04,
     "cooldown_bars": 4
-  }
+  },
+  "candidate_strategies": [
+    {
+      "fast_window": 16,
+      "slow_window": 64,
+      "breakout_window": 32,
+      "atr_stop_multiple": 2.0,
+      "risk_reward": 1.6,
+      "cooldown_bars": 6
+    },
+    {
+      "fast_window": 32,
+      "slow_window": 128,
+      "breakout_window": 64,
+      "atr_stop_multiple": 2.4,
+      "risk_reward": 2.0,
+      "cooldown_bars": 6
+    }
+  ]
 }

@@ -67,6 +67,28 @@ class WalkForwardTests(unittest.TestCase):
         )
         self.assertTrue(passed, reasons)
 
+    def test_risk_and_cost_gates_are_checked(self) -> None:
+        passed, reasons = evaluate_fold(
+            {
+                "total_trade_count": 30,
+                "profit_factor": 1.2,
+                "expectancy": 0.1,
+                "max_drawdown_percent": 0.0,
+                "sharpe_ratio": -0.2,
+                "cost_ratio": 0.8,
+                "max_consecutive_losses": 13,
+            },
+            minimum_trades=30,
+            minimum_profit_factor=1.05,
+            minimum_expectancy=0,
+            maximum_drawdown=0.15,
+            minimum_sharpe_ratio=0.0,
+            maximum_cost_ratio=0.6,
+            maximum_consecutive_losses=12,
+        )
+        self.assertFalse(passed)
+        self.assertEqual(len(reasons), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

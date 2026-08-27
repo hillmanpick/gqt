@@ -56,6 +56,8 @@ class BacktestAdapterTests(unittest.TestCase):
         self.assertEqual(result["forced_exit_count"], 1)
         self.assertEqual(result["unclosed_position_count"], 0)
         self.assertAlmostEqual(result["cost_adjusted_total_net_pnl"], -11.29)
+        self.assertEqual(result["max_consecutive_losses"], 1)
+        self.assertGreater(result["cost_ratio"], 0)
 
 
 if __name__ == "__main__":
