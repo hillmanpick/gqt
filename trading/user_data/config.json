@@ -25,7 +25,7 @@
   "gqt_risk_reward_ratio": 2.0,
   "gqt_ai_risk_sizing": false,
   "gqt_compound_enabled": true,
-  "gqt_compound_capital_usage_percent": 12.0,
+  "gqt_compound_capital_usage_percent": 100.0,
   "gqt_compound_take_profit": 0.10,
   "gqt_compound_stop_loss": 0.06,
   "gqt_compound_pyramid_profit": 0.03,

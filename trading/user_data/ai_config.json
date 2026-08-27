@@ -18,7 +18,7 @@
   "margin_mode": "isolated",
   "leverage": 10,
   "max_stake_amount": 500.0,
-  "capital_usage_percent": 12.0,
+  "capital_usage_percent": 100.0,
   "risk_reward_ratio": 2.0,
   "allow_ai_risk_sizing": false,
   "minimum_confidence": 0.75,
