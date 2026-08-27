@@ -40,6 +40,10 @@
   "gqt_daily_profit_force_exit": true,
   "gqt_daily_profit_target": 0.1,
   "gqt_daily_profit_timezone_offset_hours": 8.0,
+  "max_drawdown_allowed": 0.8,
+  "max_drawdown_stop_candles": 6,
+  "stoploss_guard_trade_limit": 8,
+  "stoploss_guard_stop_candles": 4,
   "liquidation_buffer": 0.2,
   "minimal_roi": {
     "0": 0.99
