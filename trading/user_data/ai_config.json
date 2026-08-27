@@ -9,17 +9,17 @@
     "XRPUSDT",
     "DOGEUSDT",
     "ADAUSDT",
-    "LINKUSDT",
     "AVAXUSDT",
-    "LTCUSDT"
+    "LINKUSDT",
+    "SUIUSDT"
   ],
   "strategy_profile": "balanced",
-  "timeframe": "15m",
+  "timeframe": "5m",
   "margin_mode": "isolated",
-  "leverage": 2,
-  "max_stake_amount": 120.0,
-  "capital_usage_percent": 12.0,
-  "risk_reward_ratio": 1.4,
+  "leverage": 10,
+  "max_stake_amount": 500.0,
+  "capital_usage_percent": 100.0,
+  "risk_reward_ratio": 2.0,
   "allow_ai_risk_sizing": false,
   "minimum_confidence": 0.75,
   "minimum_long_score": 0.62,
@@ -30,5 +30,5 @@
   "minimum_volume_ratio": -0.35,
   "model_timeout_seconds": 30,
   "market_max_age_seconds": 90,
-  "one_signal_per_candle": true
+  "one_signal_per_candle": false
 }

@@ -5,6 +5,7 @@ pub enum Page {
     Overview,
     Account,
     PositionHistory,
+    EventPrediction,
     Market,
     Strategy,
     Backtest,
@@ -14,10 +15,11 @@ pub enum Page {
 }
 
 impl Page {
-    pub const ALL: [Page; 9] = [
+    pub const ALL: [Page; 10] = [
         Page::Overview,
         Page::Account,
         Page::PositionHistory,
+        Page::EventPrediction,
         Page::Market,
         Page::Strategy,
         Page::Backtest,
@@ -31,6 +33,7 @@ impl Page {
             Page::Overview => "总览",
             Page::Account => "账户",
             Page::PositionHistory => "仓位历史",
+            Page::EventPrediction => "事件预测",
             Page::Market => "行情",
             Page::Strategy => "策略",
             Page::Backtest => "回测",
@@ -45,6 +48,7 @@ impl Page {
             Page::Overview => "layout-dashboard",
             Page::Account => "wallet-cards",
             Page::PositionHistory => "history",
+            Page::EventPrediction => "target",
             Page::Market => "candlestick-chart",
             Page::Strategy => "braces",
             Page::Backtest => "chart-no-axes-combined",
@@ -59,6 +63,7 @@ impl Page {
             Page::Overview => "Binance U 本位永续",
             Page::Account => "真实账户资金与合约持仓",
             Page::PositionHistory => "模拟盘成交与仓位记录",
+            Page::EventPrediction => "30m / 1h 虚拟预测复盘",
             Page::Market => "实时 K 线与市场情绪",
             Page::Strategy => "Rust 客户端 / Freqtrade Interface v3",
             Page::Backtest => "历史验证与成本压力测试",
@@ -349,24 +354,24 @@ impl StrategyProfile {
                 daily_profit_timezone_offset_hours: 8.0,
             },
             StrategyProfile::Aggressive => StrategyProfilePreset {
-                leverage: 3,
+                leverage: 100,
                 capital_usage_percent: 18.0,
                 risk_reward_ratio: 1.0,
-                minimum_long_score: 0.58,
-                minimum_short_score: 0.58,
-                minimum_factor_score: 0.08,
-                minimum_trend_quality: 0.35,
-                minimum_adx: 8.0,
-                minimum_volume_ratio: -0.50,
-                take_profit: 0.012,
-                stop_loss: 0.012,
-                pyramid_profit: 0.004,
+                minimum_long_score: 0.54,
+                minimum_short_score: 0.54,
+                minimum_factor_score: 0.05,
+                minimum_trend_quality: 0.30,
+                minimum_adx: 6.0,
+                minimum_volume_ratio: -0.60,
+                take_profit: 0.010,
+                stop_loss: 0.010,
+                pyramid_profit: 0.003,
                 pyramid_stake_ratio: 0.60,
                 fee_rate: 0.0005,
                 slippage_rate: 0.0003,
-                min_net_profit: 0.0035,
-                min_pyramid_net_profit: 0.0015,
-                time_roll_net_profit: 0.0015,
+                min_net_profit: 0.0025,
+                min_pyramid_net_profit: 0.0010,
+                time_roll_net_profit: 0.0010,
                 daily_profit_target: 0.10,
                 daily_profit_timezone_offset_hours: 8.0,
             },
@@ -461,19 +466,13 @@ impl Default for AiTradingConfig {
             minimum_volume_ratio: -0.35,
             model_timeout_seconds: 30,
             market_max_age_seconds: 90,
-            one_signal_per_candle: true,
+            one_signal_per_candle: false,
         }
     }
 }
 
 pub fn default_ai_symbol_whitelist() -> Vec<String> {
-    [
-        "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "LINKUSDT",
-        "AVAXUSDT", "LTCUSDT",
-    ]
-    .iter()
-    .map(|symbol| symbol.to_string())
-    .collect()
+    vec!["BTCUSDT".to_string()]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

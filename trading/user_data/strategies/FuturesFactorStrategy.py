@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -13,6 +14,11 @@ PROFILE_ALIASES = {
     "compound_alpha_scalp": "balanced",
     "factor_alpha": "balanced",
     "default": "balanced",
+}
+
+MAJOR_BASES = {
+    "BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "TRX", "AVAX", "LINK",
+    "DOT", "LTC", "BCH", "TON", "NEAR", "UNI", "ATOM", "ETC", "FIL", "APT", "SUI",
 }
 
 PROFILE_DEFAULTS = {
@@ -73,17 +79,17 @@ PROFILE_DEFAULTS = {
         "long_vwap_factor": 0.995,
         "short_vwap_factor": 1.005,
         "gqt_compound_capital_usage_percent": 12.0,
-        "gqt_compound_take_profit": 0.018,
-        "gqt_compound_stop_loss": 0.014,
-        "gqt_compound_pyramid_profit": 0.006,
-        "gqt_compound_pyramid_stake_ratio": 0.45,
-        "gqt_compound_leverage": 2.0,
+        "gqt_compound_take_profit": 0.100,
+        "gqt_compound_stop_loss": 0.060,
+        "gqt_compound_pyramid_profit": 0.030,
+        "gqt_compound_pyramid_stake_ratio": 0.30,
+        "gqt_compound_leverage": 10.0,
         "gqt_compound_add_window": 0.85,
         "gqt_fee_rate": 0.0005,
         "gqt_slippage_rate": 0.0002,
-        "gqt_min_net_profit": 0.0060,
-        "gqt_min_pyramid_net_profit": 0.0025,
-        "gqt_time_roll_net_profit": 0.0025,
+        "gqt_min_net_profit": 0.0120,
+        "gqt_min_pyramid_net_profit": 0.0060,
+        "gqt_time_roll_net_profit": 0.0100,
         "gqt_daily_profit_lock_enabled": True,
         "gqt_daily_profit_force_exit": True,
         "gqt_daily_profit_target": 0.10,
@@ -99,12 +105,12 @@ PROFILE_DEFAULTS = {
         "max_drawdown_stop_candles": 24,
     },
     "aggressive": {
-        "minimum_long_score": 0.58,
-        "minimum_short_score": 0.58,
-        "minimum_factor_score": 0.08,
-        "minimum_trend_quality": 0.35,
-        "minimum_adx": 8.0,
-        "minimum_volume_ratio": -0.50,
+        "minimum_long_score": 0.54,
+        "minimum_short_score": 0.54,
+        "minimum_factor_score": 0.05,
+        "minimum_trend_quality": 0.30,
+        "minimum_adx": 6.0,
+        "minimum_volume_ratio": -0.60,
         "long_rsi_min": 30.0,
         "long_rsi_max": 82.0,
         "short_rsi_min": 18.0,
@@ -114,17 +120,17 @@ PROFILE_DEFAULTS = {
         "long_vwap_factor": 0.992,
         "short_vwap_factor": 1.008,
         "gqt_compound_capital_usage_percent": 18.0,
-        "gqt_compound_take_profit": 0.012,
-        "gqt_compound_stop_loss": 0.012,
-        "gqt_compound_pyramid_profit": 0.004,
+        "gqt_compound_take_profit": 0.010,
+        "gqt_compound_stop_loss": 0.010,
+        "gqt_compound_pyramid_profit": 0.003,
         "gqt_compound_pyramid_stake_ratio": 0.60,
-        "gqt_compound_leverage": 3.0,
+        "gqt_compound_leverage": 100.0,
         "gqt_compound_add_window": 0.92,
         "gqt_fee_rate": 0.0005,
         "gqt_slippage_rate": 0.0003,
-        "gqt_min_net_profit": 0.0035,
-        "gqt_min_pyramid_net_profit": 0.0015,
-        "gqt_time_roll_net_profit": 0.0015,
+        "gqt_min_net_profit": 0.0025,
+        "gqt_min_pyramid_net_profit": 0.0010,
+        "gqt_time_roll_net_profit": 0.0010,
         "gqt_daily_profit_lock_enabled": True,
         "gqt_daily_profit_force_exit": True,
         "gqt_daily_profit_target": 0.10,
@@ -147,8 +153,8 @@ class FuturesFactorStrategy(IStrategy):
 
     INTERFACE_VERSION = 3
     can_short = True
-    timeframe = "15m"
-    process_only_new_candles = True
+    timeframe = "5m"
+    process_only_new_candles = False
     startup_candle_count = 320
 
     position_adjustment_enable = True
@@ -170,6 +176,8 @@ class FuturesFactorStrategy(IStrategy):
 
     @property
     def protections(self) -> list[dict]:
+        if self._paper_data_collection_enabled():
+            return []
         return [
             {
                 "method": "CooldownPeriod",
@@ -247,12 +255,108 @@ class FuturesFactorStrategy(IStrategy):
         profile_value = self._profile().get(name, fallback)
         return self._bool(self._settings().get(name), self._bool(profile_value, fallback))
 
+    def _continuous_dry_run_entries_enabled(self) -> bool:
+        runtime_config = getattr(self, "config", {})
+        return (
+            isinstance(runtime_config, dict)
+            and runtime_config.get("dry_run") is True
+            and self._profile_bool("gqt_continuous_dry_run_entries", False)
+        )
+
+    def _paper_data_collection_enabled(self) -> bool:
+        runtime_config = getattr(self, "config", {})
+        return (
+            isinstance(runtime_config, dict)
+            and runtime_config.get("dry_run") is True
+            and str(self._settings().get("gqt_execution_mode", "paper")).strip().lower()
+            == "paper"
+            and self._profile_bool("gqt_paper_data_collection", True)
+        )
+
     def _cost_leverage(self) -> float:
         requested = self._profile_float(
             "gqt_compound_leverage",
             self._float_setting("leverage", 2.0),
         )
-        return max(1.0, requested)
+        return max(1.0, min(requested, 50.0))
+
+    def _execution_mode(self) -> str:
+        return str(self._settings().get("gqt_execution_mode", "paper")).strip().lower()
+
+    def _sentiment_bias(self, pair: str, current_time: datetime) -> tuple[float, float, int]:
+        """Read recent scanner sentiment and return (bias, quality, event_count).
+
+        The scanner stores normalized events in sentiment.sqlite.  Symbol-specific
+        events are preferred; global headlines are a weaker market-wide signal.
+        Missing or stale data is deliberately neutral so a feed outage cannot
+        create a directional trade by itself.
+        """
+        if not self._profile_bool("gqt_sentiment_enabled", True):
+            return 0.0, 0.0, 0
+        path = self._user_data / "sentiment.sqlite"
+        try:
+            timestamp = int(self._as_utc(current_time).timestamp())
+            bucket = timestamp // 60
+            base = pair.split("/", 1)[0].upper()
+            result_cache = getattr(self, "_sentiment_bias_cache", {})
+            cache_key = (base, bucket)
+            if cache_key in result_cache:
+                return result_cache[cache_key]
+            cached_rows = getattr(self, "_sentiment_rows_cache", None)
+            if cached_rows is None or cached_rows[0] != bucket:
+                cutoff = timestamp - 72 * 60 * 60
+                connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)
+                raw_rows = connection.execute(
+                    "SELECT symbol, payload_json FROM sentiment_events "
+                    "WHERE published_at >= ? ORDER BY published_at DESC LIMIT 1500",
+                    (cutoff,),
+                ).fetchall()
+                connection.close()
+                rows = []
+                for symbol, payload_json in raw_rows:
+                    try:
+                        rows.append((symbol, json.loads(payload_json)))
+                    except (TypeError, ValueError):
+                        continue
+                cached_rows = (bucket, rows)
+                setattr(self, "_sentiment_rows_cache", cached_rows)
+            rows = cached_rows[1]
+            weighted = 0.0
+            weight_total = 0.0
+            count = 0
+            for symbol, payload in rows:
+                symbols = {str(value).upper().replace("/", "").replace("USDT", "")
+                           for value in payload.get("symbols", []) if value}
+                event_symbol = str(symbol or payload.get("symbol", "")).upper()
+                specific = base in symbols or base in event_symbol
+                if not specific and (symbols or event_symbol):
+                    continue
+                sentiment = self._float(payload.get("sentiment"), 0.0)
+                confidence = self._float(payload.get("confidence"), 0.5)
+                credibility = self._float(payload.get("source_credibility"), 0.5)
+                weight = (2.0 if specific else 0.35) * max(0.1, confidence) * max(0.1, credibility)
+                weighted += sentiment * weight
+                weight_total += weight
+                count += 1
+            if weight_total <= 0.0:
+                result = (0.0, 0.0, 0)
+                result_cache[cache_key] = result
+                setattr(self, "_sentiment_bias_cache", result_cache)
+                return result
+            quality = min(1.0, weight_total / 3.0)
+            result = (float(np.clip(weighted / weight_total, -1.0, 1.0)), quality, count)
+            result_cache[cache_key] = result
+            setattr(self, "_sentiment_bias_cache", result_cache)
+            return result
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            return 0.0, 0.0, 0
+
+    def _leverage_cap(self, pair: str) -> float:
+        symbol = pair.replace("/", "").replace(":USDT", "").upper()
+        base = symbol[:-4] if symbol.endswith("USDT") else symbol
+        setting = "gqt_major_leverage_cap" if base in MAJOR_BASES else "gqt_alt_leverage_cap"
+        fallback = 50.0 if base in MAJOR_BASES else 5.0
+        return max(1.0, min(self._float_setting(setting, fallback), fallback))
 
     def _round_trip_cost_floor(self) -> float:
         fee_rate = max(0.0, self._profile_float("gqt_fee_rate", 0.0005))
@@ -439,6 +543,8 @@ class FuturesFactorStrategy(IStrategy):
         return (equity + extra_profit_abs - start_balance) / start_balance
 
     def _daily_target_reached(self, current_time: datetime, extra_profit_abs: float = 0.0) -> bool:
+        if self._paper_data_collection_enabled():
+            return False
         if not self._profile_bool("gqt_daily_profit_lock_enabled", True):
             return False
         state = self._daily_lock_state(current_time)
@@ -506,6 +612,12 @@ class FuturesFactorStrategy(IStrategy):
         low = dataframe["low"]
         volume = dataframe["volume"]
         typical = (high + low + close) / 3.0
+        sentiment_bias, sentiment_quality, sentiment_events = self._sentiment_bias(
+            str(metadata.get("pair", "")), self._dataframe_time(dataframe)
+        )
+        dataframe["sentiment_bias"] = sentiment_bias
+        dataframe["sentiment_quality"] = sentiment_quality
+        dataframe["sentiment_events"] = sentiment_events
 
         dataframe["ema_8"] = ta.EMA(dataframe, timeperiod=8)
         dataframe["ema_21"] = ta.EMA(dataframe, timeperiod=21)
@@ -697,6 +809,7 @@ class FuturesFactorStrategy(IStrategy):
                 (dataframe["volume_confirmation"], 0.10),
                 (dataframe["volatility_quality"], 0.07),
                 (self.bounded(dataframe["close_location"], -0.10, 0.90), 0.03),
+                (self.bounded(dataframe["sentiment_bias"], -0.10, 0.70), 0.10),
             ]
         )
         dataframe["short_score"] = self.weighted_score(
@@ -709,6 +822,7 @@ class FuturesFactorStrategy(IStrategy):
                 (dataframe["volume_confirmation"], 0.10),
                 (dataframe["volatility_quality"], 0.07),
                 (self.bounded(-dataframe["close_location"], -0.10, 0.90), 0.03),
+                (self.bounded(-dataframe["sentiment_bias"], -0.10, 0.70), 0.10),
             ]
         )
         dataframe["factor_score"] = dataframe["long_score"] - dataframe["short_score"]
@@ -757,6 +871,7 @@ class FuturesFactorStrategy(IStrategy):
             & (dataframe["rsi"].between(long_rsi_min, long_rsi_max))
             & (dataframe["atr_pct"].between(atr_min, atr_max))
             & (dataframe["close"] > dataframe["rolling_vwap"] * long_vwap_factor)
+            & ((dataframe["sentiment_quality"] < 0.35) | (dataframe["sentiment_bias"] >= -0.35))
         )
         short_conditions = (
             (dataframe["volume"] > 0)
@@ -768,10 +883,29 @@ class FuturesFactorStrategy(IStrategy):
             & (dataframe["rsi"].between(short_rsi_min, short_rsi_max))
             & (dataframe["atr_pct"].between(atr_min, atr_max))
             & (dataframe["close"] < dataframe["rolling_vwap"] * short_vwap_factor)
+            & ((dataframe["sentiment_quality"] < 0.35) | (dataframe["sentiment_bias"] <= 0.35))
         )
 
         dataframe.loc[long_conditions, ["enter_long", "enter_tag"]] = (1, "alpha_compound_long")
         dataframe.loc[short_conditions, ["enter_short", "enter_tag"]] = (1, "alpha_compound_short")
+
+        if self._continuous_dry_run_entries_enabled():
+            latest_index = dataframe.index[-1]
+            latest_factor = dataframe.at[latest_index, "factor_score"]
+            latest_volume = dataframe.at[latest_index, "volume"]
+            if (
+                np.isfinite(latest_factor)
+                and np.isfinite(latest_volume)
+                and latest_volume > 0
+                and dataframe.at[latest_index, "enter_long"] != 1
+                and dataframe.at[latest_index, "enter_short"] != 1
+            ):
+                if latest_factor >= 0:
+                    dataframe.at[latest_index, "enter_long"] = 1
+                    dataframe.at[latest_index, "enter_tag"] = "dry_run_continuous_factor_long"
+                else:
+                    dataframe.at[latest_index, "enter_short"] = 1
+                    dataframe.at[latest_index, "enter_tag"] = "dry_run_continuous_factor_short"
         return dataframe
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -830,6 +964,10 @@ class FuturesFactorStrategy(IStrategy):
         time_in_force: str, current_time: datetime, entry_tag: str | None,
         side: str, **kwargs,
     ) -> bool:
+        if self._execution_mode() == "recommend":
+            return False
+        if not bool(getattr(self, "config", {}).get("dry_run", True)) and self._execution_mode() != "live":
+            return False
         return not self._daily_target_reached(current_time)
 
     def custom_stake_amount(
@@ -889,6 +1027,17 @@ class FuturesFactorStrategy(IStrategy):
         if force_exit and self._daily_target_reached(current_time, extra_profit):
             return "daily_profit_target_lock"
 
+        if self._paper_data_collection_enabled():
+            open_date = getattr(trade, "open_date_utc", None)
+            if open_date is not None:
+                open_date = self._as_utc(open_date)
+                hold_minutes = max(
+                    1.0,
+                    self._profile_float("gqt_paper_collection_hold_minutes", 3.0),
+                )
+                if (self._as_utc(current_time) - open_date).total_seconds() >= hold_minutes * 60.0:
+                    return "paper_data_collection_roll"
+
         take_profit = self._take_profit_target()
         stop_loss = self._profile_float("gqt_compound_stop_loss", 0.014)
         if current_profit >= take_profit:
@@ -935,4 +1084,4 @@ class FuturesFactorStrategy(IStrategy):
             "gqt_compound_leverage",
             self._float_setting("leverage", 2.0),
         )
-        return max(1.0, min(requested, max_leverage))
+        return max(1.0, min(requested, self._leverage_cap(pair), max_leverage))

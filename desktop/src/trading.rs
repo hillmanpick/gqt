@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::{Duration as ChronoDuration, NaiveDate};
+use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, NaiveDate, NaiveDateTime, Utc};
 use rand::{RngCore, rngs::OsRng};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
@@ -33,6 +33,7 @@ pub struct TradingWorkspace {
     pub ai_config: PathBuf,
     pub ai_signals: PathBuf,
     pub ai_audit: PathBuf,
+    pub event_predictions: PathBuf,
 }
 
 impl TradingWorkspace {
@@ -62,6 +63,7 @@ impl TradingWorkspace {
             ai_config,
             ai_signals: root.join("user_data").join("ai_signals.json"),
             ai_audit: root.join("user_data").join("ai_audit.sqlite"),
+            event_predictions: root.join("user_data").join("event_predictions.sqlite"),
         };
         let ai_config = workspace.ai_trading_config().unwrap_or_default();
         workspace.sync_ai_runtime_config(&ai_config)?;
@@ -84,13 +86,28 @@ impl TradingWorkspace {
     fn sync_ai_runtime_config(&self, ai_config: &AiTradingConfig) -> Result<()> {
         let pairs = normalized_pairs(&ai_config.symbol_whitelist)?;
         let mut config: Value = serde_json::from_str(&fs::read_to_string(&self.config)?)?;
+        let all_futures_symbols = config["gqt_all_futures_symbols"].as_bool().unwrap_or(false);
         let exchange = config
             .as_object_mut()
             .context("Freqtrade 配置根节点无效")?
             .entry("exchange")
             .or_insert_with(|| json!({}));
         let exchange = exchange.as_object_mut().context("exchange 配置无效")?;
-        exchange.insert("pair_whitelist".into(), json!(pairs));
+        if all_futures_symbols {
+            exchange.remove("pair_whitelist");
+            config["pairlists"] = json!([
+                {
+                    "method": "VolumePairList",
+                    "number_assets": 1000,
+                    "sort_key": "quoteVolume",
+                    "min_value": 0,
+                    "refresh_period": 900
+                }
+            ]);
+        } else {
+            exchange.insert("pair_whitelist".into(), json!(pairs));
+            config["pairlists"] = json!([{ "method": "StaticPairList" }]);
+        }
         ensure_order_book_pricing(&mut config)?;
         ensure_compound_defaults(&mut config)?;
         let docker_proxy = crate::network::configured_docker_proxy();
@@ -130,7 +147,7 @@ impl TradingWorkspace {
             });
         } else if config["strategy"].as_str() == Some("AiSignalStrategy") {
             config["strategy"] = json!("FuturesFactorStrategy");
-            config["timeframe"] = json!("15m");
+            config["timeframe"] = json!("5m");
             config["margin_mode"] = json!("isolated");
         }
         write_json_atomic(&self.config, &config).context("无法同步 Freqtrade 交易白名单")?;
@@ -280,6 +297,23 @@ impl TradingWorkspace {
         api_key: &str,
         api_secret: &str,
     ) -> Result<String> {
+        // A container with the fixed name can have been started from another
+        // checkout (for example the repository's trading/ directory).  That
+        // silently splits the simulated account from the desktop workspace.
+        // Remove only that container when its bind mount is not this workspace;
+        // the SQLite files remain untouched on disk.
+        if start && !self.container_uses_workspace()? {
+            let output = background_command("docker")
+                .args(["rm", "-f", "binance-futures-factor"])
+                .output()
+                .context("无法移除指向其他工作区的交易容器")?;
+            if !output.status.success() {
+                bail!(
+                    "无法移除指向其他工作区的交易容器: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+        }
         let args: Vec<&str> = if start {
             let mut args = vec!["compose", "up", "-d"];
             if force_recreate {
@@ -320,6 +354,41 @@ impl TradingWorkspace {
             bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn container_uses_workspace(&self) -> Result<bool> {
+        let output = background_command("docker")
+            .args([
+                "inspect",
+                "--format",
+                "{{json .Mounts}}",
+                "binance-futures-factor",
+            ])
+            .output()
+            .context("无法检查交易容器挂载")?;
+        if !output.status.success() {
+            // No container yet: compose up will create the correctly mounted one.
+            return Ok(true);
+        }
+        let mounts: Value =
+            serde_json::from_slice(&output.stdout).context("交易容器挂载信息无效")?;
+        let expected = fs::canonicalize(&self.root)
+            .unwrap_or_else(|_| self.root.clone())
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        Ok(mounts.as_array().is_some_and(|items| {
+            items.iter().any(|mount| {
+                mount["Destination"].as_str() == Some("/freqtrade/user_data")
+                    && mount["Source"]
+                        .as_str()
+                        .map(|source| {
+                            source.replace('\\', "/").to_ascii_lowercase()
+                                == format!("{expected}/user_data")
+                        })
+                        .unwrap_or(false)
+            })
+        }))
     }
 
     pub fn simulation_account(&self) -> Result<SimulationAccount> {
@@ -364,7 +433,9 @@ impl TradingWorkspace {
                     stake_amount: row.get::<_, Option<f64>>(3)?.unwrap_or_default(),
                     open_rate: row.get::<_, Option<f64>>(4)?.unwrap_or_default(),
                     leverage: row.get::<_, Option<f64>>(5)?.unwrap_or(1.0),
-                    open_date: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                    open_date: format_trade_time(
+                        &row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                    ),
                     tag: row.get(7)?,
                 })
             })?
@@ -551,8 +622,8 @@ fn recent_position_history(connection: &Connection, limit: usize) -> Result<Vec<
             open_rate: row.get::<_, Option<f64>>(5)?.unwrap_or_default(),
             close_rate: row.get(6)?,
             leverage: row.get::<_, Option<f64>>(7)?.unwrap_or(1.0),
-            open_date: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
-            close_date: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+            open_date: format_trade_time(&row.get::<_, Option<String>>(8)?.unwrap_or_default()),
+            close_date: format_trade_time(&row.get::<_, Option<String>>(9)?.unwrap_or_default()),
             tag: row.get(10)?,
             exit_reason: row.get(11)?,
             profit_abs: row.get::<_, Option<f64>>(12)?.unwrap_or_default(),
@@ -561,6 +632,29 @@ fn recent_position_history(connection: &Connection, limit: usize) -> Result<Vec<
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .context("无法读取仓位历史")
+}
+
+fn format_trade_time(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return String::new();
+    }
+    let zone = FixedOffset::east_opt(8 * 60 * 60).expect("UTC+8 is a valid fixed offset");
+    if let Ok(time) = DateTime::parse_from_rfc3339(value) {
+        return time
+            .with_timezone(&zone)
+            .format("%m-%d %H:%M:%S")
+            .to_string();
+    }
+    for format in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"] {
+        if let Ok(time) = NaiveDateTime::parse_from_str(value, format) {
+            return DateTime::<Utc>::from_naive_utc_and_offset(time, Utc)
+                .with_timezone(&zone)
+                .format("%m-%d %H:%M:%S")
+                .to_string();
+        }
+    }
+    value.to_string()
 }
 
 fn normalized_pairs(symbols: &[String]) -> Result<Vec<String>> {
@@ -609,6 +703,14 @@ fn migrate_default_strategy(path: &Path) -> Result<()> {
                 || !source.contains("gqt_daily_profit_timezone_offset_hours")));
     if legacy_default {
         fs::write(path, DEFAULT_STRATEGY).context("无法迁移默认 Freqtrade 策略")?;
+    } else {
+        let updated = source.replace(
+            "process_only_new_candles = True",
+            "process_only_new_candles = False",
+        );
+        if updated != source {
+            fs::write(path, updated).context("无法更新 Freqtrade 策略处理频率")?;
+        }
     }
     Ok(())
 }
@@ -622,6 +724,14 @@ fn migrate_ai_strategy(path: &Path) -> Result<()> {
     if legacy_default {
         fs::write(path, DEFAULT_AI_STRATEGY)
             .context("Failed to migrate default AI Freqtrade strategy")?;
+    } else {
+        let updated = source.replace(
+            "process_only_new_candles = True",
+            "process_only_new_candles = False",
+        );
+        if updated != source {
+            fs::write(path, updated).context("Failed to update AI strategy processing cadence")?;
+        }
     }
     Ok(())
 }
@@ -658,6 +768,10 @@ fn migrate_ai_config(path: &Path) -> Result<()> {
         config.minimum_trend_quality = 0.42;
         config.minimum_adx = 10.0;
         config.minimum_volume_ratio = -0.35;
+        should_write = true;
+    }
+    if config.one_signal_per_candle {
+        config.one_signal_per_candle = false;
         should_write = true;
     }
     if should_write {
@@ -793,6 +907,16 @@ fn ensure_compound_defaults(config: &mut Value) -> Result<()> {
     root.entry("gqt_compound_pyramid_stake_ratio")
         .or_insert(json!(0.45));
     root.entry("gqt_compound_leverage").or_insert(json!(2));
+    root.entry("gqt_execution_mode").or_insert(json!("paper"));
+    root.entry("gqt_major_leverage_cap").or_insert(json!(50));
+    root.entry("gqt_alt_leverage_cap").or_insert(json!(5));
+    root.entry("gqt_sentiment_required").or_insert(json!(true));
+    root.entry("gqt_sentiment_enabled").or_insert(json!(true));
+    root.entry("gqt_all_futures_symbols").or_insert(json!(true));
+    root.entry("gqt_paper_data_collection")
+        .or_insert(json!(true));
+    root.entry("gqt_paper_collection_hold_minutes")
+        .or_insert(json!(3));
     root.entry("gqt_fee_rate").or_insert(json!(0.0005));
     root.entry("gqt_slippage_rate").or_insert(json!(0.0002));
     root.entry("gqt_min_net_profit").or_insert(json!(0.006));
@@ -831,19 +955,36 @@ fn ensure_ccxt_proxy(config: &mut Value, proxy: Option<&str>) -> Result<()> {
     let root = config
         .as_object_mut()
         .context("Freqtrade config root is invalid")?;
+
     for key in ["ccxt_config", "ccxt_async_config"] {
-        let ccxt = root.entry(key).or_insert_with(|| json!({}));
+        if root.get(key).is_some_and(|value| !value.is_object()) {
+            bail!("legacy {key} config is invalid");
+        }
+    }
+    let legacy_ccxt = ["ccxt_config", "ccxt_async_config"].map(|key| (key, root.remove(key)));
+    let exchange = root
+        .entry("exchange")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("exchange config is invalid")?;
+
+    for (key, legacy) in legacy_ccxt {
+        let ccxt = exchange.entry(key).or_insert_with(|| json!({}));
         let ccxt = ccxt
             .as_object_mut()
             .with_context(|| format!("{key} config is invalid"))?;
+        if let Some(Value::Object(legacy)) = legacy {
+            for (legacy_key, legacy_value) in legacy {
+                if !ccxt.contains_key(&legacy_key) {
+                    ccxt.insert(legacy_key, legacy_value);
+                }
+            }
+        }
+        ccxt.remove("httpProxy");
+        ccxt.remove("httpsProxy");
+        ccxt.remove("aiohttpProxy");
         if let Some(proxy) = proxy {
-            ccxt.insert("httpProxy".into(), json!(proxy));
             ccxt.insert("httpsProxy".into(), json!(proxy));
-            ccxt.insert("aiohttpProxy".into(), json!(proxy));
-        } else {
-            ccxt.remove("httpProxy");
-            ccxt.remove("httpsProxy");
-            ccxt.remove("aiohttpProxy");
         }
     }
     Ok(())
@@ -1010,11 +1151,101 @@ mod tests {
         assert_eq!(config["timeframe"], "1h");
         assert_eq!(config["margin_mode"], "cross");
         assert_eq!(config["gqt_compound_leverage"], 50);
-        assert_eq!(
-            config["exchange"]["pair_whitelist"],
-            json!(["SOL/USDT:USDT", "DOGE/USDT:USDT"])
-        );
+        assert!(config["exchange"]["pair_whitelist"].is_null());
+        assert_eq!(config["pairlists"][0]["method"], "VolumePairList");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stores_ccxt_proxy_under_exchange_and_migrates_legacy_values() {
+        let mut config = json!({
+            "exchange": {
+                "name": "binance",
+                "ccxt_config": {"enableRateLimit": true},
+                "ccxt_async_config": {"enableRateLimit": true}
+            },
+            "ccxt_config": {
+                "legacyOption": "keep-me",
+                "httpProxy": "http://old-proxy:7890"
+            },
+            "ccxt_async_config": {
+                "legacyAsyncOption": "keep-me-too",
+                "aiohttpProxy": "http://old-proxy:7890"
+            }
+        });
+
+        ensure_ccxt_proxy(&mut config, Some("http://host.docker.internal:7890")).unwrap();
+
+        assert!(config.get("ccxt_config").is_none());
+        assert!(config.get("ccxt_async_config").is_none());
+        assert_eq!(config["exchange"]["ccxt_config"]["enableRateLimit"], true);
+        assert_eq!(config["exchange"]["ccxt_config"]["legacyOption"], "keep-me");
+        assert_eq!(
+            config["exchange"]["ccxt_config"]["httpsProxy"],
+            "http://host.docker.internal:7890"
+        );
+        assert!(config["exchange"]["ccxt_config"].get("httpProxy").is_none());
+        assert!(
+            config["exchange"]["ccxt_config"]
+                .get("aiohttpProxy")
+                .is_none()
+        );
+        assert_eq!(
+            config["exchange"]["ccxt_async_config"]["legacyAsyncOption"],
+            "keep-me-too"
+        );
+        assert_eq!(
+            config["exchange"]["ccxt_async_config"]["httpsProxy"],
+            "http://host.docker.internal:7890"
+        );
+        assert!(
+            config["exchange"]["ccxt_async_config"]
+                .get("httpProxy")
+                .is_none()
+        );
+        assert!(
+            config["exchange"]["ccxt_async_config"]
+                .get("aiohttpProxy")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn removes_only_ccxt_proxy_values_when_proxy_is_unavailable() {
+        let mut config = json!({
+            "exchange": {
+                "name": "binance",
+                "ccxt_config": {
+                    "enableRateLimit": true,
+                    "customOption": 7,
+                    "httpProxy": "http://old-proxy:7890",
+                    "httpsProxy": "http://old-proxy:7890",
+                    "aiohttpProxy": "http://old-proxy:7890"
+                },
+                "ccxt_async_config": {
+                    "enableRateLimit": true,
+                    "customAsyncOption": 9,
+                    "httpProxy": "http://old-proxy:7890",
+                    "httpsProxy": "http://old-proxy:7890",
+                    "aiohttpProxy": "http://old-proxy:7890"
+                }
+            }
+        });
+
+        ensure_ccxt_proxy(&mut config, None).unwrap();
+
+        assert_eq!(config["exchange"]["name"], "binance");
+        for key in ["ccxt_config", "ccxt_async_config"] {
+            assert_eq!(config["exchange"][key]["enableRateLimit"], true);
+            assert!(config["exchange"][key].get("httpProxy").is_none());
+            assert!(config["exchange"][key].get("httpsProxy").is_none());
+            assert!(config["exchange"][key].get("aiohttpProxy").is_none());
+        }
+        assert_eq!(config["exchange"]["ccxt_config"]["customOption"], 7);
+        assert_eq!(
+            config["exchange"]["ccxt_async_config"]["customAsyncOption"],
+            9
+        );
     }
 
     #[test]
@@ -1042,15 +1273,11 @@ mod tests {
         let workspace = TradingWorkspace::ensure(&root).unwrap();
         let stored_ai = workspace.ai_trading_config().unwrap();
         assert_eq!(stored_ai.symbol_whitelist, default_ai_symbol_whitelist());
+        assert!(!stored_ai.one_signal_per_candle);
         let config: Value =
             serde_json::from_str(&fs::read_to_string(&workspace.config).unwrap()).unwrap();
-        assert_eq!(
-            config["exchange"]["pair_whitelist"]
-                .as_array()
-                .unwrap()
-                .len(),
-            10
-        );
+        assert!(config["exchange"]["pair_whitelist"].is_null());
+        assert_eq!(config["pairlists"][0]["method"], "VolumePairList");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1075,8 +1302,8 @@ mod tests {
             .unwrap();
         drop(connection);
         let account = workspace.simulation_account().unwrap();
-        assert_eq!(account.wallet_balance, 1025.0);
-        assert_eq!(account.available_balance, 975.0);
+        assert_eq!(account.wallet_balance, 2025.0);
+        assert_eq!(account.available_balance, 1975.0);
         assert_eq!(account.closed_trades, 1);
         assert_eq!(account.open_trades[0].side, "空");
         assert_eq!(account.trade_history.len(), 2);

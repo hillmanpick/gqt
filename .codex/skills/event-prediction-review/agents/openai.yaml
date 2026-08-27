@@ -1,0 +1,4 @@
+interface:
+  display_name: "Event Prediction Review"
+  short_description: "Review GQT event prediction virtual orders"
+  default_prompt: "Review the latest GQT event prediction virtual-order results and propose measurable tuning changes."

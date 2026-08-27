@@ -9,13 +9,19 @@ from pandas import DataFrame, Series
 from freqtrade.strategy import IStrategy
 
 
+MAJOR_BASES = {
+    "BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "TRX", "AVAX", "LINK",
+    "DOT", "LTC", "BCH", "TON", "NEAR", "UNI", "ATOM", "ETC", "FIL", "APT", "SUI",
+}
+
+
 class AiSignalStrategy(IStrategy):
     """Executes AI signals only when the local multi-factor gate agrees."""
 
     INTERFACE_VERSION = 3
     can_short = True
     timeframe = "15m"
-    process_only_new_candles = True
+    process_only_new_candles = False
     startup_candle_count = 240
     position_adjustment_enable = False
 
@@ -39,6 +45,18 @@ class AiSignalStrategy(IStrategy):
         if isinstance(runtime_config, dict):
             config.update(runtime_config)
         return config
+
+    def _execution_mode(self) -> str:
+        return str(self._config().get("gqt_execution_mode", "paper")).strip().lower()
+
+    def _leverage_cap(self, pair: str) -> float:
+        config = self._config()
+        symbol = pair.replace("/", "").replace(":USDT", "").upper()
+        base = symbol[:-4] if symbol.endswith("USDT") else symbol
+        major = base in MAJOR_BASES
+        setting = "gqt_major_leverage_cap" if major else "gqt_alt_leverage_cap"
+        fallback = 50.0 if major else 5.0
+        return max(1.0, min(self._float(config.get(setting), fallback), fallback))
 
     @staticmethod
     def _float(value, fallback: float) -> float:
@@ -487,6 +505,10 @@ class AiSignalStrategy(IStrategy):
         time_in_force: str, current_time: datetime, entry_tag: str | None,
         side: str, **kwargs,
     ) -> bool:
+        if self._execution_mode() == "recommend":
+            return False
+        if not bool(getattr(self, "config", {}).get("dry_run", True)) and self._execution_mode() != "live":
+            return False
         signal = self._valid_signal(pair)
         return (
             signal is not None
@@ -543,4 +565,4 @@ class AiSignalStrategy(IStrategy):
     ) -> float:
         config = self._config()
         requested = self._float(config.get("gqt_compound_leverage", config.get("leverage")), 1.0)
-        return max(1.0, min(requested, max_leverage))
+        return max(1.0, min(requested, self._leverage_cap(pair), max_leverage))

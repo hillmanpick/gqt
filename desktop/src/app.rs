@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::{Datelike, Local, TimeZone};
+use chrono::{Datelike, FixedOffset, TimeZone, Utc};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use directories::ProjectDirs;
 use eframe::egui::{
@@ -18,19 +18,24 @@ use zeroize::Zeroizing;
 use crate::{
     ai, ai_trader,
     audit::AuditLog,
+    event_prediction::{
+        self, EventHorizon, EventPredictionRunDirection, EventPredictionStats,
+        EventPredictionTicket,
+    },
     exchange, market,
     model::{
         AiProvider, AiTradingConfig, AiTradingInput, Candle, CredentialDraft, FuturesAccount,
         FuturesPosition, Interval, MarginMode, MarketCommand, MarketEvent, MarketSnapshot, Page,
         SecretStatus, SimulationAccount, StrategyProfile,
     },
+    scanner::{self, ScannerCommand, ScannerEvent, UniverseSnapshot},
     store::SecretStore,
     theme,
     trading::TradingWorkspace,
 };
 
 const AI_TIMEFRAMES: [&str; 6] = ["1m", "5m", "15m", "1h", "4h", "1d"];
-const BUILD_LABEL: &str = "0.4.0-factor-tuning";
+const BUILD_LABEL: &str = "0.4.0-event-batch5-v2";
 const RELAY_DEFAULT_MODEL: &str = "gpt-5.6-luna";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,14 +64,15 @@ impl EquityRange {
     }
 
     fn cutoff(self) -> i64 {
-        let now = Local::now();
+        let zone = utc8_offset();
+        let now = Utc::now().with_timezone(&zone);
         match self {
-            EquityRange::Today => Local
+            EquityRange::Today => zone
                 .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
                 .single()
                 .map(|time| time.timestamp())
                 .unwrap_or_else(|| now.timestamp() - 24 * 60 * 60),
-            EquityRange::Month => Local
+            EquityRange::Month => zone
                 .with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
                 .single()
                 .map(|time| time.timestamp())
@@ -113,6 +119,12 @@ pub struct GqtApp {
     market_error: String,
     market_commands: Sender<MarketCommand>,
     market_events: Receiver<MarketEvent>,
+    scanner_commands: Sender<ScannerCommand>,
+    scanner_events: Receiver<ScannerEvent>,
+    scanner_snapshot: UniverseSnapshot,
+    scanner_connected: bool,
+    scanner_error: String,
+    scanner_search: String,
     strategy_source: String,
     strategy_state: String,
     stake_amount: f64,
@@ -141,6 +153,32 @@ pub struct GqtApp {
     last_ai_decision_check: Instant,
     ai_decision_status: String,
     ai_processed_candles: BTreeMap<String, i64>,
+    event_prediction_enabled: bool,
+    event_prediction_running: bool,
+    last_event_prediction_check: Instant,
+    event_prediction_status: String,
+    event_prediction_open_count: i64,
+    event_prediction_legacy_open_count: i64,
+    event_prediction_starting_bankroll: f64,
+    event_prediction_stake_amount: f64,
+    event_prediction_realized_pnl: f64,
+    event_prediction_open_exposure: f64,
+    event_prediction_equity: f64,
+    event_prediction_available_balance: f64,
+    event_prediction_stats: Vec<EventPredictionStats>,
+    event_prediction_all_realized_pnl: f64,
+    event_prediction_all_stats: Vec<EventPredictionStats>,
+    event_prediction_recent: Vec<EventPredictionTicket>,
+    event_prediction_history: Vec<EventPredictionTicket>,
+    event_prediction_run_dialog_open: bool,
+    event_prediction_manual_10m: bool,
+    event_prediction_manual_30m: bool,
+    event_prediction_manual_60m: bool,
+    event_prediction_order_dialog: Option<EventOrderKind>,
+    event_prediction_ticket_dialog: Option<EventPredictionTicket>,
+    event_prediction_cycle_dialog: Option<EventPredictionCycleDialog>,
+    event_prediction_direction_dialog: Option<Vec<EventPredictionRunDirection>>,
+    event_prediction_direction_dialog_pending: bool,
     toast: Option<(String, bool, Instant)>,
     task_sender: mpsc::Sender<TaskEvent>,
     task_receiver: mpsc::Receiver<TaskEvent>,
@@ -167,6 +205,11 @@ enum TaskEvent {
     Account(Result<FuturesAccount, String>),
     Simulation(Result<SimulationAccount, String>),
     AiDecision(Result<AiDecisionSummary, String>),
+    EventPrediction(Result<event_prediction::EventPredictionSummary, String>),
+    EventPredictionCycle {
+        cycle_id: String,
+        result: Result<Vec<EventPredictionTicket>, String>,
+    },
 }
 
 struct AiDecisionSummary {
@@ -184,6 +227,38 @@ enum CredentialAction {
 enum LiveAction {
     Enable,
     Start,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EventOrderKind {
+    Open,
+    Settled,
+}
+
+#[derive(Clone)]
+struct EventPredictionCycleView {
+    cycle_id: String,
+    tickets: Vec<EventPredictionTicket>,
+}
+
+#[derive(Clone)]
+enum EventPredictionCycleDialog {
+    Loading { cycle_id: String },
+    Ready(EventPredictionCycleView),
+}
+
+impl EventPredictionCycleDialog {
+    fn cycle_id(&self) -> &str {
+        match self {
+            Self::Loading { cycle_id } => cycle_id,
+            Self::Ready(cycle) => &cycle.cycle_id,
+        }
+    }
+}
+
+enum EventTicketAction {
+    Ticket(EventPredictionTicket),
+    Cycle(String),
 }
 
 impl GqtApp {
@@ -226,6 +301,8 @@ impl GqtApp {
             symbol: initial_symbol.clone(),
             interval: Interval::FifteenMinutes,
         });
+        let (scanner_commands, scanner_events) =
+            scanner::start_worker(workspace.root.join("user_data"));
         let (task_sender, task_receiver) = mpsc::channel();
         let (docker_available, bot_state) = workspace.docker_state();
         let dry_run = workspace.dry_run().unwrap_or(true);
@@ -245,6 +322,15 @@ impl GqtApp {
         } else {
             AiProvider::DeepSeek
         };
+        let event_prediction_enabled = store
+            .setting("event_prediction_enabled")
+            .ok()
+            .flatten()
+            .is_none_or(|value| value != "false");
+        let event_prediction_dashboard =
+            event_prediction::EventPredictionLog::open(&workspace.event_predictions)
+                .and_then(|log| log.dashboard())
+                .unwrap_or_default();
         Self {
             store,
             workspace,
@@ -273,6 +359,12 @@ impl GqtApp {
             market_error: String::new(),
             market_commands,
             market_events,
+            scanner_commands,
+            scanner_events,
+            scanner_snapshot: UniverseSnapshot::default(),
+            scanner_connected: false,
+            scanner_error: String::new(),
+            scanner_search: String::new(),
             strategy_source,
             strategy_state: "未修改".into(),
             stake_amount,
@@ -305,6 +397,32 @@ impl GqtApp {
             last_ai_decision_check: Instant::now() - Duration::from_secs(60),
             ai_decision_status: "AI 闭环等待启动".into(),
             ai_processed_candles: BTreeMap::new(),
+            event_prediction_enabled,
+            event_prediction_running: false,
+            last_event_prediction_check: Instant::now() - Duration::from_secs(90),
+            event_prediction_status: event_prediction_dashboard.message,
+            event_prediction_open_count: event_prediction_dashboard.open_count,
+            event_prediction_legacy_open_count: event_prediction_dashboard.legacy_open_count,
+            event_prediction_starting_bankroll: event_prediction_dashboard.starting_bankroll,
+            event_prediction_stake_amount: event_prediction_dashboard.stake_amount,
+            event_prediction_realized_pnl: event_prediction_dashboard.realized_pnl,
+            event_prediction_open_exposure: event_prediction_dashboard.open_exposure,
+            event_prediction_equity: event_prediction_dashboard.equity,
+            event_prediction_available_balance: event_prediction_dashboard.available_balance,
+            event_prediction_stats: event_prediction_dashboard.stats,
+            event_prediction_all_realized_pnl: event_prediction_dashboard.all_realized_pnl,
+            event_prediction_all_stats: event_prediction_dashboard.all_stats,
+            event_prediction_recent: event_prediction_dashboard.open_recent,
+            event_prediction_history: event_prediction_dashboard.settled_recent,
+            event_prediction_run_dialog_open: false,
+            event_prediction_manual_10m: true,
+            event_prediction_manual_30m: true,
+            event_prediction_manual_60m: true,
+            event_prediction_order_dialog: None,
+            event_prediction_ticket_dialog: None,
+            event_prediction_cycle_dialog: None,
+            event_prediction_direction_dialog: None,
+            event_prediction_direction_dialog_pending: false,
             toast: None,
             task_sender,
             task_receiver,
@@ -333,6 +451,16 @@ impl GqtApp {
                 }
                 MarketEvent::Connection(connected) => self.market_connected = connected,
                 MarketEvent::Error(error) => self.market_error = error,
+            }
+        }
+        while let Ok(event) = self.scanner_events.try_recv() {
+            match event {
+                ScannerEvent::Snapshot(snapshot) => {
+                    self.scanner_snapshot = snapshot;
+                    self.scanner_error.clear();
+                }
+                ScannerEvent::Connection(connected) => self.scanner_connected = connected,
+                ScannerEvent::Error(error) => self.scanner_error = error,
             }
         }
         while let Ok(event) = self.task_receiver.try_recv() {
@@ -453,6 +581,75 @@ impl GqtApp {
                         Err(error) => {
                             self.ai_decision_status = error.clone();
                             self.toast(error, true);
+                        }
+                    }
+                }
+                TaskEvent::EventPrediction(result) => {
+                    self.event_prediction_running = false;
+                    let show_direction_dialog = self.event_prediction_direction_dialog_pending;
+                    self.event_prediction_direction_dialog_pending = false;
+                    match result {
+                        Ok(summary) => {
+                            let direction_text = format_event_run_directions(&summary.directions);
+                            let direction_suffix = if direction_text.is_empty() {
+                                String::new()
+                            } else {
+                                format!("；当前方向：{direction_text}")
+                            };
+                            self.event_prediction_status = format!(
+                                "{}；本轮评估 {}，新增订单 {}，结算 {}；同链未结算时等待{}",
+                                summary.message,
+                                summary.evaluated,
+                                summary.created,
+                                summary.settled,
+                                direction_suffix
+                            );
+                            self.event_prediction_open_count = summary.open_count;
+                            self.event_prediction_legacy_open_count = summary.legacy_open_count;
+                            self.event_prediction_starting_bankroll = summary.starting_bankroll;
+                            self.event_prediction_stake_amount = summary.stake_amount;
+                            self.event_prediction_realized_pnl = summary.realized_pnl;
+                            self.event_prediction_open_exposure = summary.open_exposure;
+                            self.event_prediction_equity = summary.equity;
+                            self.event_prediction_available_balance = summary.available_balance;
+                            self.event_prediction_stats = summary.stats;
+                            self.event_prediction_all_realized_pnl = summary.all_realized_pnl;
+                            self.event_prediction_all_stats = summary.all_stats;
+                            self.event_prediction_recent = summary.open_recent;
+                            self.event_prediction_history = summary.settled_recent;
+                            if show_direction_dialog && !summary.directions.is_empty() {
+                                self.event_prediction_direction_dialog =
+                                    Some(summary.directions.clone());
+                            }
+                        }
+                        Err(error) => {
+                            self.event_prediction_status = error.clone();
+                            self.toast(error, true);
+                        }
+                    }
+                }
+                TaskEvent::EventPredictionCycle { cycle_id, result } => {
+                    let is_current = self
+                        .event_prediction_cycle_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.cycle_id() == cycle_id);
+                    if !is_current {
+                        continue;
+                    }
+                    match result {
+                        Ok(tickets) if !tickets.is_empty() => {
+                            self.event_prediction_cycle_dialog =
+                                Some(EventPredictionCycleDialog::Ready(
+                                    EventPredictionCycleView { cycle_id, tickets },
+                                ));
+                        }
+                        Ok(_) => {
+                            self.event_prediction_cycle_dialog = None;
+                            self.toast(format!("周期 {cycle_id} 暂无订单"), true);
+                        }
+                        Err(error) => {
+                            self.event_prediction_cycle_dialog = None;
+                            self.toast(format!("读取周期 {cycle_id} 失败：{error}"), true);
                         }
                     }
                 }
@@ -634,47 +831,50 @@ impl GqtApp {
                 let status_height = 66.0;
                 let navigation_height = (ui.available_height() - status_height).max(0.0);
                 ui.allocate_ui(Vec2::new(ui.available_width(), navigation_height), |ui| {
-                    for page in Page::ALL {
-                        let active = self.page == page;
-                        let fill = if active {
-                            theme::SURFACE_2
-                        } else {
-                            Color32::TRANSPARENT
-                        };
-                        let stroke = if active {
-                            Stroke::new(1.0, theme::YELLOW)
-                        } else {
-                            Stroke::NONE
-                        };
-                        let response = Frame::NONE
-                            .fill(fill)
-                            .stroke(stroke)
-                            .corner_radius(4)
-                            .inner_margin(Margin::symmetric(10, 9))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(theme::icon(
-                                        page.icon(),
-                                        17.0,
-                                        if active { theme::YELLOW } else { theme::MUTED },
-                                    ));
-                                    ui.label(RichText::new(page.label()).color(if active {
-                                        theme::TEXT
-                                    } else {
-                                        theme::MUTED
-                                    }));
-                                });
-                            })
-                            .response
-                            .interact(Sense::click());
-                        if response.clicked() {
-                            self.page = page;
-                            if page == Page::Execution {
-                                self.refresh_logs();
+                    ScrollArea::vertical()
+                        .id_salt("sidebar_navigation")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for page in Page::ALL {
+                                let active = self.page == page;
+                                let fill = if active {
+                                    theme::SURFACE_2
+                                } else {
+                                    Color32::TRANSPARENT
+                                };
+                                let stroke = if active {
+                                    Stroke::new(1.0, theme::YELLOW)
+                                } else {
+                                    Stroke::NONE
+                                };
+                                let response = Frame::NONE
+                                    .fill(fill)
+                                    .stroke(stroke)
+                                    .corner_radius(4)
+                                    .inner_margin(Margin::symmetric(10, 9))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(theme::icon(
+                                                page.icon(),
+                                                17.0,
+                                                if active { theme::YELLOW } else { theme::MUTED },
+                                            ));
+                                            ui.label(RichText::new(page.label()).color(
+                                                if active { theme::TEXT } else { theme::MUTED },
+                                            ));
+                                        });
+                                    })
+                                    .response
+                                    .interact(Sense::click());
+                                if response.clicked() {
+                                    self.page = page;
+                                    if page == Page::Execution {
+                                        self.refresh_logs();
+                                    }
+                                }
+                                ui.add_space(3.0);
                             }
-                        }
-                        ui.add_space(3.0);
-                    }
+                        });
                 });
                 ui.separator();
                 self.render_sidebar_status(ui);
@@ -716,8 +916,7 @@ impl GqtApp {
                             .corner_radius(5)
                             .inner_margin(Margin::symmetric(13, 7))
                             .show(ui, |ui| {
-                                ui.set_min_width(118.0);
-                                ui.vertical_centered(|ui| {
+                                ui.horizontal(|ui| {
                                     ui.label(
                                         RichText::new(if self.dry_run {
                                             "模拟盘"
@@ -732,6 +931,7 @@ impl GqtApp {
                                         })
                                         .strong(),
                                     );
+                                    ui.separator();
                                     ui.label(
                                         RichText::new(state_label)
                                             .size(11.0)
@@ -756,7 +956,13 @@ impl GqtApp {
                 Page::Overview => self.render_overview(ui),
                 Page::Account => self.render_account(ui),
                 Page::PositionHistory => self.render_position_history(ui),
-                Page::Market => self.render_market(ui),
+                Page::EventPrediction => self.render_event_prediction(ui),
+                Page::Market => {
+                    ScrollArea::vertical()
+                        .id_salt("market-page-scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| self.render_market(ui));
+                }
                 Page::Strategy => self.render_strategy(ui),
                 Page::Backtest => self.render_backtest(ui),
                 Page::Data => self.render_data(ui),
@@ -1382,6 +1588,177 @@ impl GqtApp {
             });
     }
 
+    fn render_event_prediction(&mut self, ui: &mut Ui) {
+        ScrollArea::vertical()
+            .id_salt("event-prediction-page")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.render_event_prediction_inner(ui));
+    }
+
+    fn render_event_prediction_inner(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new("事件预测虚拟盘").size(16.0).strong());
+                ui.label(
+                    RichText::new(
+                        format!(
+                            "仅 BTC/ETH；10m / 30m / 1h 各自运行；每周期 5 条线，单线起始 5U、周期初始投入 25U；按轮次复投；当前策略 {}",
+                            event_prediction::EVENT_STRATEGY_NAME
+                        ),
+                    )
+                        .size(11.0)
+                        .color(theme::MUTED),
+                );
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        !self.event_prediction_running,
+                        theme::primary_button(if self.event_prediction_running {
+                            "运行中..."
+                        } else {
+                            "立即跑一轮"
+                        }),
+                    )
+                    .clicked()
+                {
+                    self.event_prediction_run_dialog_open = true;
+                }
+                let changed = ui
+                    .checkbox(&mut self.event_prediction_enabled, "启用每分钟策略评估")
+                    .changed();
+                if changed {
+                    let value = if self.event_prediction_enabled {
+                        "true"
+                    } else {
+                        "false"
+                    };
+                    if let Err(error) = self.store.set_setting("event_prediction_enabled", value) {
+                        self.toast(error.to_string(), true);
+                    }
+                }
+            });
+        });
+        ui.separator();
+        ui.label(
+            RichText::new(&self.event_prediction_status)
+                .size(12.0)
+                .color(theme::MUTED),
+        );
+        ui.add_space(10.0);
+
+        let stat10 = event_stat(&self.event_prediction_stats, 10);
+        let stat30 = event_stat(&self.event_prediction_stats, 30);
+        let stat60 = event_stat(&self.event_prediction_stats, 60);
+        let all_stat10 = event_stat(&self.event_prediction_all_stats, 10);
+        let all_stat30 = event_stat(&self.event_prediction_all_stats, 30);
+        let all_stat60 = event_stat(&self.event_prediction_all_stats, 60);
+        ui.columns(4, |cols| {
+            metric(
+                &mut cols[0],
+                "周期初始投入",
+                &format!(
+                    "{:.2} USDT",
+                    self.event_prediction_stake_amount * event_prediction::EVENT_CYCLE_SLOTS as f64
+                ),
+                &format!(
+                    "5 条线 × 单线 5U；虚拟本金 {}",
+                    format_event_money(self.event_prediction_starting_bankroll)
+                ),
+                theme::YELLOW,
+            );
+            metric(
+                &mut cols[1],
+                "单线起始本金",
+                &format!("{:.2} USDT", self.event_prediction_stake_amount),
+                "周期初始投入 25U（5 条线 × 5U）；赢后该线回报全额复投",
+                theme::TEXT,
+            );
+            metric(
+                &mut cols[2],
+                "当前策略收益",
+                &format!("{:+.2} USDT", self.event_prediction_realized_pnl),
+                &format!(
+                    "{} 已结算 {:+.2}",
+                    event_prediction::EVENT_STRATEGY_NAME,
+                    self.event_prediction_realized_pnl
+                ),
+                if self.event_prediction_realized_pnl >= 0.0 {
+                    theme::GREEN
+                } else {
+                    theme::RED
+                },
+            );
+            metric(
+                &mut cols[3],
+                "全历史收益",
+                &format!("{:+.2} USDT", self.event_prediction_all_realized_pnl),
+                &format!(
+                    "旧策略 + 当前策略；当前占用 {:.2}",
+                    self.event_prediction_open_exposure
+                ),
+                if self.event_prediction_all_realized_pnl >= 0.0 {
+                    theme::GREEN
+                } else {
+                    theme::RED
+                },
+            );
+        });
+        ui.add_space(10.0);
+        ui.columns(4, |cols| {
+            metric(
+                &mut cols[0],
+                "未结算票据",
+                &self.event_prediction_open_count.to_string(),
+                &format!(
+                    "周期票等待到期；另有旧玩法票 {} 张正在清算",
+                    self.event_prediction_legacy_open_count
+                ),
+                theme::YELLOW,
+            );
+            event_metric(&mut cols[1], "周期策略 10m", &stat10);
+            event_metric(&mut cols[2], "周期策略 30m", &stat30);
+            event_metric(&mut cols[3], "周期策略 1h", &stat60);
+        });
+        ui.add_space(10.0);
+        ui.columns(4, |cols| {
+            metric(
+                &mut cols[0],
+                "统计口径",
+                "10m / 30m / 1h",
+                "当前策略与全历史分别展示",
+                theme::TEXT,
+            );
+            event_metric(&mut cols[1], "历史 10m", &all_stat10);
+            event_metric(&mut cols[2], "历史 30m", &all_stat30);
+            event_metric(&mut cols[3], "历史 1h", &all_stat60);
+        });
+        ui.add_space(18.0);
+        if let Some(action) = event_ticket_list_card(
+            ui,
+            "未结算票据",
+            "按到期时间排序，最先需要复盘的排前面",
+            &self.event_prediction_recent,
+            "暂无未结算票据",
+            EventOrderKind::Open,
+            &mut self.event_prediction_order_dialog,
+        ) {
+            self.handle_event_ticket_action(action);
+        }
+        ui.add_space(14.0);
+        if let Some(action) = event_ticket_list_card(
+            ui,
+            "历史已结算",
+            "最近 80 条已结算虚拟订单，胜/负/平都在这里看",
+            &self.event_prediction_history,
+            "暂无历史已结算票据",
+            EventOrderKind::Settled,
+            &mut self.event_prediction_order_dialog,
+        ) {
+            self.handle_event_ticket_action(action);
+        }
+    }
+
     fn render_market(&mut self, ui: &mut Ui) {
         let symbols = self.visible_symbols();
         ui.horizontal(|ui| {
@@ -1549,9 +1926,389 @@ impl GqtApp {
                 });
             });
         });
+        ui.add_space(14.0);
+        self.render_scanner_panel(ui);
         if !self.market_error.is_empty() && !self.market_connected {
             ui.colored_label(theme::RED, &self.market_error);
         }
+    }
+
+    fn render_scanner_panel(&mut self, ui: &mut Ui) {
+        let snapshot = self.scanner_snapshot.clone();
+        let mut selected_symbol = None;
+        ui.horizontal(|ui| {
+            section_title(
+                ui,
+                "全市场扫描",
+                &format!(
+                    "{} 个 Binance USDT 交易对 · 更新 {}",
+                    snapshot.total_symbols,
+                    format_scanner_time_with_zone(snapshot.updated_at)
+                ),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.colored_label(
+                    if self.scanner_connected {
+                        theme::GREEN
+                    } else {
+                        theme::RED
+                    },
+                    if self.scanner_connected {
+                        "● 扫描中"
+                    } else {
+                        "● 扫描断开"
+                    },
+                );
+            });
+        });
+        if !snapshot.recommendations.is_empty() {
+            ui.add_space(6.0);
+            let heading = if snapshot.sentiment_configured {
+                format!(
+                    "推荐候选（已接入 {} 条舆情事件）",
+                    snapshot.sentiment_events
+                )
+            } else {
+                "推荐候选（未配置新闻/X API，当前只展示行情候选）".into()
+            };
+            ui.label(RichText::new(heading).color(theme::MUTED));
+            for recommendation in snapshot.recommendations.iter().take(5) {
+                Frame::NONE
+                    .fill(Color32::from_rgb(12, 16, 19))
+                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .corner_radius(3)
+                    .inner_margin(Margin::same(9))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&recommendation.symbol).strong());
+                            ui.colored_label(
+                                if recommendation.side == "LONG" {
+                                    theme::GREEN
+                                } else {
+                                    theme::RED
+                                },
+                                &recommendation.side,
+                            );
+                            ui.label(format!(
+                                "评分 {:.0} · 置信度 {:.0}%",
+                                recommendation.score,
+                                recommendation.confidence * 100.0
+                            ));
+                            ui.label(format!(
+                                "{} 杠杆上限 {}x / 建议 {}x",
+                                recommendation.category,
+                                recommendation.leverage_cap,
+                                recommendation.suggested_leverage
+                            ));
+                        });
+                        ui.label(RichText::new(&recommendation.reason).color(theme::MUTED));
+                        ui.label(
+                            RichText::new(format!(
+                                "触发：{} · 止损 {:.2}% · 止盈 {:.2}% · {}",
+                                recommendation.trigger,
+                                recommendation.stop_loss_percent,
+                                recommendation.take_profit_percent,
+                                recommendation.status
+                            ))
+                            .color(theme::MUTED),
+                        );
+                    });
+                ui.add_space(4.0);
+            }
+        } else {
+            let message = if snapshot.sentiment_configured {
+                "当前没有通过行情和舆情双重门槛的候选，不强行推荐。"
+            } else {
+                "当前没有可执行推荐；配置合规新闻/X API 后才会启用舆情确认。"
+            };
+            ui.label(RichText::new(message).color(theme::MUTED));
+        }
+        if !snapshot.headlines.is_empty() {
+            ui.add_space(8.0);
+            ui.label(RichText::new("最新舆情事件").color(theme::MUTED));
+            for headline in snapshot.headlines.iter().take(5) {
+                ui.horizontal_wrapped(|ui| {
+                    let sentiment_color = if headline.sentiment > 0.15 {
+                        theme::GREEN
+                    } else if headline.sentiment < -0.15 {
+                        theme::RED
+                    } else {
+                        theme::MUTED
+                    };
+                    ui.colored_label(sentiment_color, &headline.symbol);
+                    ui.label(format!(
+                        "{} · {} · {}",
+                        headline.event_type,
+                        headline.source,
+                        format_scanner_time(headline.published_at)
+                    ));
+                    if headline.url.starts_with("http://") || headline.url.starts_with("https://") {
+                        ui.hyperlink_to("来源", &headline.url);
+                    }
+                    ui.label(&headline.title);
+                });
+            }
+        }
+        if !snapshot.candidates.is_empty() {
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("全币种行情").strong());
+                ui.label(
+                    RichText::new("按综合评分排序 · 点击交易对查看 K 线")
+                        .size(12.0)
+                        .color(theme::MUTED),
+                );
+            });
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("搜索").color(theme::MUTED));
+                ui.add_sized(
+                    [250.0, 30.0],
+                    TextEdit::singleline(&mut self.scanner_search).hint_text("BTC、ETH 或合约代码"),
+                );
+                if ui
+                    .add_enabled(
+                        !self.scanner_search.is_empty(),
+                        theme::secondary_button("清除"),
+                    )
+                    .clicked()
+                {
+                    self.scanner_search.clear();
+                }
+                ui.label(
+                    RichText::new("持仓量仅对前 12 个高流动性合约请求")
+                        .size(12.0)
+                        .color(theme::MUTED),
+                );
+            });
+            let query = self.scanner_search.trim().to_ascii_uppercase();
+            let filtered_candidates = snapshot
+                .candidates
+                .iter()
+                .filter(|candidate| query.is_empty() || candidate.symbol.contains(&query))
+                .collect::<Vec<_>>();
+            ui.label(
+                RichText::new(format!(
+                    "显示 {} / {} 个 · 点击交易对切换上方 K 线",
+                    filtered_candidates.len(),
+                    snapshot.candidates.len()
+                ))
+                .color(theme::MUTED),
+            );
+            Frame::NONE
+                .fill(theme::SURFACE)
+                .stroke(Stroke::new(1.0, theme::BORDER))
+                .corner_radius(4)
+                .inner_margin(Margin::same(8))
+                .show(ui, |ui| {
+                    ScrollArea::both()
+                        .id_salt("scanner-market-table")
+                        .min_scrolled_height(210.0)
+                        .max_height(360.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_min_width(920.0);
+                            egui::Grid::new("scanner-market-grid")
+                                .striped(true)
+                                .min_col_width(92.0)
+                                .show(ui, |ui| {
+                                    for heading in [
+                                        "交易对",
+                                        "市场",
+                                        "分类",
+                                        "价格",
+                                        "24h涨跌",
+                                        "成交额",
+                                        "资金费率",
+                                        "舆情",
+                                        "评分",
+                                    ] {
+                                        ui.label(
+                                            RichText::new(heading).strong().color(theme::MUTED),
+                                        );
+                                    }
+                                    ui.end_row();
+                                    for candidate in filtered_candidates {
+                                        if ui
+                                            .selectable_label(
+                                                self.symbol == candidate.symbol,
+                                                RichText::new(&candidate.symbol).strong(),
+                                            )
+                                            .clicked()
+                                        {
+                                            selected_symbol = Some(candidate.symbol.clone());
+                                        }
+                                        ui.label(&candidate.market);
+                                        ui.label(&candidate.category);
+                                        ui.label(format_price(candidate.price));
+                                        let change_color = if candidate.change_percent > 0.0 {
+                                            theme::GREEN
+                                        } else if candidate.change_percent < 0.0 {
+                                            theme::RED
+                                        } else {
+                                            theme::MUTED
+                                        };
+                                        ui.colored_label(
+                                            change_color,
+                                            format!("{:+.2}%", candidate.change_percent),
+                                        );
+                                        ui.label(compact_scanner_volume(candidate.quote_volume));
+                                        ui.label(format!(
+                                            "{:+.4}%",
+                                            candidate.funding_rate * 100.0
+                                        ));
+                                        let sentiment_color = if candidate.sentiment_score > 0.15 {
+                                            theme::GREEN
+                                        } else if candidate.sentiment_score < -0.15 {
+                                            theme::RED
+                                        } else {
+                                            theme::MUTED
+                                        };
+                                        ui.colored_label(
+                                            sentiment_color,
+                                            if candidate.sentiment_event_count == 0 {
+                                                "--".into()
+                                            } else {
+                                                format!(
+                                                    "{} {:.2}",
+                                                    candidate.sentiment_label,
+                                                    candidate.sentiment_score
+                                                )
+                                            },
+                                        );
+                                        ui.label(format!("{:.1}", candidate.market_score));
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                });
+        }
+        self.render_scanner_rankings(ui, &snapshot);
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!(
+                "候选池 {} 个（U本位 + 现货） · 数据质量 {:.0}% · 舆情来源 {} · 时间 UTC+8",
+                snapshot.candidates.len(),
+                snapshot.data_quality * 100.0,
+                if snapshot.sentiment_configured {
+                    "已配置"
+                } else {
+                    "未配置"
+                }
+            ))
+            .color(theme::MUTED),
+        );
+        if !snapshot.sentiment_error.is_empty() {
+            ui.colored_label(
+                theme::RED,
+                format!("舆情源暂不可用：{}", snapshot.sentiment_error),
+            );
+        }
+        if !self.scanner_error.is_empty() {
+            ui.colored_label(theme::RED, &self.scanner_error);
+        }
+        if let Some(symbol) = selected_symbol
+            && self.symbol != symbol
+        {
+            self.symbol = symbol;
+            self.select_market();
+        }
+    }
+
+    fn render_scanner_rankings(&mut self, ui: &mut Ui, snapshot: &UniverseSnapshot) {
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("市场榜单").strong());
+            ui.label(
+                RichText::new("按 24h 表现和成交活跃度排序")
+                    .size(12.0)
+                    .color(theme::MUTED),
+            );
+        });
+        let render_ranking =
+            |ui: &mut Ui, title: &str, rows: &[scanner::MarketCandidate], accent: Color32| {
+                Frame::NONE
+                    .fill(theme::SURFACE)
+                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .corner_radius(4)
+                    .inner_margin(Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_min_height(226.0);
+                        ui.label(RichText::new(title).strong().color(accent));
+                        ui.add_space(4.0);
+                        if rows.is_empty() {
+                            ui.label(RichText::new("暂无数据").color(theme::MUTED));
+                        }
+                        for row in rows.iter().take(7) {
+                            ui.horizontal(|ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.label(RichText::new(&row.symbol).strong());
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.colored_label(
+                                        if row.change_percent >= 0.0 {
+                                            theme::GREEN
+                                        } else {
+                                            theme::RED
+                                        },
+                                        format!("{:+.2}%", row.change_percent),
+                                    );
+                                    ui.add_space(10.0);
+                                    ui.label(
+                                        RichText::new(format_price(row.price)).color(theme::MUTED),
+                                    );
+                                });
+                            });
+                        }
+                    });
+            };
+        ui.columns(2, |columns| {
+            render_ranking(&mut columns[0], "涨幅榜", &snapshot.gainers, theme::GREEN);
+            render_ranking(&mut columns[1], "跌幅榜", &snapshot.losers, theme::RED);
+        });
+        ui.add_space(8.0);
+        ui.columns(2, |columns| {
+            render_ranking(&mut columns[0], "热门榜", &snapshot.hot, theme::YELLOW);
+            Frame::NONE
+                .fill(theme::SURFACE)
+                .stroke(Stroke::new(1.0, theme::BORDER))
+                .corner_radius(4)
+                .inner_margin(Margin::same(10))
+                .show(&mut columns[1], |ui| {
+                    ui.set_min_height(226.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("持续上涨监测").strong().color(theme::GREEN));
+                        ui.label(
+                            RichText::new("连续 3 次扫描上升")
+                                .size(12.0)
+                                .color(theme::MUTED),
+                        );
+                    });
+                    ui.add_space(4.0);
+                    if snapshot.rising.is_empty() {
+                        ui.label(RichText::new("正在积累连续上涨样本...").color(theme::MUTED));
+                    } else {
+                        ui.vertical(|ui| {
+                            for row in snapshot.rising.iter().take(7) {
+                                if ui
+                                    .selectable_label(
+                                        self.symbol == row.symbol,
+                                        format!(
+                                            "{}  {}  {:+.2}%",
+                                            row.symbol,
+                                            format_price(row.price),
+                                            row.change_percent
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    self.symbol = row.symbol.clone();
+                                    self.select_market();
+                                }
+                            }
+                        });
+                    }
+                });
+        });
     }
 
     fn render_strategy(&mut self, ui: &mut Ui) {
@@ -2046,6 +2803,485 @@ impl GqtApp {
         }
     }
 
+    fn render_event_prediction_dialogs(&mut self, ctx: &egui::Context) {
+        self.render_event_prediction_run_dialog(ctx);
+        self.render_event_prediction_direction_dialog(ctx);
+        self.render_event_prediction_order_dialog(ctx);
+        self.render_event_prediction_cycle_dialog(ctx);
+        self.render_event_prediction_ticket_dialog(ctx);
+    }
+
+    fn handle_event_ticket_action(&mut self, action: EventTicketAction) {
+        match action {
+            EventTicketAction::Ticket(ticket) => {
+                self.event_prediction_cycle_dialog = None;
+                self.event_prediction_ticket_dialog = Some(ticket);
+            }
+            EventTicketAction::Cycle(cycle_id) => self.request_event_prediction_cycle(cycle_id),
+        }
+    }
+
+    fn request_event_prediction_cycle(&mut self, cycle_id: String) {
+        let cycle_id = cycle_id.trim().to_string();
+        if cycle_id.is_empty() {
+            return;
+        }
+        let path = self.workspace.event_predictions.clone();
+        let sender = self.task_sender.clone();
+        self.event_prediction_order_dialog = None;
+        self.event_prediction_ticket_dialog = None;
+        self.event_prediction_cycle_dialog = Some(EventPredictionCycleDialog::Loading {
+            cycle_id: cycle_id.clone(),
+        });
+        thread::spawn(move || {
+            let result = event_prediction::EventPredictionLog::open(&path)
+                .and_then(|log| log.cycle_tickets(&cycle_id))
+                .map_err(|error| error.to_string());
+            let _ = sender.send(TaskEvent::EventPredictionCycle { cycle_id, result });
+        });
+    }
+
+    fn render_event_prediction_run_dialog(&mut self, ctx: &egui::Context) {
+        if !self.event_prediction_run_dialog_open {
+            return;
+        }
+
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("立即跑一轮事件预测")
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.label("选择这次要生成的虚拟预测周期：");
+                ui.add_space(6.0);
+                ui.checkbox(&mut self.event_prediction_manual_10m, "10 分钟");
+                ui.checkbox(&mut self.event_prediction_manual_30m, "30 分钟");
+                ui.checkbox(&mut self.event_prediction_manual_60m, "1 小时");
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("确认后会立即读取 Binance Futures 公共行情，并返回 BTC/ETH 当前买涨或买跌。")
+                        .size(11.0)
+                        .color(theme::MUTED),
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let has_selection = self.event_prediction_manual_10m
+                        || self.event_prediction_manual_30m
+                        || self.event_prediction_manual_60m;
+                    if ui
+                        .add_enabled(
+                            has_selection && !self.event_prediction_running,
+                            theme::primary_button("确认运行"),
+                        )
+                        .clicked()
+                    {
+                        confirm = true;
+                    }
+                    if ui.add(theme::secondary_button("取消")).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if confirm {
+            self.event_prediction_run_dialog_open = false;
+            self.start_event_prediction_manual_cycle();
+        } else if cancel || !open {
+            self.event_prediction_run_dialog_open = false;
+        }
+    }
+
+    fn render_event_prediction_direction_dialog(&mut self, ctx: &egui::Context) {
+        let Some(directions) = self.event_prediction_direction_dialog.clone() else {
+            return;
+        };
+
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new("本轮应该买什么")
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(true)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_min_width(560.0);
+                ui.label(
+                    RichText::new("这是刚刚“立即跑一轮”生成的 BTC/ETH 虚拟预测方向：")
+                        .size(13.0)
+                        .color(theme::TEXT),
+                );
+                ui.label(
+                    RichText::new(
+                        "只提示当前策略方向；事件预测仍然是虚拟下单，不是真实 Binance 下单。",
+                    )
+                    .size(11.0)
+                    .color(theme::MUTED),
+                );
+                ui.add_space(10.0);
+                egui::Grid::new("event-prediction-direction-dialog-grid")
+                    .num_columns(5)
+                    .striped(true)
+                    .spacing([18.0, 12.0])
+                    .show(ui, |ui| {
+                        for heading in ["时间段", "交易对", "建议", "置信度", "状态"] {
+                            ui.label(RichText::new(heading).color(theme::MUTED).strong());
+                        }
+                        ui.end_row();
+                        let mut sorted = directions.clone();
+                        sorted.sort_by(|left, right| {
+                            left.horizon_minutes
+                                .cmp(&right.horizon_minutes)
+                                .then_with(|| left.symbol.cmp(&right.symbol))
+                        });
+                        for direction in sorted {
+                            ui.label(format_event_direction_window(&direction));
+                            ui.label(
+                                RichText::new(compact_event_symbol(&direction.symbol)).strong(),
+                            );
+                            ui.colored_label(
+                                prediction_direction_color(&direction.direction),
+                                prediction_trade_direction_label(&direction.direction),
+                            );
+                            ui.label(format!("{:.1}%", direction.confidence * 100.0));
+                            ui.label(if direction.created {
+                                "本轮已写入"
+                            } else {
+                                "等待上一单结算"
+                            });
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(12.0);
+                if ui.add(theme::primary_button("知道了")).clicked() {
+                    close = true;
+                }
+            });
+
+        if close || !open {
+            self.event_prediction_direction_dialog = None;
+        }
+    }
+
+    fn render_event_prediction_order_dialog(&mut self, ctx: &egui::Context) {
+        let Some(kind) = self.event_prediction_order_dialog else {
+            return;
+        };
+        let (title, context, tickets, scroll_id, empty_text) = match kind {
+            EventOrderKind::Open => (
+                "未结算票据大列表",
+                "当前策略最近 80 条未结算票据；点票据编号看详情，点周期编号看整组订单",
+                &self.event_prediction_recent,
+                "event-prediction-open-dialog-scroll",
+                "暂无未结算票据",
+            ),
+            EventOrderKind::Settled => (
+                "历史已结算大列表",
+                "当前策略最近 80 条已结算虚拟订单；点票据编号看详情，点周期编号看整组订单",
+                &self.event_prediction_history,
+                "event-prediction-history-dialog-scroll",
+                "暂无历史已结算票据",
+            ),
+        };
+        let mut open = true;
+        let mut close = false;
+        let mut selected_action = None;
+        let content_rect = ctx.content_rect();
+        let dialog_width = (content_rect.width() - 32.0).clamp(280.0, 1180.0);
+        let dialog_height = (content_rect.height() - 32.0).clamp(280.0, 760.0);
+        egui::Window::new(title)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(dialog_width)
+            .max_width(dialog_width)
+            .max_height(dialog_height)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                selected_action = event_ticket_table(
+                    ui,
+                    scroll_id,
+                    title,
+                    context,
+                    tickets,
+                    empty_text,
+                    (dialog_height - 125.0).max(220.0),
+                    true,
+                );
+                ui.add_space(8.0);
+                if ui.add(theme::secondary_button("关闭")).clicked() {
+                    close = true;
+                }
+            });
+
+        if let Some(action) = selected_action {
+            self.event_prediction_order_dialog = None;
+            self.handle_event_ticket_action(action);
+            return;
+        }
+        let escape_pressed = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        if close || !open || escape_pressed {
+            self.event_prediction_order_dialog = None;
+        }
+    }
+
+    fn render_event_prediction_cycle_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.event_prediction_cycle_dialog.clone() else {
+            return;
+        };
+
+        if let EventPredictionCycleDialog::Loading { cycle_id } = dialog {
+            let mut open = true;
+            let mut close = false;
+            egui::Window::new(format!("正在读取周期 {cycle_id}"))
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.spinner();
+                    ui.label("正在从完整历史中读取这个周期的全部订单…");
+                    if ui.add(theme::secondary_button("取消")).clicked() {
+                        close = true;
+                    }
+                });
+            let escape_pressed = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+            if close || !open || escape_pressed {
+                self.event_prediction_cycle_dialog = None;
+            }
+            return;
+        }
+        let EventPredictionCycleDialog::Ready(cycle) = dialog else {
+            return;
+        };
+
+        let mut tickets = cycle.tickets.clone();
+        tickets.sort_by(|left, right| {
+            left.cycle_order
+                .cmp(&right.cycle_order)
+                .then_with(|| {
+                    left.cycle_slot
+                        .unwrap_or_default()
+                        .cmp(&right.cycle_slot.unwrap_or_default())
+                })
+                .then_with(|| left.open_time.cmp(&right.open_time))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let settled = tickets
+            .iter()
+            .filter(|ticket| ticket.status == "settled")
+            .count();
+        let wins = tickets
+            .iter()
+            .filter(|ticket| ticket.result == "win")
+            .count();
+        let losses = tickets
+            .iter()
+            .filter(|ticket| ticket.result == "loss")
+            .count();
+        let ties = tickets
+            .iter()
+            .filter(|ticket| ticket.result == "tie")
+            .count();
+        let pnl = tickets
+            .iter()
+            .filter_map(|ticket| ticket.virtual_pnl)
+            .sum::<f64>();
+        let context = format!(
+            "完整周期共 {} 笔，按轮次、线路排序；已结算 {}；{} 胜 / {} 负 / {} 平；累计盈亏 {:+.2} USDT",
+            tickets.len(),
+            settled,
+            wins,
+            losses,
+            ties,
+            pnl
+        );
+        let mut open = true;
+        let mut close = false;
+        let mut selected_action = None;
+        let scroll_id = format!("event-prediction-cycle-dialog-scroll-{}", cycle.cycle_id);
+        let content_rect = ctx.content_rect();
+        let dialog_width = (content_rect.width() - 32.0).clamp(280.0, 1180.0);
+        let dialog_height = (content_rect.height() - 32.0).clamp(280.0, 760.0);
+        egui::Window::new(format!("周期订单 {}", cycle.cycle_id))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(dialog_width)
+            .max_width(dialog_width)
+            .max_height(dialog_height)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                selected_action = event_ticket_table(
+                    ui,
+                    &scroll_id,
+                    &cycle.cycle_id,
+                    &context,
+                    &tickets,
+                    "该周期暂无订单",
+                    (dialog_height - 125.0).max(220.0),
+                    false,
+                );
+                ui.add_space(8.0);
+                if ui.add(theme::secondary_button("关闭")).clicked() {
+                    close = true;
+                }
+            });
+
+        if let Some(EventTicketAction::Ticket(ticket)) = selected_action {
+            self.event_prediction_cycle_dialog = None;
+            self.event_prediction_ticket_dialog = Some(ticket);
+            return;
+        }
+        let escape_pressed = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        if close || !open || escape_pressed {
+            self.event_prediction_cycle_dialog = None;
+        }
+    }
+
+    fn render_event_prediction_ticket_dialog(&mut self, ctx: &egui::Context) {
+        let Some(ticket) = self.event_prediction_ticket_dialog.clone() else {
+            return;
+        };
+
+        let mut open = true;
+        let mut close = false;
+        let content_rect = ctx.content_rect();
+        let mut selected_cycle = None;
+        let dialog_width = (content_rect.width() - 32.0).clamp(280.0, 540.0);
+        let dialog_height = (content_rect.height() - 32.0).clamp(280.0, 760.0);
+        egui::Window::new(format!("订单详情 {}", compact_event_id(&ticket.id)))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(true)
+            .min_width(dialog_width)
+            .max_width(dialog_width)
+            .max_height(dialog_height)
+            .vscroll(true)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&ticket.symbol).size(18.0).strong());
+                    ui.colored_label(
+                        prediction_direction_color(&ticket.direction),
+                        prediction_direction_label(&ticket.direction),
+                    );
+                    ui.colored_label(
+                        prediction_result_color(&ticket),
+                        prediction_result_label(&ticket),
+                    );
+                });
+                ui.add_space(8.0);
+                event_ticket_detail_row(ui, "完整票据 ID", &ticket.id);
+                event_ticket_detail_row(ui, "交易对", &ticket.symbol);
+                event_ticket_detail_row(ui, "周期", &format!("{}m", ticket.horizon_minutes));
+                if event_ticket_cycle_detail_row(ui, &ticket) {
+                    close = true;
+                    selected_cycle = Some(ticket.cycle_id.clone());
+                }
+                event_ticket_detail_row(
+                    ui,
+                    "周期轮次",
+                    &if ticket.cycle_order > 0 {
+                        format!("第 {} 轮", ticket.cycle_order)
+                    } else {
+                        "--".into()
+                    },
+                );
+                event_ticket_detail_row(
+                    ui,
+                    "线路槽位",
+                    &if ticket.cycle_slot.is_some_and(|slot| slot > 0) {
+                        format!("{} 号线", ticket.cycle_slot.unwrap_or_default())
+                    } else {
+                        "--".into()
+                    },
+                );
+                event_ticket_detail_row(
+                    ui,
+                    "方向",
+                    prediction_trade_direction_label(&ticket.direction),
+                );
+                event_ticket_detail_row(
+                    ui,
+                    "置信度",
+                    &format!("{:.1}%", ticket.confidence * 100.0),
+                );
+                event_ticket_detail_row(ui, "分数", &format!("{:+.3}", ticket.score));
+                event_ticket_detail_row(ui, "下注", &format!("{:.2} USDT", ticket.stake_amount));
+                event_ticket_detail_row(
+                    ui,
+                    "本单结算回报",
+                    &ticket
+                        .cycle_balance_after
+                        .map(|value| format!("{value:.2} USDT"))
+                        .unwrap_or_else(|| "--".into()),
+                );
+                event_ticket_detail_row(ui, "开盘价", &format_price(ticket.entry_price));
+                event_ticket_detail_row(
+                    ui,
+                    "到期价",
+                    &ticket
+                        .expiry_price
+                        .map(format_price)
+                        .unwrap_or_else(|| "--".into()),
+                );
+                event_ticket_detail_row(ui, "状态", &ticket.status);
+                event_ticket_detail_row(ui, "结果", prediction_result_label(&ticket));
+                event_ticket_detail_row(
+                    ui,
+                    "波动",
+                    &ticket
+                        .move_percent
+                        .map(|value| format!("{value:+.4}%"))
+                        .unwrap_or_else(|| "--".into()),
+                );
+                event_ticket_detail_row(
+                    ui,
+                    "虚拟盈亏",
+                    &ticket
+                        .virtual_pnl
+                        .map(|value| format!("{value:+.2} USDT"))
+                        .unwrap_or_else(|| "--".into()),
+                );
+                event_ticket_detail_row(ui, "开盘时间", &format_event_time(ticket.open_time));
+                event_ticket_detail_row(ui, "到期时间", &format_event_time(ticket.close_time));
+                ui.add_space(8.0);
+                ui.label(RichText::new("复盘").color(theme::MUTED));
+                Frame::NONE
+                    .fill(theme::SURFACE_2)
+                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .corner_radius(4)
+                    .inner_margin(Margin::same(10))
+                    .show(ui, |ui| {
+                        ScrollArea::vertical().max_height(130.0).show(ui, |ui| {
+                            ui.label(if ticket.review.is_empty() {
+                                "暂无复盘文本"
+                            } else {
+                                &ticket.review
+                            });
+                        });
+                    });
+                ui.add_space(10.0);
+                if ui.add(theme::secondary_button("关闭")).clicked() {
+                    close = true;
+                }
+            });
+
+        let escape_pressed = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        if let Some(cycle_id) = selected_cycle {
+            self.event_prediction_ticket_dialog = None;
+            self.request_event_prediction_cycle(cycle_id);
+            return;
+        }
+        if close || !open || escape_pressed {
+            self.event_prediction_ticket_dialog = None;
+        }
+    }
+
     fn render_live_confirmation(&mut self, ctx: &egui::Context) {
         let Some(action) = self.live_confirmation else {
             return;
@@ -2233,6 +3469,81 @@ impl GqtApp {
         });
     }
 
+    fn maybe_run_event_prediction_loop(&mut self) {
+        self.start_event_prediction_cycle(false);
+    }
+
+    fn start_event_prediction_cycle(&mut self, force: bool) {
+        let _ = self.start_event_prediction_cycle_for_horizons(force, EventHorizon::ALL.to_vec());
+    }
+
+    fn start_event_prediction_manual_cycle(&mut self) {
+        let mut horizons = Vec::new();
+        if self.event_prediction_manual_10m {
+            horizons.push(EventHorizon::TenMinutes);
+        }
+        if self.event_prediction_manual_30m {
+            horizons.push(EventHorizon::ThirtyMinutes);
+        }
+        if self.event_prediction_manual_60m {
+            horizons.push(EventHorizon::OneHour);
+        }
+        if horizons.is_empty() {
+            self.toast("请至少选择一个事件预测周期", true);
+            return;
+        }
+        if self.start_event_prediction_cycle_for_horizons(true, horizons) {
+            self.event_prediction_direction_dialog_pending = true;
+        }
+    }
+
+    fn start_event_prediction_cycle_for_horizons(
+        &mut self,
+        force: bool,
+        horizons: Vec<EventHorizon>,
+    ) -> bool {
+        if !self.event_prediction_enabled && !force {
+            self.event_prediction_status = "事件预测虚拟盘已关闭".into();
+            return false;
+        }
+        if self.event_prediction_running {
+            return false;
+        }
+        if !force && self.last_event_prediction_check.elapsed() < Duration::from_secs(60) {
+            return false;
+        }
+        let symbols = event_prediction::supported_symbols();
+        if symbols.is_empty() {
+            self.event_prediction_status = "事件预测没有可用交易对".into();
+            return false;
+        }
+        self.event_prediction_running = true;
+        self.last_event_prediction_check = Instant::now();
+        let horizon_text = format_event_horizon_selection(&horizons);
+        self.event_prediction_status = format!(
+            "事件预测正在运行：{} 个交易对，{} 虚拟预测样本生成中",
+            symbols.len(),
+            horizon_text
+        );
+        let path = self.workspace.event_predictions.clone();
+        let sender = self.task_sender.clone();
+        let run_all_horizons = horizons.len() == EventHorizon::ALL.len()
+            && horizons
+                .iter()
+                .zip(EventHorizon::ALL.iter())
+                .all(|(selected, default)| selected.minutes() == default.minutes());
+        thread::spawn(move || {
+            let result = if run_all_horizons {
+                event_prediction::run_cycle(&path, &symbols).map_err(|error| error.to_string())
+            } else {
+                event_prediction::run_cycle_for_horizons(&path, &symbols, &horizons)
+                    .map_err(|error| error.to_string())
+            };
+            let _ = sender.send(TaskEvent::EventPrediction(result));
+        });
+        true
+    }
+
     fn refresh_account(&mut self) {
         if self.account_check_running || self.last_account_check.elapsed() < Duration::from_secs(8)
         {
@@ -2323,7 +3634,7 @@ impl GqtApp {
                     ui.checkbox(&mut self.ai_config.dry_run_only, "仅允许模拟盘");
                     ui.checkbox(
                         &mut self.ai_config.one_signal_per_candle,
-                        "每根 K 线只执行一次",
+                        "限制为每根 K 线只执行一次（数据采集建议关闭）",
                     );
                 });
                 ui.add_space(8.0);
@@ -2913,11 +4224,72 @@ fn save_equity_history(path: &PathBuf, points: &[EquityPoint]) -> std::io::Resul
 }
 
 fn format_equity_time(timestamp: i64) -> String {
-    Local
-        .timestamp_opt(timestamp, 0)
+    Utc.timestamp_opt(timestamp, 0)
         .single()
-        .map(|time| time.format("%m-%d %H:%M").to_string())
+        .map(|time| {
+            time.with_timezone(&utc8_offset())
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
         .unwrap_or_else(|| "--".into())
+}
+
+fn format_event_time(timestamp: i64) -> String {
+    if timestamp <= 0 {
+        return "--".into();
+    }
+    Utc.timestamp_opt(timestamp, 0)
+        .single()
+        .map(|time| {
+            time.with_timezone(&utc8_offset())
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "--".into())
+}
+
+fn utc8_offset() -> FixedOffset {
+    FixedOffset::east_opt(8 * 60 * 60).expect("UTC+8 is a valid fixed offset")
+}
+
+fn format_scanner_time(timestamp: i64) -> String {
+    if timestamp <= 0 {
+        return "--".into();
+    }
+    Utc.timestamp_opt(timestamp, 0)
+        .single()
+        .map(|time| {
+            (time + chrono::Duration::hours(8))
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "--".into())
+}
+
+fn compact_scanner_volume(value: f64) -> String {
+    if value >= 1_000_000_000.0 {
+        format!("{:.1}B", value / 1_000_000_000.0)
+    } else if value >= 1_000_000.0 {
+        format!("{:.1}M", value / 1_000_000.0)
+    } else if value >= 1_000.0 {
+        format!("{:.1}K", value / 1_000.0)
+    } else {
+        format!("{value:.0}")
+    }
+}
+
+fn format_scanner_time_with_zone(timestamp: i64) -> String {
+    if timestamp <= 0 {
+        return "-- UTC+8".into();
+    }
+    Utc.timestamp_opt(timestamp, 0)
+        .single()
+        .map(|time| {
+            (time + chrono::Duration::hours(8))
+                .format("%m-%d %H:%M:%S UTC+8")
+                .to_string()
+        })
+        .unwrap_or_else(|| "-- UTC+8".into())
 }
 
 impl eframe::App for GqtApp {
@@ -2928,6 +4300,7 @@ impl eframe::App for GqtApp {
             self.refresh_account();
             self.refresh_simulation_account();
             self.maybe_run_ai_decision_loop();
+            self.maybe_run_event_prediction_loop();
         }
         ctx.request_repaint_after(Duration::from_millis(200));
     }
@@ -2938,6 +4311,7 @@ impl eframe::App for GqtApp {
         } else {
             self.render_shell(ui);
         }
+        self.render_event_prediction_dialogs(ui.ctx());
         self.render_live_confirmation(ui.ctx());
         if let Some((message, error, created)) = self.toast.clone() {
             if created.elapsed() < Duration::from_secs(3) {
@@ -2964,6 +4338,7 @@ impl eframe::App for GqtApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         let _ = self.market_commands.send(MarketCommand::Stop);
+        let _ = self.scanner_commands.send(ScannerCommand::Stop);
     }
 }
 
@@ -3440,6 +4815,474 @@ fn metric(ui: &mut Ui, label: &str, value: &str, sub: &str, accent: Color32) {
             ui.label(RichText::new(value).size(20.0).color(accent).strong());
             ui.label(RichText::new(sub).size(11.0).color(theme::MUTED));
         });
+}
+
+fn event_stat(stats: &[EventPredictionStats], horizon_minutes: i64) -> EventPredictionStats {
+    stats
+        .iter()
+        .find(|stat| stat.horizon_minutes == horizon_minutes)
+        .cloned()
+        .unwrap_or(EventPredictionStats {
+            horizon_minutes,
+            ..Default::default()
+        })
+}
+
+fn event_metric(ui: &mut Ui, label: &str, stat: &EventPredictionStats) {
+    metric(
+        ui,
+        label,
+        &format!("{:.1}%", stat.win_rate),
+        &format!(
+            "{} 胜 / {} 负 / {} 平，均波 {:+.3}%，均置信 {:.1}%",
+            stat.wins, stat.losses, stat.ties, stat.avg_move_percent, stat.avg_confidence
+        ),
+        if stat.win_rate >= 50.0 {
+            theme::GREEN
+        } else if stat.total > 0 {
+            theme::RED
+        } else {
+            theme::TEXT
+        },
+    );
+}
+
+fn format_event_money(value: f64) -> String {
+    if value.is_finite() {
+        format!("{value:.2} USDT")
+    } else {
+        "无限".into()
+    }
+}
+
+fn event_ticket_list_card(
+    ui: &mut Ui,
+    title: &str,
+    context: &str,
+    tickets: &[EventPredictionTicket],
+    empty_text: &str,
+    kind: EventOrderKind,
+    order_dialog: &mut Option<EventOrderKind>,
+) -> Option<EventTicketAction> {
+    let mut selected_action = None;
+    Frame::NONE
+        .fill(theme::SURFACE)
+        .stroke(Stroke::new(1.0, theme::BORDER))
+        .corner_radius(5)
+        .inner_margin(Margin::same(14))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(title).size(14.0).strong());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add(theme::secondary_button("打开大列表")).clicked() {
+                        *order_dialog = Some(kind);
+                    }
+                    ui.label(
+                        RichText::new(format!("{} 条 · {}", tickets.len(), context))
+                            .size(11.0)
+                            .color(theme::MUTED),
+                    );
+                });
+            });
+            ui.add_space(10.0);
+            if tickets.is_empty() {
+                ui.label(RichText::new(empty_text).color(theme::MUTED));
+                return;
+            }
+
+            egui::Grid::new(format!("event-ticket-card-{}", event_order_kind_salt(kind)))
+                .num_columns(11)
+                .striped(true)
+                .spacing([18.0, 10.0])
+                .show(ui, |ui| {
+                    for heading in [
+                        "票据",
+                        "交易对",
+                        "周期",
+                        "周期编号 / 轮次 / 线路",
+                        "本单下注",
+                        "本单回报",
+                        "方向",
+                        "结果",
+                        "盈亏",
+                        "开盘",
+                        "到期",
+                    ] {
+                        ui.label(RichText::new(heading).color(theme::MUTED).strong());
+                    }
+                    ui.end_row();
+                    for ticket in tickets.iter().take(8) {
+                        if ui
+                            .add(theme::secondary_button(compact_event_id(&ticket.id)))
+                            .clicked()
+                        {
+                            selected_action = Some(EventTicketAction::Ticket(ticket.clone()));
+                        }
+                        ui.label(RichText::new(&ticket.symbol).strong());
+                        ui.label(format!("{}m", ticket.horizon_minutes));
+                        if event_cycle_button(ui, ticket, true).clicked() {
+                            selected_action =
+                                Some(EventTicketAction::Cycle(ticket.cycle_id.clone()));
+                        }
+                        ui.label(format!("{:.2}", ticket.stake_amount));
+                        ui.label(
+                            ticket
+                                .cycle_balance_after
+                                .map(|value| format!("{value:.2}"))
+                                .unwrap_or_else(|| "--".into()),
+                        );
+                        ui.colored_label(
+                            prediction_direction_color(&ticket.direction),
+                            prediction_direction_label(&ticket.direction),
+                        );
+                        ui.colored_label(
+                            prediction_result_color(ticket),
+                            prediction_result_label(ticket),
+                        );
+                        ui.label(
+                            ticket
+                                .virtual_pnl
+                                .map(|value| format!("{value:+.2}"))
+                                .unwrap_or_else(|| "--".into()),
+                        );
+                        ui.label(format_event_time(ticket.open_time));
+                        ui.label(format_event_time(ticket.close_time));
+                        ui.end_row();
+                    }
+                });
+
+            if tickets.len() > 8 {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!(
+                        "还有 {} 条，点“打开大列表”查看。",
+                        tickets.len() - 8
+                    ))
+                    .size(11.0)
+                    .color(theme::MUTED),
+                );
+            }
+        });
+    selected_action
+}
+
+fn event_ticket_table(
+    ui: &mut Ui,
+    scroll_id: &str,
+    title: &str,
+    context: &str,
+    tickets: &[EventPredictionTicket],
+    empty_text: &str,
+    max_height: f32,
+    cycle_links: bool,
+) -> Option<EventTicketAction> {
+    let mut selected_action = None;
+    Frame::NONE
+        .fill(theme::SURFACE)
+        .stroke(Stroke::new(1.0, theme::BORDER))
+        .corner_radius(5)
+        .inner_margin(Margin::same(14))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(title).size(14.0).strong());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("{} 条 · {}", tickets.len(), context))
+                            .size(11.0)
+                            .color(theme::MUTED),
+                    );
+                });
+            });
+            ui.add_space(10.0);
+            if tickets.is_empty() {
+                ui.label(RichText::new(empty_text).color(theme::MUTED));
+                return;
+            }
+            ScrollArea::both()
+                .id_salt(scroll_id)
+                .max_height(max_height)
+                .show(ui, |ui| {
+                    egui::Grid::new(format!("{scroll_id}-grid"))
+                        .num_columns(18)
+                        .striped(true)
+                        .spacing([18.0, 12.0])
+                        .show(ui, |ui| {
+                            for heading in [
+                                "票据",
+                                "交易对",
+                                "周期",
+                                "周期编号",
+                                "轮次 / 线路",
+                                "方向",
+                                "置信度",
+                                "分数",
+                                "下注",
+                                "开盘价",
+                                "到期价",
+                                "结果",
+                                "波动",
+                                "虚拟盈亏",
+                                "本单回报",
+                                "开盘时间",
+                                "到期时间",
+                                "复盘",
+                            ] {
+                                ui.label(RichText::new(heading).color(theme::MUTED).strong());
+                            }
+                            ui.end_row();
+                            for ticket in tickets {
+                                if ui
+                                    .add(theme::secondary_button(compact_event_id(&ticket.id)))
+                                    .clicked()
+                                {
+                                    selected_action =
+                                        Some(EventTicketAction::Ticket(ticket.clone()));
+                                }
+                                ui.label(RichText::new(&ticket.symbol).strong());
+                                ui.label(format!("{}m", ticket.horizon_minutes));
+                                if cycle_links {
+                                    if event_cycle_button(ui, ticket, false).clicked() {
+                                        selected_action =
+                                            Some(EventTicketAction::Cycle(ticket.cycle_id.clone()));
+                                    }
+                                } else {
+                                    ui.label(format_event_cycle_id(ticket));
+                                }
+                                ui.label(format_event_cycle_step(ticket));
+                                ui.colored_label(
+                                    prediction_direction_color(&ticket.direction),
+                                    prediction_direction_label(&ticket.direction),
+                                );
+                                ui.label(format!("{:.1}%", ticket.confidence * 100.0));
+                                ui.label(format!("{:+.3}", ticket.score));
+                                ui.label(format!("{:.2}", ticket.stake_amount));
+                                ui.label(format_price(ticket.entry_price));
+                                ui.label(
+                                    ticket
+                                        .expiry_price
+                                        .map(format_price)
+                                        .unwrap_or_else(|| "--".into()),
+                                );
+                                ui.colored_label(
+                                    prediction_result_color(ticket),
+                                    prediction_result_label(ticket),
+                                );
+                                ui.label(
+                                    ticket
+                                        .move_percent
+                                        .map(|value| format!("{value:+.4}%"))
+                                        .unwrap_or_else(|| "--".into()),
+                                );
+                                ui.label(
+                                    ticket
+                                        .virtual_pnl
+                                        .map(|value| format!("{value:+.1}"))
+                                        .unwrap_or_else(|| "--".into()),
+                                );
+                                ui.label(
+                                    ticket
+                                        .cycle_balance_after
+                                        .map(|value| format!("{value:.2}"))
+                                        .unwrap_or_else(|| "--".into()),
+                                );
+                                ui.label(format_event_time(ticket.open_time));
+                                ui.label(format_event_time(ticket.close_time));
+                                ui.label(compact_error(&ticket.review, 120));
+                                ui.end_row();
+                            }
+                        });
+                });
+        });
+    selected_action
+}
+
+fn event_cycle_button(
+    ui: &mut Ui,
+    ticket: &EventPredictionTicket,
+    include_step: bool,
+) -> egui::Response {
+    if ticket.cycle_id.is_empty() || ticket.cycle_number <= 0 {
+        ui.add_enabled(false, theme::secondary_button("旧玩法"))
+    } else {
+        let label = if include_step {
+            format!(
+                "{} · {}",
+                format_event_cycle_id(ticket),
+                format_event_cycle_step(ticket)
+            )
+        } else {
+            format_event_cycle_id(ticket)
+        };
+        ui.add(theme::secondary_button(label).sense(Sense::click()))
+            .on_hover_text(format!("查看周期 {} 的全部订单", ticket.cycle_id))
+    }
+}
+
+fn event_ticket_cycle_detail_row(ui: &mut Ui, ticket: &EventPredictionTicket) -> bool {
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("周期编号").color(theme::MUTED));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if event_cycle_button(ui, ticket, false).clicked() {
+                clicked = true;
+            }
+        });
+    });
+    ui.separator();
+    clicked
+}
+
+fn compact_event_id(id: &str) -> String {
+    id.rsplit_once('-')
+        .map(|(_, suffix)| suffix.to_string())
+        .unwrap_or_else(|| id.to_string())
+}
+
+fn format_event_cycle_step(ticket: &EventPredictionTicket) -> String {
+    if ticket.cycle_order > 0 {
+        let slot = if ticket.cycle_slot.is_some_and(|slot| slot > 0) {
+            format!("{}号线", ticket.cycle_slot.unwrap_or_default())
+        } else {
+            "--号线".into()
+        };
+        format!("第 {} 轮 / {slot}", ticket.cycle_order)
+    } else {
+        "旧玩法".into()
+    }
+}
+
+fn format_event_cycle_id(ticket: &EventPredictionTicket) -> String {
+    if ticket.cycle_number <= 0 {
+        return "旧玩法".into();
+    }
+    format!("C{:06}", ticket.cycle_number)
+}
+
+fn event_order_kind_salt(kind: EventOrderKind) -> &'static str {
+    match kind {
+        EventOrderKind::Open => "open",
+        EventOrderKind::Settled => "settled",
+    }
+}
+
+fn event_ticket_detail_row(ui: &mut Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).color(theme::MUTED));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(RichText::new(value).color(theme::TEXT));
+        });
+    });
+    ui.separator();
+}
+
+fn format_event_horizon_selection(horizons: &[EventHorizon]) -> String {
+    let mut labels = horizons
+        .iter()
+        .map(|horizon| horizon.label())
+        .collect::<Vec<_>>();
+    labels.dedup();
+    labels.join("/")
+}
+
+fn format_event_run_directions(directions: &[EventPredictionRunDirection]) -> String {
+    let mut groups = Vec::new();
+    for horizon in [10, 30, 60] {
+        let mut parts = directions
+            .iter()
+            .filter(|direction| direction.horizon_minutes == horizon)
+            .map(|direction| {
+                let symbol = compact_event_symbol(&direction.symbol);
+                let label = prediction_trade_direction_label(&direction.direction);
+                let confidence = direction.confidence * 100.0;
+                let duplicate_marker = if direction.created {
+                    ""
+                } else {
+                    "·等待结算"
+                };
+                format!("{symbol} {label}({confidence:.0}%{duplicate_marker})")
+            })
+            .collect::<Vec<_>>();
+        if parts.is_empty() {
+            continue;
+        }
+        parts.sort();
+        let horizon_label = if horizon == 60 {
+            "1h".into()
+        } else {
+            format!("{horizon}m")
+        };
+        groups.push(format!("{horizon_label}：{}", parts.join("，")));
+    }
+    groups.join("；")
+}
+
+fn format_event_direction_window(direction: &EventPredictionRunDirection) -> String {
+    let horizon = if direction.horizon_minutes == 60 {
+        "1小时".into()
+    } else {
+        format!("{}分钟", direction.horizon_minutes)
+    };
+    format!(
+        "{}：{} → {}",
+        horizon,
+        format_event_time(direction.open_time),
+        format_event_time(direction.close_time)
+    )
+}
+
+fn compact_event_symbol(symbol: &str) -> &str {
+    match symbol {
+        "BTCUSDT" => "BTC",
+        "ETHUSDT" => "ETH",
+        _ => symbol,
+    }
+}
+
+fn prediction_trade_direction_label(direction: &str) -> &'static str {
+    match direction {
+        "up" => "买涨",
+        "down" => "买跌",
+        _ => "--",
+    }
+}
+
+fn prediction_direction_label(direction: &str) -> &'static str {
+    match direction {
+        "up" => "看涨",
+        "down" => "看跌",
+        _ => "--",
+    }
+}
+
+fn prediction_direction_color(direction: &str) -> Color32 {
+    match direction {
+        "up" => theme::GREEN,
+        "down" => theme::RED,
+        _ => theme::MUTED,
+    }
+}
+
+fn prediction_result_label(ticket: &EventPredictionTicket) -> &'static str {
+    if ticket.status == "open" {
+        return "待结算";
+    }
+    match ticket.result.as_str() {
+        "win" => "胜",
+        "loss" => "负",
+        "tie" => "平",
+        _ => "--",
+    }
+}
+
+fn prediction_result_color(ticket: &EventPredictionTicket) -> Color32 {
+    if ticket.status == "open" {
+        return theme::YELLOW;
+    }
+    match ticket.result.as_str() {
+        "win" => theme::GREEN,
+        "loss" => theme::RED,
+        _ => theme::MUTED,
+    }
 }
 
 fn section_title(ui: &mut Ui, title: &str, context: &str) {

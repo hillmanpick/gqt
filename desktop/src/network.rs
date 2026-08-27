@@ -4,7 +4,10 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use reqwest::blocking::{Client, ClientBuilder};
+use reqwest::{
+    Url,
+    blocking::{Client, ClientBuilder},
+};
 
 const LOCAL_PROXY_PORTS: [u16; 7] = [7890, 7897, 7899, 10808, 10809, 20170, 20171];
 
@@ -25,22 +28,26 @@ pub fn client_builder(timeout: Duration) -> ClientBuilder {
 }
 
 pub fn configured_proxy() -> Option<String> {
-    for name in [
+    let configured = [
         "GQT_PROXY",
         "HTTPS_PROXY",
         "https_proxy",
         "HTTP_PROXY",
         "http_proxy",
-    ] {
-        if let Ok(value) = std::env::var(name) {
+    ]
+    .into_iter()
+    .find_map(|name| {
+        std::env::var(name).ok().and_then(|value| {
             let value = value.trim();
             if value.starts_with("http://") || value.starts_with("https://") {
-                return Some(value.to_string());
+                Some(value.to_string())
+            } else {
+                None
             }
-        }
-    }
+        })
+    });
 
-    detected_local_proxy()
+    select_proxy(configured, detected_local_proxy())
 }
 
 pub fn configured_docker_proxy() -> Option<String> {
@@ -54,6 +61,26 @@ fn detected_local_proxy() -> Option<String> {
             .is_ok()
             .then(|| format!("http://127.0.0.1:{port}"))
     })
+}
+
+fn select_proxy(configured: Option<String>, detected_local: Option<String>) -> Option<String> {
+    match (configured, detected_local) {
+        (Some(configured), Some(local)) if !is_loopback_proxy(&configured) => Some(local),
+        (Some(configured), _) => Some(configured),
+        (None, local) => local,
+    }
+}
+
+fn is_loopback_proxy(proxy: &str) -> bool {
+    Url::parse(proxy)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        })
 }
 
 fn proxy_for_docker(proxy: &str) -> String {
@@ -86,6 +113,36 @@ mod tests {
         assert_eq!(
             proxy_for_docker("http://10.0.0.2:7890"),
             "http://10.0.0.2:7890"
+        );
+    }
+
+    #[test]
+    fn local_proxy_wins_over_remote_environment_proxy() {
+        assert_eq!(
+            select_proxy(
+                Some("http://192.168.5.2:7890".into()),
+                Some("http://127.0.0.1:7890".into())
+            ),
+            Some("http://127.0.0.1:7890".into())
+        );
+    }
+
+    #[test]
+    fn remote_environment_proxy_is_used_without_a_local_proxy() {
+        assert_eq!(
+            select_proxy(Some("http://192.168.5.2:7890".into()), None),
+            Some("http://192.168.5.2:7890".into())
+        );
+    }
+
+    #[test]
+    fn configured_loopback_proxy_remains_preferred() {
+        assert_eq!(
+            select_proxy(
+                Some("http://localhost:7897".into()),
+                Some("http://127.0.0.1:7890".into())
+            ),
+            Some("http://localhost:7897".into())
         );
     }
 }
