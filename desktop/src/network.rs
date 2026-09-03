@@ -59,12 +59,10 @@ pub fn configured_proxy() -> Option<String> {
 
 pub fn binance_client_builder(timeout: Duration) -> ClientBuilder {
     let builder = Client::builder().timeout(timeout).no_proxy();
-    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18080);
-    if TcpStream::connect_timeout(&address, Duration::from_millis(150)).is_ok() {
-        builder.proxy(reqwest::Proxy::all(BINANCE_EGRESS_PROXY).expect("valid Binance proxy URL"))
-    } else {
-        builder
-    }
+    // Binance Futures must never silently fall back to the host's direct route:
+    // a VPN node change can expose a restricted mainland/datacenter IP and return 451.
+    // TradingWorkspace starts the local egress bridge before any Binance request.
+    builder.proxy(reqwest::Proxy::all(BINANCE_EGRESS_PROXY).expect("valid Binance proxy URL"))
 }
 
 fn detected_local_proxy() -> Option<String> {
