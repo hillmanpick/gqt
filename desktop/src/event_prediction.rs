@@ -20,7 +20,7 @@ pub const EVENT_STAKE_USDT: f64 = 5.0;
 pub const EVENT_TEN_MINUTE_PROFIT_RATE: f64 = 0.80;
 pub const EVENT_DEFAULT_PROFIT_RATE: f64 = 0.85;
 pub const EVENT_SUPPORTED_SYMBOLS: [&str; 2] = ["BTCUSDT", "ETHUSDT"];
-pub const EVENT_STRATEGY_NAME: &str = "event_reinvest_batch5_v2";
+pub const EVENT_STRATEGY_NAME: &str = "event_reinvest_batch5_kline1h_v3";
 pub const EVENT_CYCLE_SLOTS: i64 = 5;
 const EVENT_SCHEMA_VERSION: i64 = 3;
 const EVENT_EXPERT_HISTORY_LIMIT: i64 = 400;
@@ -900,11 +900,6 @@ impl EventPredictionLog {
             } else {
                 EventDirection::Down
             };
-        let reason = if direction == EventDirection::Up {
-            "rolling_up_commitment_v9"
-        } else {
-            "rolling_down_commitment_v9"
-        };
         let score_strength = if samples.len() < EVENT_EXPERT_MIN_SAMPLES {
             0.20
         } else {
@@ -912,7 +907,6 @@ impl EventPredictionLog {
         };
         Ok(Some(DirectionRegimeBias {
             direction,
-            reason,
             sample_size: samples.len() as i64,
             up_rate,
             long_sample_size: None,
@@ -1478,13 +1472,10 @@ fn create_symbol_predictions(
     open_time: i64,
     now: i64,
 ) -> Result<EventCreationSummary> {
-    let candles = market::fetch_candles(client, symbol, Interval::OneMinute, 240)?;
-    if candles.len() < 80 {
-        bail!(
-            "not enough 1m candles for event prediction: {}",
-            candles.len()
-        );
-    }
+    let raw_candles = market::fetch_candles(client, symbol, Interval::OneMinute, 240)?;
+    // The active one-minute candle can still change after the prediction timestamp.
+    // Every direction decision must use the 60 completed candles immediately before it.
+    let candles = completed_one_hour_candles(&raw_candles, open_time)?;
     let snapshot = market::fetch_snapshot(client, symbol)?;
     let mut summary = EventCreationSummary::default();
     for horizon in horizons {
@@ -1659,7 +1650,6 @@ struct DirectionDecision {
 #[derive(Debug, Clone)]
 struct DirectionRegimeBias {
     direction: EventDirection,
-    reason: &'static str,
     sample_size: i64,
     up_rate: f64,
     long_sample_size: Option<i64>,
@@ -1707,12 +1697,26 @@ fn calibrated_direction(
 ) -> DirectionDecision {
     let abs_score = raw_score.abs();
     if let Some(bias) = regime_bias {
+        // Historical direction frequencies are only a weak corroborating input.  The
+        // point-in-time one-hour K-line score remains the primary decision input.
+        let blended_score = (0.70 * raw_score
+            + 0.30 * signed_factor_score(bias.score_strength, bias.direction))
+        .clamp(-1.0, 1.0);
+        let direction = if blended_score >= 0.0 {
+            EventDirection::Up
+        } else {
+            EventDirection::Down
+        };
         return DirectionDecision {
-            direction: bias.direction,
-            reason: bias.reason,
-            flipped: raw_direction != bias.direction,
-            score_strength: abs_score.max(bias.score_strength).clamp(0.05, 1.0),
-            factor_score: signed_factor_score(bias.score_strength, bias.direction),
+            direction,
+            reason: "kline_hour_with_regime_corroboration_v3",
+            flipped: raw_direction != direction,
+            score_strength: blended_score
+                .abs()
+                .max(abs_score * 0.70)
+                .max(bias.score_strength * 0.30)
+                .clamp(0.05, 1.0),
+            factor_score: blended_score,
             regime_sample_size: Some(bias.sample_size),
             regime_up_rate: Some(bias.up_rate),
             regime_long_sample_size: bias.long_sample_size,
@@ -1734,15 +1738,11 @@ fn calibrated_direction(
         };
     }
 
-    let direction = if raw_score <= 0.0 {
-        EventDirection::Up
-    } else {
-        EventDirection::Down
-    };
-    let factor_score = signed_factor_score(abs_score.max(0.08), direction);
+    let direction = raw_direction;
+    let factor_score = raw_score;
     DirectionDecision {
         direction,
-        reason: "raw_score_contrarian_fallback_v7",
+        reason: "completed_one_hour_kline_v3",
         flipped: raw_direction != direction,
         score_strength: abs_score.max(0.08),
         factor_score,
@@ -1810,7 +1810,40 @@ fn usable_price(snapshot: &MarketSnapshot) -> f64 {
     }
 }
 
+fn completed_one_hour_candles(candles: &[Candle], open_time: i64) -> Result<Vec<Candle>> {
+    let completed = candles
+        .iter()
+        .filter(|candle| candle.time > 0 && candle.time + 60 <= open_time)
+        .rev()
+        .take(60)
+        .cloned()
+        .collect::<Vec<_>>();
+    if completed.len() != 60 {
+        bail!(
+            "not enough completed 1m candles before event prediction: {}",
+            completed.len()
+        );
+    }
+    let completed = completed.into_iter().rev().collect::<Vec<_>>();
+    if completed
+        .last()
+        .map(|candle| candle.time + 60 != open_time)
+        .unwrap_or(true)
+    {
+        bail!("latest completed event prediction K-line is not adjacent to open time");
+    }
+    if completed
+        .windows(2)
+        .any(|pair| pair[1].time != pair[0].time + 60)
+    {
+        bail!("completed event prediction K-line window contains a gap");
+    }
+    Ok(completed)
+}
+
 fn prediction_features(candles: &[Candle], snapshot: &MarketSnapshot) -> Value {
+    let hour = one_hour_candle_window(candles);
+    let candles = hour.as_slice();
     let closes = candles
         .iter()
         .map(|candle| candle.close)
@@ -1818,12 +1851,12 @@ fn prediction_features(candles: &[Candle], snapshot: &MarketSnapshot) -> Value {
     let ret3 = pct_change(candles, 3);
     let ret10 = pct_change(candles, 10);
     let ret30 = pct_change(candles, 30);
-    let ret60 = pct_change(candles, 60);
-    let volatility = mean_abs_return(&closes, 80).max(0.0005);
+    let ret60 = hour_return(candles);
+    let volatility = mean_abs_return(&closes, 59).max(0.0005);
     let momentum3 = normalized_return(candles, 3, volatility);
     let momentum10 = normalized_return(candles, 10, volatility);
     let momentum30 = normalized_return(candles, 30, volatility);
-    let momentum60 = normalized_return(candles, 60, volatility);
+    let momentum60 = (ret60 / (volatility * 60.0_f64.sqrt()).max(0.0005)).clamp(-2.0, 2.0) / 2.0;
     let ema_short = ema_bias(&closes, 8, 21, volatility);
     let ema_mid = ema_bias(&closes, 13, 34, volatility);
     let ema_long = ema_bias(&closes, 21, 55, volatility);
@@ -1831,11 +1864,29 @@ fn prediction_features(candles: &[Candle], snapshot: &MarketSnapshot) -> Value {
     let rsi_trend = ((rsi - 50.0) / 25.0).clamp(-1.0, 1.0);
     let volume_ratio = volume_ratio(candles, 45);
     let volume_bias = momentum3.signum() * (volume_ratio / 1.5).clamp(0.0, 1.0);
-    let breakout = breakout_bias(candles, 60);
+    let breakout = breakout_bias(candles, candles.len().saturating_sub(1));
     let long_short_bias = ((snapshot.long_short_ratio - 1.0) / 0.35).clamp(-1.0, 1.0);
     let funding_bias = (-snapshot.funding_rate / 0.0008).clamp(-1.0, 1.0);
     let sentiment = (long_short_bias * 0.75 + funding_bias * 0.25).clamp(-1.0, 1.0);
+    let hour_return = hour_return(candles);
+    let hour_trend = hour_trend_score(candles, volatility);
+    let hour_close_location = close_location(candles);
+    let hour_drawdown = normalized_drawdown(candles, volatility);
+    let hour_volume_ratio = latest_volume_ratio(candles);
+    let hour_acceleration = hour_acceleration(candles, volatility);
+    let hour_kline_score = (0.34 * hour_trend
+        + 0.20 * hour_close_location
+        + 0.18 * hour_acceleration
+        + 0.16 * hour_drawdown
+        + 0.12 * hour_return.signum() * hour_volume_ratio.min(1.0))
+    .clamp(-1.0, 1.0);
     json!({
+        "kline_window": "1m_completed_60_before_open_v1",
+        "kline_window_minutes": 60,
+        "kline_candle_count": candles.len(),
+        "kline_window_start": candles.first().map(|candle| candle.time).unwrap_or_default(),
+        "kline_window_end": candles.last().map(|candle| candle.time + 60).unwrap_or_default(),
+        "kline_complete_through": candles.last().map(|candle| candle.time + 60).unwrap_or_default(),
         "ret3": ret3,
         "ret10": ret10,
         "ret30": ret30,
@@ -1857,7 +1908,129 @@ fn prediction_features(candles: &[Candle], snapshot: &MarketSnapshot) -> Value {
         "funding_bias": funding_bias,
         "sentiment": sentiment,
         "snapshot_change_percent": snapshot.change_percent,
+        "hour_return": hour_return,
+        "hour_trend": hour_trend,
+        "hour_close_location": hour_close_location,
+        "hour_drawdown": hour_drawdown,
+        "hour_volume_ratio": hour_volume_ratio,
+        "hour_acceleration": hour_acceleration,
+        "hour_kline_score": hour_kline_score,
     })
+}
+
+fn one_hour_candle_window(candles: &[Candle]) -> Vec<Candle> {
+    candles
+        .iter()
+        .rev()
+        .take(60)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn hour_return(candles: &[Candle]) -> f64 {
+    match (candles.first(), candles.last()) {
+        (Some(first), Some(last))
+            if first.open.is_finite() && first.open > 0.0 && last.close.is_finite() =>
+        {
+            last.close / first.open - 1.0
+        }
+        _ => 0.0,
+    }
+}
+
+fn hour_trend_score(candles: &[Candle], volatility: f64) -> f64 {
+    if candles.len() < 2 {
+        return 0.0;
+    }
+    let count = candles.len() as f64;
+    let mean_x = (count - 1.0) / 2.0;
+    let mean_close = candles.iter().map(|candle| candle.close).sum::<f64>() / count;
+    if !mean_close.is_finite() || mean_close <= 0.0 {
+        return 0.0;
+    }
+    let numerator = candles
+        .iter()
+        .enumerate()
+        .map(|(index, candle)| (index as f64 - mean_x) * (candle.close - mean_close))
+        .sum::<f64>();
+    let denominator = (0..candles.len())
+        .map(|index| (index as f64 - mean_x).powi(2))
+        .sum::<f64>();
+    if denominator <= f64::EPSILON {
+        return 0.0;
+    }
+    let normalized_slope = numerator / denominator / mean_close / volatility.max(0.0005);
+    (normalized_slope * 20.0).clamp(-1.0, 1.0)
+}
+
+fn close_location(candles: &[Candle]) -> f64 {
+    let Some(last) = candles.last() else {
+        return 0.0;
+    };
+    let high = candles
+        .iter()
+        .map(|candle| candle.high)
+        .filter(|value| value.is_finite())
+        .fold(f64::NEG_INFINITY, f64::max);
+    let low = candles
+        .iter()
+        .map(|candle| candle.low)
+        .filter(|value| value.is_finite())
+        .fold(f64::INFINITY, f64::min);
+    let range = high - low;
+    if range.is_finite() && range > f64::EPSILON && last.close.is_finite() {
+        ((last.close - low) / range * 2.0 - 1.0).clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn normalized_drawdown(candles: &[Candle], volatility: f64) -> f64 {
+    let Some(last) = candles.last() else {
+        return 0.0;
+    };
+    let peak = candles
+        .iter()
+        .map(|candle| candle.high)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if peak.is_finite() && peak > 0.0 && last.close.is_finite() {
+        ((last.close / peak - 1.0) / (volatility * 8.0).max(0.002)).clamp(-1.0, 0.0)
+    } else {
+        0.0
+    }
+}
+
+fn latest_volume_ratio(candles: &[Candle]) -> f64 {
+    let Some(last) = candles.last() else {
+        return 0.0;
+    };
+    if candles.len() < 2 || !last.volume.is_finite() {
+        return 0.0;
+    }
+    let average = candles[..candles.len() - 1]
+        .iter()
+        .map(|candle| candle.volume)
+        .filter(|value| value.is_finite())
+        .sum::<f64>()
+        / (candles.len() - 1) as f64;
+    if average > f64::EPSILON {
+        (last.volume / average - 1.0).clamp(0.0, 3.0)
+    } else {
+        0.0
+    }
+}
+
+fn hour_acceleration(candles: &[Candle], volatility: f64) -> f64 {
+    if candles.len() < 60 {
+        return 0.0;
+    }
+    let prior = candles[44].close / candles[0].close - 1.0;
+    let recent = candles[59].close / candles[44].close - 1.0;
+    ((recent - prior / 3.0) / (volatility * 15.0_f64.sqrt()).max(0.002)).clamp(-1.0, 1.0)
 }
 
 fn feature_value(features: &Value, name: &str) -> f64 {
@@ -1871,33 +2044,36 @@ fn feature_value(features: &Value, name: &str) -> f64 {
 fn horizon_score(horizon: EventHorizon, features: &Value) -> f64 {
     match horizon {
         EventHorizon::TenMinutes => {
-            0.42 * feature_value(features, "momentum3")
-                + 0.22 * feature_value(features, "momentum10")
-                + 0.18 * feature_value(features, "ema_short")
-                + 0.10 * feature_value(features, "volume_bias")
+            0.24 * feature_value(features, "momentum3")
+                + 0.14 * feature_value(features, "momentum10")
+                + 0.12 * feature_value(features, "ema_short")
+                + 0.08 * feature_value(features, "volume_bias")
                 + 0.08 * feature_value(features, "sentiment")
+                + 0.34 * feature_value(features, "hour_kline_score")
         }
         EventHorizon::ThirtyMinutes => {
-            0.20 * feature_value(features, "momentum10")
-                + 0.30 * feature_value(features, "momentum30")
-                + 0.22 * feature_value(features, "ema_mid")
-                + 0.10 * feature_value(features, "breakout")
-                + 0.10 * feature_value(features, "sentiment")
-                + 0.08 * feature_value(features, "rsi_trend")
+            0.12 * feature_value(features, "momentum10")
+                + 0.16 * feature_value(features, "momentum30")
+                + 0.14 * feature_value(features, "ema_mid")
+                + 0.08 * feature_value(features, "breakout")
+                + 0.08 * feature_value(features, "sentiment")
+                + 0.06 * feature_value(features, "rsi_trend")
+                + 0.36 * feature_value(features, "hour_kline_score")
         }
         EventHorizon::OneHour => {
-            0.16 * feature_value(features, "momentum10")
-                + 0.26 * feature_value(features, "momentum60")
-                + 0.28 * feature_value(features, "ema_long")
-                + 0.14 * feature_value(features, "breakout")
-                + 0.10 * feature_value(features, "sentiment")
+            0.08 * feature_value(features, "momentum10")
+                + 0.12 * feature_value(features, "momentum60")
+                + 0.16 * feature_value(features, "ema_long")
+                + 0.08 * feature_value(features, "breakout")
+                + 0.08 * feature_value(features, "sentiment")
                 + 0.06 * feature_value(features, "rsi_trend")
+                + 0.42 * feature_value(features, "hour_kline_score")
         }
     }
 }
 
 fn pct_change(candles: &[Candle], periods: usize) -> f64 {
-    if candles.len() <= periods {
+    if periods == 0 || candles.len() <= periods {
         return 0.0;
     }
     let latest = candles
@@ -2125,6 +2301,34 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![10]
         );
+    }
+
+    #[test]
+    fn one_hour_window_excludes_current_candle_and_requires_contiguous_boundary() {
+        let open_time = 1_700_100_000;
+        let mut candles = (0..61)
+            .map(|index| Candle {
+                time: open_time - 60 * (61 - index),
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.0,
+                volume: 1.0,
+            })
+            .collect::<Vec<_>>();
+        candles.push(Candle {
+            time: open_time,
+            open: 100.0,
+            high: 102.0,
+            low: 98.0,
+            close: 101.0,
+            volume: 10.0,
+        });
+        let window = completed_one_hour_candles(&candles, open_time).unwrap();
+        assert_eq!(window.len(), 60);
+        assert_eq!(window.first().unwrap().time, open_time - 60 * 60);
+        assert_eq!(window.last().unwrap().time, open_time - 60);
+        assert!(completed_one_hour_candles(&candles[..60], open_time).is_err());
     }
 
     #[test]
@@ -2647,9 +2851,9 @@ mod tests {
             &neutral_features,
             None,
         );
-        assert_eq!(raw_up.direction, EventDirection::Down);
-        assert_eq!(raw_up.reason, "raw_score_contrarian_fallback_v7");
-        assert!(raw_up.flipped);
+        assert_eq!(raw_up.direction, EventDirection::Up);
+        assert_eq!(raw_up.reason, "completed_one_hour_kline_v3");
+        assert!(!raw_up.flipped);
 
         let raw_down = calibrated_direction(
             EventHorizon::OneHour,
@@ -2658,8 +2862,8 @@ mod tests {
             &neutral_features,
             None,
         );
-        assert_eq!(raw_down.direction, EventDirection::Up);
-        assert!(raw_down.flipped);
+        assert_eq!(raw_down.direction, EventDirection::Down);
+        assert!(!raw_down.flipped);
 
         let bottom_features = json!({
             "momentum3": 0.25,
@@ -2693,7 +2897,6 @@ mod tests {
 
         let commitment_bias = DirectionRegimeBias {
             direction: EventDirection::Down,
-            reason: "rolling_down_commitment_v9",
             sample_size: 8,
             up_rate: 0.625,
             long_sample_size: None,
@@ -2708,7 +2911,7 @@ mod tests {
             Some(&commitment_bias),
         );
         assert_eq!(committed.direction, EventDirection::Down);
-        assert_eq!(committed.reason, "rolling_down_commitment_v9");
+        assert_eq!(committed.reason, "kline_hour_with_regime_corroboration_v3");
 
         let mut features = json!({"momentum10": 0.25});
         add_direction_training_fields(
@@ -2721,8 +2924,8 @@ mod tests {
         );
         assert_eq!(features["strategy_version"], EVENT_STRATEGY_NAME);
         assert_eq!(features["raw_direction"], "up");
-        assert_eq!(features["final_direction"], "down");
-        assert_eq!(features["direction_flipped"], true);
+        assert_eq!(features["final_direction"], "up");
+        assert_eq!(features["direction_flipped"], false);
         assert!(features["factor_score"].as_f64().is_some());
     }
 

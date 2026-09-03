@@ -277,3 +277,11 @@ Append one compact entry after each event prediction review. Keep raw ticket dat
 - Lifecycle: each winning or tied slot advances to its next round independently; a losing slot stops; winning slots have no five-round cap; only when all five slots have lost does the symbol/horizon start a new numbered cycle with five fresh 5-USDT slots.
 - Compatibility boundary: preserve all `event_reinvest_cycle_v1` tickets as historical data and let any open v1 ticket settle naturally before `event_reinvest_batch5_v2` starts for the same symbol/horizon. Store the new slot number separately so cycle history can be read as round then slot.
 - Verification: all 43 Rust tests pass. A migration of the 75,529-row live-database backup changed schema v2 to v3 with no ticket loss or row rewrite, `quick_check=ok`, and zero duplicate slot orders/open slots. The release client started as `0.4.0-event-batch5-v2`; once the two 10m legacy tickets settled, BTC and ETH each opened exactly five 5-USDT slot-1 tickets with no duplicates, while the still-open legacy 30m/60m tickets continued blocking those horizons as designed.
+
+## 2026-09-03 Completed One-Hour K-Line Window
+
+- Review baseline: the live BTC/ETH event log has 38,114 settled 10m tickets at 51.03%, 36,737 settled 30m tickets at 50.22%, and 33,166 settled 60m tickets at 48.20%; these are below the payout break-even rates and do not establish a profitable edge.
+- Implementation: event predictions now use exactly 60 contiguous, fully closed 1m candles ending at `open_time`. The active candle, missing boundary candle, and K-line gaps are rejected to avoid look-ahead or stale-window decisions.
+- Factors: the one-hour window contributes trend slope, close location, drawdown, acceleration, volume anomaly, and one-hour return through `hour_kline_score`; historical regime frequency is limited to a 30% corroborating weight.
+- Verification: 57 Rust tests pass, including a boundary test proving the current candle is excluded. Existing SQLite tickets are preserved; new tickets are marked `event_reinvest_batch5_kline1h_v3` with window metadata.
+- Next hypothesis: evaluate the v3 strategy on non-overlapping, point-in-time cohorts by 10m/30m/60m before changing weights again; do not infer profitability from the large overlapping historical sample.
