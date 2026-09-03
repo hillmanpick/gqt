@@ -23,6 +23,7 @@ const DEFAULT_AI_STRATEGY: &str =
     include_str!("../../trading/user_data/strategies/AiSignalStrategy.py");
 const DEFAULT_AI_CONFIG: &str = include_str!("../../trading/user_data/ai_config.json");
 const DEFAULT_COMPOSE: &str = include_str!("../../trading/docker-compose.yml");
+const DEFAULT_BINANCE_PROXY: &str = include_str!("../../trading/binance_proxy.py");
 
 #[derive(Debug, Clone)]
 pub struct TradingWorkspace {
@@ -45,6 +46,7 @@ impl TradingWorkspace {
         let ai_strategy = strategy_dir.join("AiSignalStrategy.py");
         let ai_config = root.join("user_data").join("ai_config.json");
         let compose = root.join("docker-compose.yml");
+        let binance_proxy = root.join("binance_proxy.py");
         write_if_missing(&config, DEFAULT_CONFIG)?;
         migrate_config(&config)?;
         write_if_missing(&strategy, DEFAULT_STRATEGY)?;
@@ -53,6 +55,8 @@ impl TradingWorkspace {
         migrate_ai_strategy(&ai_strategy)?;
         write_if_missing(&ai_config, DEFAULT_AI_CONFIG)?;
         migrate_ai_config(&ai_config)?;
+        fs::write(&binance_proxy, DEFAULT_BINANCE_PROXY)
+            .context("无法更新 Binance Docker 出口桥")?;
         write_if_missing(&compose, DEFAULT_COMPOSE)?;
         migrate_compose(&compose)?;
         let workspace = Self {
@@ -68,6 +72,31 @@ impl TradingWorkspace {
         let ai_config = workspace.ai_trading_config().unwrap_or_default();
         workspace.sync_ai_runtime_config(&ai_config)?;
         Ok(workspace)
+    }
+
+    pub fn ensure_binance_egress(&self) -> Result<()> {
+        let output = background_command("docker")
+            .args(["compose", "up", "-d", "binance-egress"])
+            .current_dir(&self.root)
+            .env("GQT_DOCKER_PROXY", "")
+            .output()
+            .context("无法启动 Binance Docker 出口桥")?;
+        if !output.status.success() {
+            bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+        }
+
+        let address = "127.0.0.1:18080"
+            .parse()
+            .expect("valid Binance proxy address");
+        for _ in 0..30 {
+            if std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(100))
+                .is_ok()
+            {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        bail!("Binance Docker 出口桥启动后未监听 127.0.0.1:18080")
     }
 
     pub fn ai_trading_config(&self) -> Result<AiTradingConfig> {
@@ -110,8 +139,7 @@ impl TradingWorkspace {
         }
         ensure_order_book_pricing(&mut config)?;
         ensure_compound_defaults(&mut config)?;
-        let docker_proxy = crate::network::configured_docker_proxy();
-        ensure_ccxt_proxy(&mut config, docker_proxy.as_deref())?;
+        ensure_ccxt_proxy(&mut config, None)?;
         let profile_preset = ai_config.strategy_profile.preset();
         let effective_leverage = ai_config.leverage.max(1);
         config["gqt_strategy_profile"] = json!(ai_config.strategy_profile.as_str());
@@ -339,16 +367,6 @@ impl TradingWorkspace {
             .env("BINANCE_API_KEY", api_key)
             .env("BINANCE_API_SECRET", api_secret)
             .env("FREQTRADE_DB_URL", database_url);
-        if let Some(proxy) = crate::network::configured_docker_proxy() {
-            command
-                .env("GQT_DOCKER_PROXY", &proxy)
-                .env("HTTP_PROXY", &proxy)
-                .env("HTTPS_PROXY", &proxy)
-                .env("ALL_PROXY", &proxy)
-                .env("http_proxy", &proxy)
-                .env("https_proxy", &proxy)
-                .env("all_proxy", &proxy);
-        }
         let output = command.output().context("无法启动 Docker")?;
         if !output.status.success() {
             bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
@@ -998,11 +1016,34 @@ fn migrate_compose(path: &Path) -> Result<()> {
             "${FREQTRADE_DB_URL:-sqlite:////freqtrade/user_data/tradesv3.dryrun.sqlite}",
         )
         .replace("\n      --strategy FuturesFactorStrategy", "");
-    if !updated.contains("GQT_DOCKER_PROXY") {
-        updated = updated.replace(
-            "      FREQTRADE__EXCHANGE__SECRET: \"${BINANCE_API_SECRET:-}\"\n",
-            "      FREQTRADE__EXCHANGE__SECRET: \"${BINANCE_API_SECRET:-}\"\n      GQT_DOCKER_PROXY: \"${GQT_DOCKER_PROXY:-}\"\n      HTTP_PROXY: \"${GQT_DOCKER_PROXY:-}\"\n      HTTPS_PROXY: \"${GQT_DOCKER_PROXY:-}\"\n      ALL_PROXY: \"${GQT_DOCKER_PROXY:-}\"\n      http_proxy: \"${GQT_DOCKER_PROXY:-}\"\n      https_proxy: \"${GQT_DOCKER_PROXY:-}\"\n      all_proxy: \"${GQT_DOCKER_PROXY:-}\"\n",
-        );
+    let trailing_newline = updated.ends_with('\n');
+    updated = updated
+        .lines()
+        .filter(|line| {
+            ![
+                "GQT_DOCKER_PROXY:",
+                "HTTP_PROXY:",
+                "HTTPS_PROXY:",
+                "ALL_PROXY:",
+                "http_proxy:",
+                "https_proxy:",
+                "all_proxy:",
+            ]
+            .iter()
+            .any(|name| line.trim_start().starts_with(name))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if trailing_newline {
+        updated.push('\n');
+    }
+    if !updated.contains("\n  binance-egress:") {
+        let service = "  binance-egress:\n    image: freqtradeorg/freqtrade:2026.6\n    container_name: gqt-binance-egress\n    restart: unless-stopped\n    entrypoint: [\"python\", \"/opt/binance_proxy.py\"]\n    volumes:\n      - ./binance_proxy.py:/opt/binance_proxy.py:ro\n    ports:\n      - \"127.0.0.1:18080:18080\"\n\n";
+        let services_end = updated
+            .find("services:")
+            .and_then(|index| updated[index..].find('\n').map(|offset| index + offset + 1))
+            .context("Docker Compose 缺少 services 节")?;
+        updated.insert_str(services_end, service);
     }
     if updated != source {
         fs::write(path, updated).context("无法迁移 Docker Compose 配置")?;
@@ -1095,6 +1136,8 @@ mod tests {
         let migrated = fs::read_to_string(&path).unwrap();
         assert!(!migrated.contains("--strategy FuturesFactorStrategy"));
         assert!(migrated.contains("FREQTRADE_DB_URL"));
+        assert!(migrated.contains("binance-egress:"));
+        assert!(!migrated.contains("GQT_DOCKER_PROXY"));
         let _ = fs::remove_file(path);
     }
 
@@ -1302,8 +1345,8 @@ mod tests {
             .unwrap();
         drop(connection);
         let account = workspace.simulation_account().unwrap();
-        assert_eq!(account.wallet_balance, 2025.0);
-        assert_eq!(account.available_balance, 1975.0);
+        assert_eq!(account.wallet_balance, 10025.0);
+        assert_eq!(account.available_balance, 9975.0);
         assert_eq!(account.closed_trades, 1);
         assert_eq!(account.open_trades[0].side, "空");
         assert_eq!(account.trade_history.len(), 2);

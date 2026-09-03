@@ -1162,7 +1162,7 @@ pub fn run_cycle_for_horizons(
     let log = EventPredictionLog::open(path)?;
     let symbols = supported_cycle_symbols(symbols);
     let horizons = normalized_horizons(horizons);
-    let client = network::client(Duration::from_secs(20))?;
+    let client = network::binance_client(Duration::from_secs(20))?;
     let now = chrono::Utc::now().timestamp();
     let mut failures = Vec::new();
     let mut settlement_prices = BTreeMap::new();

@@ -112,7 +112,7 @@ fn parse_futures_account(account: &Value, position_data: &Value) -> Result<Futur
 }
 
 fn futures_client() -> Result<Client> {
-    network::client(Duration::from_secs(15)).context("无法创建 Binance 请求客户端")
+    network::binance_client(Duration::from_secs(15)).context("无法创建 Binance 请求客户端")
 }
 
 fn server_time(client: &Client) -> Result<i64> {

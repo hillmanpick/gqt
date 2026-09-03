@@ -92,12 +92,10 @@
     "key": "",
     "secret": "",
     "ccxt_config": {
-      "enableRateLimit": true,
-      "httpsProxy": "http://host.docker.internal:7890"
+      "enableRateLimit": true
     },
     "ccxt_async_config": {
-      "enableRateLimit": true,
-      "httpsProxy": "http://host.docker.internal:7890"
+      "enableRateLimit": true
     },
     "pair_whitelist": [
       "BTC/USDT:USDT",

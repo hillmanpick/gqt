@@ -190,7 +190,14 @@ fn run_worker(
     events: Sender<ScannerEvent>,
     data_root: PathBuf,
 ) {
-    let client = match network::client(Duration::from_secs(12)) {
+    let binance_client = match network::binance_client(Duration::from_secs(12)) {
+        Ok(client) => client,
+        Err(error) => {
+            let _ = events.send(ScannerEvent::Error(error.to_string()));
+            return;
+        }
+    };
+    let remote_client = match network::client(Duration::from_secs(12)) {
         Ok(client) => client,
         Err(error) => {
             let _ = events.send(ScannerEvent::Error(error.to_string()));
@@ -220,7 +227,8 @@ fn run_worker(
         }
         let now = Utc::now().timestamp();
         match scan_once(
-            &client,
+            &binance_client,
+            &remote_client,
             &mut known_symbols,
             &mut futures_symbols,
             &mut spot_symbols,
@@ -265,7 +273,8 @@ fn persist_snapshot(data_root: &PathBuf, snapshot: &UniverseSnapshot) -> Result<
 }
 
 fn scan_once(
-    client: &Client,
+    binance_client: &Client,
+    remote_client: &Client,
     known_symbols: &mut HashSet<String>,
     futures_symbols: &mut HashSet<String>,
     spot_symbols: &mut HashSet<String>,
@@ -279,7 +288,7 @@ fn scan_once(
     let now = Utc::now().timestamp();
     let mut sentiment_error = String::new();
     if sentiment_config.enabled() && now - *last_sentiment_fetch >= 60 {
-        match crate::sentiment::fetch_remote_events(client, sentiment_config) {
+        match crate::sentiment::fetch_remote_events(remote_client, sentiment_config) {
             Ok(events) => {
                 if let Some(store) = sentiment_store {
                     let _ = store.upsert_events(&events);
@@ -298,7 +307,7 @@ fn scan_once(
         *last_sentiment_fetch = now;
     }
     if now - *last_universe_refresh > 600 || known_symbols.is_empty() {
-        let (futures, spot) = fetch_universe(client)?;
+        let (futures, spot) = fetch_universe(binance_client)?;
         *futures_symbols = futures;
         *spot_symbols = spot;
         known_symbols.clear();
@@ -306,9 +315,9 @@ fn scan_once(
         known_symbols.extend(spot_symbols.iter().cloned());
         *last_universe_refresh = now;
     }
-    let futures_tickers: Vec<Ticker> = get_json(client, "/fapi/v1/ticker/24hr")?;
-    let spot_tickers: Vec<Ticker> = get_spot_json("/api/v3/ticker/24hr", client)?;
-    let premiums: Vec<Premium> = get_json(client, "/fapi/v1/premiumIndex")?;
+    let futures_tickers: Vec<Ticker> = get_json(binance_client, "/fapi/v1/ticker/24hr")?;
+    let spot_tickers: Vec<Ticker> = get_spot_json("/api/v3/ticker/24hr", binance_client)?;
+    let premiums: Vec<Premium> = get_json(binance_client, "/fapi/v1/premiumIndex")?;
     let funding: HashMap<String, f64> = premiums
         .into_iter()
         .filter_map(|item| {
@@ -439,7 +448,7 @@ fn scan_once(
         .filter(|candidate| candidate.market == "U本位")
         .take(12)
     {
-        if let Ok(open_interest) = fetch_open_interest(client, &candidate.symbol) {
+        if let Ok(open_interest) = fetch_open_interest(binance_client, &candidate.symbol) {
             candidate.open_interest = open_interest;
         }
     }

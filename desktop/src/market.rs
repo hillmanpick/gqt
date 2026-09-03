@@ -16,7 +16,7 @@ const RESTRICTED_LOCATION_HINT: &str = "Binance Futures 拒绝了当前网络位
 
 pub fn start_worker(commands: Receiver<MarketCommand>, events: Sender<MarketEvent>) {
     thread::spawn(move || {
-        let client = match network::client_builder(Duration::from_secs(12))
+        let client = match network::binance_client_builder(Duration::from_secs(12))
             .user_agent("GQT-Trader/0.2")
             .build()
         {

@@ -10,11 +10,18 @@ use reqwest::{
 };
 
 const LOCAL_PROXY_PORTS: [u16; 7] = [7890, 7897, 7899, 10808, 10809, 20170, 20171];
+const BINANCE_EGRESS_PROXY: &str = "http://127.0.0.1:18080";
 
 pub fn client(timeout: Duration) -> Result<Client> {
     client_builder(timeout)
         .build()
         .context("无法创建网络请求客户端")
+}
+
+pub fn binance_client(timeout: Duration) -> Result<Client> {
+    binance_client_builder(timeout)
+        .build()
+        .context("无法创建 Binance 网络请求客户端")
 }
 
 pub fn client_builder(timeout: Duration) -> ClientBuilder {
@@ -50,8 +57,14 @@ pub fn configured_proxy() -> Option<String> {
     select_proxy(configured, detected_local_proxy())
 }
 
-pub fn configured_docker_proxy() -> Option<String> {
-    configured_proxy().map(|proxy| proxy_for_docker(&proxy))
+pub fn binance_client_builder(timeout: Duration) -> ClientBuilder {
+    let builder = Client::builder().timeout(timeout).no_proxy();
+    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18080);
+    if TcpStream::connect_timeout(&address, Duration::from_millis(150)).is_ok() {
+        builder.proxy(reqwest::Proxy::all(BINANCE_EGRESS_PROXY).expect("valid Binance proxy URL"))
+    } else {
+        builder
+    }
 }
 
 fn detected_local_proxy() -> Option<String> {
@@ -83,12 +96,6 @@ fn is_loopback_proxy(proxy: &str) -> bool {
         })
 }
 
-fn proxy_for_docker(proxy: &str) -> String {
-    proxy
-        .replace("://127.0.0.1:", "://host.docker.internal:")
-        .replace("://localhost:", "://host.docker.internal:")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,22 +105,6 @@ mod tests {
         for port in LOCAL_PROXY_PORTS {
             assert!(reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).is_ok());
         }
-    }
-
-    #[test]
-    fn rewrites_loopback_proxy_for_docker() {
-        assert_eq!(
-            proxy_for_docker("http://127.0.0.1:7890"),
-            "http://host.docker.internal:7890"
-        );
-        assert_eq!(
-            proxy_for_docker("http://localhost:10808"),
-            "http://host.docker.internal:10808"
-        );
-        assert_eq!(
-            proxy_for_docker("http://10.0.0.2:7890"),
-            "http://10.0.0.2:7890"
-        );
     }
 
     #[test]

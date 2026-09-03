@@ -279,6 +279,7 @@ impl GqtApp {
         let secret_status = store.secret_status().unwrap_or_default();
         let workspace =
             TradingWorkspace::ensure(&data_root.join("trading")).expect("create trading workspace");
+        let _ = workspace.ensure_binance_egress();
         let strategy_source = workspace.strategy_source().unwrap_or_default();
         let (stake_amount, max_open_trades, risk_reward_ratio, allow_ai_risk_sizing) =
             workspace.risk().unwrap_or((120.0, 5, 1.4, false));
@@ -4363,7 +4364,7 @@ fn run_ai_decision_cycle(cycle: AiDecisionCycle) -> Result<AiDecisionSummary, St
 }
 
 fn run_ai_decision_cycle_inner(cycle: AiDecisionCycle) -> anyhow::Result<AiDecisionSummary> {
-    let client = crate::network::client(Duration::from_secs(20))?;
+    let client = crate::network::binance_client(Duration::from_secs(20))?;
     let audit = AuditLog::open(&cycle.workspace.ai_audit)?;
     let account = if !cycle.dry_run
         && !cycle.binance_api_key.is_empty()
